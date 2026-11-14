@@ -47,9 +47,22 @@ if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1; then
 	exit 1
 fi
 
+# macOS is a supported platform but cannot be run here; at least make sure it compiles.
+macos_target=aarch64-apple-darwin
+# The active toolchain (what plain `cargo` runs) and the MSRV toolchain.
+active=$(rustup show active-toolchain | cut -d' ' -f1)
+for tc in "$active" "$toolchain"; do
+	if ! rustup target list --installed --toolchain "$tc" | grep -qx "$macos_target"; then
+		echo "check.sh: target $macos_target is not installed for $tc; run: rustup target add $macos_target --toolchain $tc" >&2
+		exit 1
+	fi
+done
+
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo "+$toolchain" check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets --target "$macos_target" -- -D warnings
+RUSTFLAGS="${RUSTFLAGS:-} -D warnings" cargo "+$toolchain" check --locked --workspace --all-targets --target "$macos_target"
 cargo build --locked --release
 echo "check.sh: ok (msrv toolchain $toolchain)"
