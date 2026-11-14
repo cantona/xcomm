@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 
+use crate::ansi::{SGR_HELD_MAX, SgrFilter};
 use crate::cli::TermOpts;
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{KeyAction, KeyParser};
@@ -109,6 +110,9 @@ pub struct Pump<'a> {
     /// The command prefix, when keyboard input is a terminal; None passes
     /// every byte through (piped input must not trigger commands).
     pub prefix: Option<(crate::cli::PrefixKey, std::time::Duration)>,
+    /// Remove color parameters from SGR sequences in device output (color
+    /// off); attributes stay.
+    pub strip_color: bool,
 }
 
 /// Room kept in the output queue for bytes the key parser holds, which it
@@ -364,6 +368,14 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
     // stdin itself would still report POLLHUP and make poll return at once.
     let signal_fd = p.signals.fd();
     let mut keys = p.prefix.map(|(key, time)| KeyParser::new(key, time));
+    // Only in the path when color is off. An unfinished sequence it holds
+    // when the session ends is dropped: never text, only a cut-off escape.
+    let mut sgr = p.strip_color.then(SgrFilter::new);
+    let mut filtered = Vec::with_capacity(if sgr.is_some() {
+        2 * BUF_SIZE + SGR_HELD_MAX
+    } else {
+        0
+    });
     // Local echo of what goes to the device; never grows past this.
     let mut echo = Vec::with_capacity(if keys.is_some() {
         BUF_SIZE + HELD_ROOM
@@ -473,7 +485,19 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
         if dev_ready.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match rustix::io::read(p.device, &mut buf[..]) {
                 Ok(0) => return Ok(ExitReason::DeviceGone),
-                Ok(n) => match write_out(p.stdout, &buf[..n], p, ctl)? {
+                Ok(n) => match write_out(
+                    p.stdout,
+                    match sgr.as_mut() {
+                        None => &buf[..n],
+                        Some(f) => {
+                            filtered.clear();
+                            f.filter(&buf[..n], &mut filtered);
+                            &filtered
+                        }
+                    },
+                    p,
+                    ctl,
+                )? {
                     Signaled::Exit(exit) => return Ok(exit),
                     Signaled::Resumed => continue,
                     Signaled::Nothing => {}
@@ -752,6 +776,11 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             device: port.fd(),
             signals: &signals,
             prefix: keys_on.then_some((opts.prefix.key, opts.prefix_time)),
+            strip_color: !crate::ansi::device_color_enabled(
+                opts.color,
+                rustix::termios::isatty(stdout.as_fd()),
+                env,
+            ),
         };
         let stderr = io::stderr();
         let mut live = commands::Live::new(

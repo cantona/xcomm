@@ -487,3 +487,74 @@ fn sigterm_sent_while_stopped_in_a_blocked_write_ends_the_session() {
     unsafe { libc::kill(pid, libc::SIGCONT) };
     assert!(wait_exit(&mut s.child, T).success());
 }
+
+const COLORED: &[u8] = b"\x1b[1;31mred\x1b[0m \x1b[2J\x1b[10;5Hend";
+const UNCOLORED: &[u8] = b"\x1b[1mred\x1b[0m \x1b[2J\x1b[10;5Hend";
+
+fn device_output_with(extra: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let mut args: Vec<&str> = extra.to_vec();
+    args.push(&path);
+    let s = support::spawn_with_env(env!("CARGO_BIN_EXE_xcomm"), &args, &lock_dir("color"), env);
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    write_all(dev.master.as_fd(), COLORED);
+    read_until(s.host.master.as_fd(), b"end", T)
+}
+
+#[test]
+fn color_never_strips_sgr_from_device_output() {
+    for flag in [&["-c", "off"][..], &["--color", "never"]] {
+        assert_eq!(device_output_with(flag, &[]), UNCOLORED, "{flag:?}");
+    }
+}
+
+#[test]
+fn color_auto_on_a_terminal_passes_device_output_untouched() {
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let s = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path],
+        &lock_dir("color"),
+        &[],
+    );
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    write_all(dev.master.as_fd(), COLORED);
+    assert_eq!(read_until(s.host.master.as_fd(), b"end", T), COLORED);
+}
+
+#[test]
+fn color_auto_follows_term_but_not_no_color() {
+    // NO_COLOR is about a program's own color; device output is the board's.
+    assert_eq!(device_output_with(&[], &[("NO_COLOR", "1")]), COLORED);
+    assert_eq!(device_output_with(&[], &[("TERM", "dumb")]), UNCOLORED);
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let s = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &["--color", "always", &path],
+        &lock_dir("color"),
+        &[("TERM", "dumb")],
+    );
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    write_all(dev.master.as_fd(), COLORED);
+    assert_eq!(read_until(s.host.master.as_fd(), b"end", T), COLORED);
+}
+
+#[test]
+fn color_auto_with_stdout_not_a_terminal_strips_sgr() {
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    let s = support::spawn_with(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path],
+        &lock_dir("color"),
+        &[],
+        Some(out_w.into()),
+    );
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    write_all(dev.master.as_fd(), COLORED);
+    assert_eq!(read_until(out_r.as_fd(), b"end", T), UNCOLORED);
+}

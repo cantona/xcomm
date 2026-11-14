@@ -63,10 +63,11 @@ impl Control for Count {
 
 /// One test: a process has one signal pipe at a time. The second run adds
 /// the prefix parser, local echo, held Alt sequences (a CSI arrow key, an
-/// ESC cut off at the end of a write) and commands.
+/// ESC cut off at the end of a write) and commands; the third the SGR
+/// filter, with sequences cut at the ends of reads.
 #[test]
 fn the_loop_does_not_allocate_in_steady_state() {
-    run(None, false, b"typed");
+    run(None, false, b"typed", None);
     let alt_a = PrefixKey {
         modifier: Modifier::Alt,
         letter: b'a',
@@ -75,10 +76,24 @@ fn the_loop_does_not_allocate_in_steady_state() {
         Some((alt_a, std::time::Duration::from_millis(1))),
         true,
         b"typed\x1b[A\x1baz\x1b",
+        None,
+    );
+    run(
+        None,
+        false,
+        b"typed",
+        Some(b"\x1b[1;31mred\x1b[0m \x1b[2J\x1b[10;5Hxy\x1b[38;2;1;2;3"),
     );
 }
 
-fn run(prefix: Option<(PrefixKey, std::time::Duration)>, echo: bool, typed: &'static [u8]) {
+/// `colored`: device output with SGR and other sequences, run through the
+/// SGR filter (color off).
+fn run(
+    prefix: Option<(PrefixKey, std::time::Duration)>,
+    echo: bool,
+    typed: &'static [u8],
+    colored: Option<&'static [u8]>,
+) {
     let dev = support::pty();
     let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
     let (out_r, out_w) = std::io::pipe().unwrap();
@@ -91,7 +106,7 @@ fn run(prefix: Option<(PrefixKey, std::time::Duration)>, echo: bool, typed: &'st
         let fl = rustix::fs::fcntl_getfl(fd).unwrap();
         rustix::fs::fcntl_setfl(fd, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
     }
-    let feeder = keep_writing(master, &[0x55u8; 4096], stop.clone());
+    let feeder = keep_writing(master, colored.unwrap_or(&[0x55u8; 4096]), stop.clone());
     let typist = keep_writing(in_w.into(), typed, stop.clone());
     // What the loop sends to the device must be taken, or the queue fills
     // and the loop stops reading input.
@@ -141,6 +156,7 @@ fn run(prefix: Option<(PrefixKey, std::time::Duration)>, echo: bool, typed: &'st
             device: port_fd.as_fd(),
             signals: &signals,
             prefix,
+            strip_color: colored.is_some(),
         };
         pump(&p, &mut count).unwrap()
     };

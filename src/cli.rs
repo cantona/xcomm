@@ -195,6 +195,17 @@ pub enum Flow {
     XonXoff,
 }
 
+/// `--color`: whether escape sequences that color text reach the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Device output: color when stdout is a terminal and TERM is not
+    /// `dumb`. xcomm's own messages: also only while NO_COLOR is unset or
+    /// empty.
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineSettings {
     pub baud: u32,
@@ -228,6 +239,7 @@ pub struct TermOpts {
     pub prefix_time: Duration,
     /// `-w`: turn the terminal's line wrap on at startup.
     pub wrap: bool,
+    pub color: ColorMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,6 +341,7 @@ pub fn parse(
     let mut no_lock = false;
     let mut low_latency = false;
     let mut wrap = false;
+    let mut color: Option<ColorMode> = None;
     let mut show_prefix = false;
     let mut version = false;
     // For --version (alone) and --show-prefix (prefix options only).
@@ -414,6 +427,29 @@ pub fn parse(
             Long("no-lock") => no_lock = true,
             Long("low-latency") => low_latency = true,
             Short('w') => wrap = true,
+            Long("color") => {
+                let v = choose(
+                    &text(p.value()?, "--color")?,
+                    "--color",
+                    &[
+                        ("auto", ColorMode::Auto),
+                        ("always", ColorMode::Always),
+                        ("never", ColorMode::Never),
+                        // minicom's spelling
+                        ("on", ColorMode::Always),
+                        ("off", ColorMode::Never),
+                    ],
+                )?;
+                set_once(&mut color, v, "--color/-c")?;
+            }
+            Short('c') => {
+                let v = choose(
+                    &text(p.value()?, "-c")?,
+                    "-c",
+                    &[("on", ColorMode::Always), ("off", ColorMode::Never)],
+                )?;
+                set_once(&mut color, v, "--color/-c")?;
+            }
             Long("prefix") | Short('e') | Long("escape") => {
                 let name = match arg {
                     Short('e') => "-e",
@@ -474,5 +510,6 @@ pub fn parse(
         prefix,
         prefix_time: prefix_time.unwrap_or(Duration::from_millis(25)),
         wrap,
+        color: color.unwrap_or(ColorMode::Auto),
     }))
 }

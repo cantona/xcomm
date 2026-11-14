@@ -94,6 +94,7 @@ fn closed_input_with_a_full_queue_does_not_spin() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut clock,
     )
@@ -145,6 +146,7 @@ fn sigterm_ends_the_session_while_a_nonblocking_terminal_is_stalled() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut clock,
     )
@@ -210,6 +212,7 @@ fn sigterm_ends_the_session_while_a_blocking_terminal_is_stalled() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut clock,
     )
@@ -249,6 +252,7 @@ fn a_terminal_that_goes_away_ends_the_session_as_gone() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut clock,
     )
@@ -278,6 +282,7 @@ fn a_pipe_reader_that_leaves_ends_the_session_as_gone() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut clock,
     )
@@ -324,6 +329,7 @@ fn end_of_input_waits_until_everything_reached_the_device() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut clock,
     )
@@ -371,6 +377,7 @@ fn a_sigtstp_caught_before_the_stop_does_not_stop_again() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut ctl,
     )
@@ -424,6 +431,7 @@ fn a_sigtstp_after_the_continue_stops_again() {
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
+            strip_color: false,
         },
         &mut ctl,
     )

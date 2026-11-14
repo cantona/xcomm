@@ -112,7 +112,8 @@ pub fn lock_dir(tag: &str) -> PathBuf {
 }
 
 /// Runs xcomm with a pty as its controlling terminal (stdin, stdout and
-/// stderr), a private lock directory and no prefix-related environment.
+/// stderr), a private lock directory, no prefix-related environment,
+/// NO_COLOR unset and TERM=xterm.
 pub fn spawn_xcomm(args: &[&str], lock_dir: &std::path::Path) -> Spawned {
     spawn_in_pty(env!("CARGO_BIN_EXE_xcomm"), args, lock_dir)
 }
@@ -159,6 +160,8 @@ pub fn spawn_with(
     ] {
         cmd.env_remove(v);
     }
+    // Color depends on these; tests that care set them through `env`.
+    cmd.env_remove("NO_COLOR").env("TERM", "xterm");
     cmd.envs(env.iter().copied());
     // SAFETY: setsid and ioctl are async-signal-safe.
     unsafe {

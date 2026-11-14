@@ -69,6 +69,32 @@ fn defaults_are_115200_8n1_no_flow() {
     assert_eq!(t.line, LineSettings::default());
     assert_eq!(t.prefix_time, Duration::from_millis(25));
     assert!(!t.no_init && !t.no_lock && !t.low_latency && !t.wrap);
+    assert_eq!(t.color, ColorMode::Auto);
+}
+
+#[test]
+fn color_options() {
+    for (v, want) in [
+        (&["--color", "auto"][..], ColorMode::Auto),
+        (&["--color", "always"], ColorMode::Always),
+        (&["--color", "never"], ColorMode::Never),
+        (&["--color=never"], ColorMode::Never),
+        (&["-c", "on"], ColorMode::Always),
+        (&["-c", "off"], ColorMode::Never),
+        (&["-coff"], ColorMode::Never),
+        (&["--color=on"], ColorMode::Always),
+        (&["--color", "off"], ColorMode::Never),
+    ] {
+        let mut a = v.to_vec();
+        a.push("x");
+        assert_eq!(term(&a, &[]).color, want, "{v:?}");
+    }
+    let e = err(&["--color", "yes", "x"], &[]);
+    assert!(e.contains("auto, always, never"), "{e}");
+    let e = err(&["-c", "always", "x"], &[]);
+    assert!(e.contains("on, off"), "{e}");
+    let e = err(&["-c", "on", "--color", "never", "x"], &[]);
+    assert!(e.contains("more than once"), "{e}");
 }
 
 #[test]

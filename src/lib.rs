@@ -1,5 +1,6 @@
 //! xcomm library.
 
+pub mod ansi;
 pub mod cli;
 pub mod hosttty;
 pub mod keys;
