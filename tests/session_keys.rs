@@ -100,6 +100,7 @@ fn ctrl_a_z_shows_help_with_prefix_name() {
         "Ctrl-A p  change the baud rate",
         "Ctrl-A e  toggle local echo",
         "Ctrl-A w  toggle line wrap",
+        "Ctrl-A l  start or stop capture",
         "Ctrl-A Ctrl-A  send Ctrl-A itself",
         "Ctrl-A Esc  cancel",
     ] {
@@ -169,6 +170,17 @@ fn ctrl_a_p_esc_or_empty_keeps_the_baud() {
     write_all(s.host.master.as_fd(), b"after");
     assert_eq!(read_until(dev.master.as_fd(), b"after", T), b"after");
     assert_eq!(speed(&dev), 115_200);
+}
+
+#[test]
+fn the_baud_prompt_takes_ascii_only() {
+    let (dev, s, _) = start(&[], &[]);
+    write_all(s.host.master.as_fd(), b"\x01p");
+    read_until(s.host.master.as_fd(), b"baud [115200]: ", T);
+    write_all(s.host.master.as_fd(), b"96\xc3\xa900\r");
+    let out = text(&read_until(s.host.master.as_fd(), b"8N1\r\n", T));
+    assert!(out.contains("xcomm: 9600 8N1"), "{out:?}");
+    assert_eq!(speed(&dev), 9600);
 }
 
 #[test]

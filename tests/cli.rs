@@ -70,6 +70,20 @@ fn defaults_are_115200_8n1_no_flow() {
     assert_eq!(t.prefix_time, Duration::from_millis(25));
     assert!(!t.no_init && !t.no_lock && !t.low_latency && !t.wrap);
     assert_eq!(t.color, ColorMode::Auto);
+    assert_eq!(t.capture, None);
+}
+
+#[test]
+fn capture_option() {
+    let t = term(&["-C", "boot.log", "x"], &[]);
+    assert_eq!(t.capture, Some(std::path::PathBuf::from("boot.log")));
+    assert!(err(&["-C", "", "x"], &[]).contains("needs a file name"));
+    assert!(err(&["-C", "-w", "x"], &[]).contains("use ./-w"));
+    assert_eq!(
+        term(&["-C", "./-w", "x"], &[]).capture,
+        Some(std::path::PathBuf::from("./-w"))
+    );
+    assert!(err(&["-C", "a", "-C", "b", "x"], &[]).contains("more than once"));
 }
 
 #[test]

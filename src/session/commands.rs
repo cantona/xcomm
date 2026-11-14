@@ -1,12 +1,16 @@
 //! What the keys typed after the prefix do.
 
+use std::ffi::OsString;
 use std::io;
 use std::os::fd::BorrowedFd;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 
 use super::{CommandIo, CommandOutcome, Control, ExitReason, SessionError, Signaled, on_signals};
+use crate::capture::Capture;
 use crate::cli::{LineSettings, PrefixChoice, TermOpts};
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{self, EscKey, HELD_MAX};
@@ -21,8 +25,11 @@ const HANGUP: Duration = Duration::from_millis(500);
 const CANCEL: &str = "\x18";
 const WRAP_ON: &[u8] = b"\x18\x1b[?7h";
 const WRAP_OFF: &[u8] = b"\x18\x1b[?7l";
-/// Longest line the prompt takes.
-const PROMPT_MAX: usize = 32;
+/// Longest baud rate answer.
+const BAUD_MAX: usize = 32;
+/// Longest file name answer, in bytes.
+const PATH_MAX: usize = 1024;
+const DEFAULT_CAPTURE: &str = "xcomm.cap";
 
 #[derive(Debug, Clone, Copy)]
 enum Cmd {
@@ -35,6 +42,7 @@ enum Cmd {
     Baud,
     Echo,
     Wrap,
+    Capture,
 }
 
 /// The keys after the prefix, in the order help lists them.
@@ -49,6 +57,7 @@ const COMMANDS: &[(u8, Cmd, &str)] = &[
     (b'p', Cmd::Baud, "change the baud rate"),
     (b'e', Cmd::Echo, "toggle local echo"),
     (b'w', Cmd::Wrap, "toggle line wrap"),
+    (b'l', Cmd::Capture, "start or stop capture"),
 ];
 
 enum Key {
@@ -64,14 +73,33 @@ enum Key {
 enum EscInPrompt {
     /// The key's byte; ESC for Esc.
     Byte(u8),
+    /// A key past ASCII that came coded.
+    Char(char),
     Ignore,
     Exit(ExitReason),
 }
 
 enum Prompt {
-    Line(String),
+    Line(Vec<u8>),
     Cancelled,
     Exit(ExitReason),
+}
+
+/// Removes the last character of `line`: a whole UTF-8 character when the
+/// line ends in one, else one byte. False when the line was empty.
+fn pop_char(line: &mut Vec<u8>) -> bool {
+    let from = line.len().saturating_sub(4);
+    let last = (from..line.len()).find_map(|i| match std::str::from_utf8(&line[i..]) {
+        Ok(s) if s.chars().count() == 1 => s.chars().next(),
+        _ => None,
+    });
+    match last {
+        Some(c) => {
+            line.truncate(line.len() - c.len_utf8());
+            true
+        }
+        None => line.pop().is_some(),
+    }
 }
 
 fn on_off(on: bool) -> &'static str {
@@ -98,6 +126,7 @@ pub(super) struct Live<'a> {
     echo: bool,
     /// Line wrap as xcomm last set it; terminals start with it on.
     wrap: bool,
+    capture: Option<Capture>,
 }
 
 impl<'a> Live<'a> {
@@ -108,6 +137,7 @@ impl<'a> Live<'a> {
         stdout: BorrowedFd<'a>,
         stderr: BorrowedFd<'a>,
         signals: &'a SignalPipe,
+        capture: Option<Capture>,
     ) -> Live<'a> {
         let live = Live {
             raw,
@@ -124,6 +154,7 @@ impl<'a> Live<'a> {
             signals,
             echo: false,
             wrap: true,
+            capture,
         };
         if opts.wrap {
             live.set_wrap(true);
@@ -131,11 +162,58 @@ impl<'a> Live<'a> {
         live
     }
 
-    /// Puts back what commands changed on the terminal.
-    pub(super) fn finish(&self) {
+    /// Writes out the capture, and puts back what commands changed on the
+    /// terminal.
+    pub(super) fn finish(&mut self) {
+        if let Some(c) = self.capture.take() {
+            let path = c.path().to_path_buf();
+            if let Err(e) = c.close() {
+                self.say(&format!("capture stopped: {}: {e}", path.display()));
+            }
+        }
         if !self.wrap {
             self.set_wrap_if_writable(true);
         }
+    }
+
+    /// Writes out what the capture holds; an error stops it.
+    fn flush_capture(&mut self) {
+        if let Some(Err(e)) = self.capture.as_mut().map(|c| c.flush()) {
+            self.capture_failed(e);
+        }
+    }
+
+    fn toggle_capture(&mut self, io: &mut CommandIo<'_>) -> Result<CommandOutcome, SessionError> {
+        if let Some(c) = self.capture.take() {
+            let (path, total) = (c.path().to_path_buf(), c.total());
+            match c.close() {
+                Ok(()) => self.say(&format!(
+                    "capture closed: {} ({total} bytes)",
+                    path.display()
+                )),
+                Err(e) => self.say(&format!("capture stopped: {}: {e}", path.display())),
+            }
+            return Ok(CommandOutcome::Continue);
+        }
+        let text = format!("capture file [{DEFAULT_CAPTURE}]: ");
+        let line = match self.prompt(&text, PATH_MAX, true, io)? {
+            Prompt::Line(line) => line,
+            Prompt::Cancelled => return Ok(CommandOutcome::Continue),
+            Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
+        };
+        let path = if line.is_empty() {
+            PathBuf::from(DEFAULT_CAPTURE)
+        } else {
+            PathBuf::from(OsString::from_vec(line))
+        };
+        match Capture::start(&path) {
+            Ok(c) => {
+                self.say_after_prompt(&format!("capturing to {}", path.display()));
+                self.capture = Some(c);
+            }
+            Err(e) => self.say_after_prompt(&format!("capture: {e}")),
+        }
+        Ok(CommandOutcome::Continue)
     }
 
     /// Switches line wrap when a blocked write might not be interrupted:
@@ -275,8 +353,8 @@ impl<'a> Live<'a> {
 
     fn change_baud(&mut self, io: &mut CommandIo<'_>) -> Result<CommandOutcome, SessionError> {
         let current = self.port.settings();
-        let line = match self.prompt(&format!("baud [{}]: ", current.baud), io)? {
-            Prompt::Line(line) => line,
+        let line = match self.prompt(&format!("baud [{}]: ", current.baud), BAUD_MAX, false, io)? {
+            Prompt::Line(line) => String::from_utf8_lossy(&line).into_owned(),
             Prompt::Cancelled => return Ok(CommandOutcome::Continue),
             Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
         };
@@ -304,11 +382,25 @@ impl<'a> Live<'a> {
         Ok(CommandOutcome::Continue)
     }
 
-    /// Reads a line of printable ASCII from the keyboard: Backspace edits,
-    /// Enter finishes, Esc or Ctrl-C cancels. Device output waits meanwhile.
-    fn prompt(&mut self, text: &str, io: &mut CommandIo<'_>) -> Result<Prompt, SessionError> {
+    /// Reads a line of up to `max` bytes of printable ASCII (and with
+    /// `utf8`, UTF-8 characters, each taken whole or not at all) from the
+    /// keyboard: Backspace edits, Enter finishes, Esc or Ctrl-C cancels.
+    /// Device output waits meanwhile.
+    fn prompt(
+        &mut self,
+        text: &str,
+        max: usize,
+        utf8: bool,
+        io: &mut CommandIo<'_>,
+    ) -> Result<Prompt, SessionError> {
         self.write(format!("{}\r\n{text}", self.ui_cancel).as_bytes());
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
+        // Continuation bytes still to come of a UTF-8 character: to take
+        // (`need`, the character starting at `start`) or, for one too long
+        // for the line, to drop (`skip`).
+        let mut need = 0usize;
+        let mut start = 0usize;
+        let mut skip = 0usize;
         loop {
             let b = match io.typed.split_first() {
                 Some((&b, more)) => {
@@ -320,7 +412,10 @@ impl<'a> Live<'a> {
                     Key::Timeout => continue,
                     Key::Exit(exit) => return Ok(Prompt::Exit(exit)),
                     Key::Resumed => {
-                        self.write(format!("\r\n{text}{line}").as_bytes());
+                        self.write(format!("\r\n{text}").as_bytes());
+                        // Not a character still being typed: it is shown
+                        // once whole.
+                        self.write(&line[..if need > 0 { start } else { line.len() }]);
                         continue;
                     }
                     // Let the loop see the keyboard gone again.
@@ -333,12 +428,34 @@ impl<'a> Live<'a> {
             let b = if b == ESC {
                 match self.escape_in_prompt(io)? {
                     EscInPrompt::Byte(b) => b,
+                    EscInPrompt::Char(c) => {
+                        if need > 0 {
+                            line.truncate(start);
+                            need = 0;
+                        }
+                        let mut bytes = [0u8; 4];
+                        let bytes = c.encode_utf8(&mut bytes).as_bytes();
+                        if utf8 && line.len() + bytes.len() <= max {
+                            line.extend_from_slice(bytes);
+                            self.write(bytes);
+                        }
+                        continue;
+                    }
                     EscInPrompt::Ignore => continue,
                     EscInPrompt::Exit(exit) => return Ok(Prompt::Exit(exit)),
                 }
             } else {
                 b
             };
+            // A character cut short by another byte is taken out again; it
+            // was not shown yet.
+            if need > 0 && !(0x80..=0xbf).contains(&b) {
+                line.truncate(start);
+                need = 0;
+                if matches!(b, 0x7f | 0x08) {
+                    continue;
+                }
+            }
             match b {
                 b'\r' | b'\n' => {
                     self.write(b"\r\n");
@@ -349,16 +466,66 @@ impl<'a> Live<'a> {
                     return Ok(Prompt::Cancelled);
                 }
                 0x7f | 0x08 => {
-                    if line.pop().is_some() {
-                        self.write(b"\x08 \x08");
+                    if pop_char(&mut line) {
+                        self.erase_last(text, &line);
                     }
                 }
-                0x20..=0x7e if line.len() < PROMPT_MAX => {
-                    line.push(char::from(b));
+                0x80..=0xbf if skip > 0 => skip -= 1,
+                // Shown once the character is whole.
+                0x80..=0xbf if need > 0 => {
+                    need -= 1;
+                    line.push(b);
+                    if need == 0 {
+                        // Overlong forms, surrogates and past U+10FFFF are
+                        // not characters.
+                        if std::str::from_utf8(&line[start..]).is_ok() {
+                            self.write(&line[start..]);
+                        } else {
+                            line.truncate(start);
+                        }
+                    }
+                }
+                0x20..=0x7e if line.len() < max => {
+                    skip = 0;
+                    line.push(b);
                     self.write(&[b]);
+                }
+                0xc2..=0xf4 if utf8 => {
+                    let len = match b {
+                        0xc2..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        _ => 4,
+                    };
+                    skip = 0;
+                    if line.len() + len <= max {
+                        start = line.len();
+                        need = len - 1;
+                        line.push(b);
+                    } else {
+                        skip = len - 1;
+                    }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Takes the last character off the screen after Backspace. When the
+    /// prompt and the answer surely fit on one row, the row is drawn again, whatever width the
+    /// removed character had. Otherwise the cursor steps back one cell: a
+    /// wrapped answer cannot be redrawn in place, as the screen may have
+    /// scrolled.
+    fn erase_last(&self, text: &str, line: &[u8]) {
+        // A character never takes more cells than it has bytes.
+        let most_cells = text.len() + line.len() + 1;
+        let fits = rustix::termios::tcgetwinsize(self.ui)
+            .is_ok_and(|w| most_cells < usize::from(w.ws_col));
+        if fits {
+            self.write(format!("\r{text}").as_bytes());
+            self.write(line);
+            self.write(b"\x1b[K");
+        } else {
+            self.write(b"\x08 \x08");
         }
     }
 
@@ -374,9 +541,10 @@ impl<'a> Live<'a> {
         loop {
             // Done by HELD_MAX bytes at the latest.
             if let EscKey::Done { key, .. } = keys::escape_key(&seq[..len]) {
-                return Ok(match keys::plain_byte(key) {
-                    Some(b) => EscInPrompt::Byte(b),
-                    None => EscInPrompt::Ignore,
+                return Ok(match (keys::plain_byte(key), keys::plain_char(key)) {
+                    (Some(b), _) => EscInPrompt::Byte(b),
+                    (None, Some(c)) => EscInPrompt::Char(c),
+                    (None, None) => EscInPrompt::Ignore,
                 });
             }
             seq[len] = match io.typed.split_first() {
@@ -441,6 +609,7 @@ impl<'a> Live<'a> {
 
 impl Control for Live<'_> {
     fn stop(&mut self) -> io::Result<()> {
+        self.flush_capture();
         if !self.wrap {
             self.set_wrap_if_writable(true);
         }
@@ -474,6 +643,12 @@ impl Control for Live<'_> {
             self.write(format!("{}\x07", self.ui_cancel).as_bytes());
             return Ok(CommandOutcome::Continue);
         };
+        // A command can take a while (a prompt, a break): what was captured
+        // goes to the file first. Stopping the capture does that itself, and
+        // a failed flush here would turn that stop into a start.
+        if !matches!(cmd, Cmd::Capture) {
+            self.flush_capture();
+        }
         match cmd {
             Cmd::Help => self.help(),
             Cmd::Quit => return Ok(CommandOutcome::Exit(ExitReason::Quit)),
@@ -489,6 +664,7 @@ impl Control for Live<'_> {
                 self.echo = !self.echo;
                 self.say(&format!("local echo {}", on_off(self.echo)));
             }
+            Cmd::Capture => return self.toggle_capture(io),
             Cmd::Wrap if self.screen.is_none() => {
                 self.say("line wrap: the output is not a terminal");
             }
@@ -503,6 +679,16 @@ impl Control for Live<'_> {
 
     fn local_echo(&self) -> bool {
         self.echo
+    }
+
+    fn capture(&mut self) -> Option<&mut Capture> {
+        self.capture.as_mut()
+    }
+
+    fn capture_failed(&mut self, error: io::Error) {
+        if let Some(c) = self.capture.take() {
+            self.say(&format!("capture stopped: {}: {error}", c.path().display()));
+        }
     }
 
     fn dropping_input(&mut self) {

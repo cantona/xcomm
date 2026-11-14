@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 
+use xcomm::capture::Capture;
 use xcomm::cli::{Modifier, PrefixKey};
 use xcomm::hosttty::SignalPipe;
 use xcomm::session::{Control, ExitReason, Pump, pump};
@@ -39,6 +40,7 @@ struct Count {
     warm: Option<u64>,
     end: u64,
     echo: bool,
+    capture: Option<Capture>,
 }
 
 impl Control for Count {
@@ -59,12 +61,18 @@ impl Control for Count {
     fn local_echo(&self) -> bool {
         self.echo
     }
+    fn capture(&mut self) -> Option<&mut Capture> {
+        self.capture.as_mut()
+    }
+    fn capture_failed(&mut self, e: std::io::Error) {
+        panic!("capture failed: {e}");
+    }
 }
 
 /// One test: a process has one signal pipe at a time. The second run adds
 /// the prefix parser, local echo, held Alt sequences (a CSI arrow key, an
 /// ESC cut off at the end of a write) and commands; the third the SGR
-/// filter, with sequences cut at the ends of reads.
+/// filter, with sequences cut at the ends of reads, and capture.
 #[test]
 fn the_loop_does_not_allocate_in_steady_state() {
     run(None, false, b"typed", None);
@@ -148,6 +156,7 @@ fn run(
         warm: None,
         end: 0,
         echo,
+        capture: colored.map(|_| Capture::start(std::path::Path::new("/dev/null")).unwrap()),
     };
     let reason = {
         let p = Pump {

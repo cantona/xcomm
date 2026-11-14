@@ -211,6 +211,20 @@ pub fn plain_byte(key: Key) -> Option<u8> {
     }
 }
 
+/// The character of a coded key past ASCII pressed with no modifier (kitty
+/// "report all keys as escape codes"); None for anything else, and for
+/// kitty's private-use codes, which name keys such as F13 or Caps Lock.
+pub fn plain_char(key: Key) -> Option<char> {
+    match key {
+        Key::Coded {
+            code: code @ 0x80..,
+            mods: 0,
+            event,
+        } if event != RELEASE && !(0xe000..=0xf8ff).contains(&code) => char::from_u32(code),
+        _ => None,
+    }
+}
+
 pub struct KeyParser {
     modifier: Modifier,
     letter: u8,

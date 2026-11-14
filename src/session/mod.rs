@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::ansi::{SGR_HELD_MAX, SgrFilter};
+use crate::capture::Capture;
 use crate::cli::TermOpts;
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{KeyAction, KeyParser};
@@ -96,6 +97,12 @@ pub trait Control {
     /// Keys were dropped: the device has taken nothing for STALL. Called
     /// once per stall.
     fn dropping_input(&mut self) {}
+    /// The capture file, while one is open: device output is copied to it.
+    fn capture(&mut self) -> Option<&mut Capture> {
+        None
+    }
+    /// A capture write failed: stop capturing, and say so.
+    fn capture_failed(&mut self, _error: io::Error) {}
 }
 
 /// The file descriptors the loop moves bytes between.
@@ -122,6 +129,8 @@ const HELD_ROOM: usize = crate::keys::HELD_MAX;
 /// input is read anyway, so that the commands (quit) still work. Keys that
 /// do not fit are dropped then.
 const STALL: Duration = Duration::from_secs(2);
+/// Longest time device output waits in the capture buffer.
+const CAPTURE_FLUSH: Duration = Duration::from_millis(50);
 /// How long quitting waits for queued keys to reach the device.
 const QUIT_DRAIN: Duration = Duration::from_secs(1);
 
@@ -387,6 +396,11 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
     let mut full_since: Option<Instant> = None;
     let mut stalled = false;
     let mut told_dropping = false;
+    // Since when the capture buffer has held bytes: it is written out
+    // CAPTURE_FLUSH later, even while output keeps coming. While a write to
+    // the terminal blocks, the capture waits too: a file write per device
+    // read is what honouring the deadline there would cost.
+    let mut capture_since: Option<Instant> = None;
     loop {
         if ctl.tick().is_break() {
             return Ok(ExitReason::Requested);
@@ -419,10 +433,11 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
         // looked at again when it would count as stalled.
         let held_due = keys.as_ref().and_then(|k| k.deadline());
         let stall_due = full_since.filter(|_| !stalled).map(|t| t + STALL);
-        let due = match (held_due, stall_due) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let capture_due = capture_since.map(|t| t + CAPTURE_FLUSH);
+        let due = [held_due, stall_due, capture_due]
+            .into_iter()
+            .flatten()
+            .min();
         let timeout = due.map(|due| {
             rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
                 .unwrap_or(rustix::event::Timespec {
@@ -434,6 +449,15 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(SessionError(format!("poll: {e}"))),
+        }
+        if capture_due.is_some_and(|due| Instant::now() >= due) {
+            capture_since = None;
+            match ctl.capture().map(|c| c.flush().map(|()| c.is_dirty())) {
+                Some(Err(e)) => ctl.capture_failed(e),
+                // A pipe reader behind: try again a while later.
+                Some(Ok(true)) => capture_since = Some(Instant::now()),
+                _ => {}
+            }
         }
         if let Some(k) = keys.as_mut().filter(|k| k.deadline().is_some()) {
             let echoing = ctl.local_echo();
@@ -485,23 +509,32 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
         if dev_ready.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match rustix::io::read(p.device, &mut buf[..]) {
                 Ok(0) => return Ok(ExitReason::DeviceGone),
-                Ok(n) => match write_out(
-                    p.stdout,
-                    match sgr.as_mut() {
+                Ok(n) => {
+                    // The capture gets the device's bytes as they came.
+                    match ctl
+                        .capture()
+                        .map(|c| c.write(&buf[..n]).map(|()| c.is_dirty()))
+                    {
+                        Some(Err(e)) => ctl.capture_failed(e),
+                        Some(Ok(true)) if capture_since.is_none() => {
+                            capture_since = Some(Instant::now());
+                        }
+                        _ => {}
+                    }
+                    let shown = match sgr.as_mut() {
                         None => &buf[..n],
                         Some(f) => {
                             filtered.clear();
                             f.filter(&buf[..n], &mut filtered);
                             &filtered
                         }
-                    },
-                    p,
-                    ctl,
-                )? {
-                    Signaled::Exit(exit) => return Ok(exit),
-                    Signaled::Resumed => continue,
-                    Signaled::Nothing => {}
-                },
+                    };
+                    match write_out(p.stdout, shown, p, ctl)? {
+                        Signaled::Exit(exit) => return Ok(exit),
+                        Signaled::Resumed => continue,
+                        Signaled::Nothing => {}
+                    }
+                }
                 Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
                 Err(e) if gone(e) => return Ok(ExitReason::DeviceGone),
                 Err(e) => return Err(SessionError(format!("read from device: {e}"))),
@@ -756,6 +789,14 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     } else {
         None
     };
+    // Once the session is sure to start, so a run that ends before it (no
+    // port, a signal while waiting for the terminal) leaves no file behind.
+    let capture = opts
+        .capture
+        .as_deref()
+        .map(Capture::start)
+        .transpose()
+        .map_err(|e| Failure::Other(format!("-C {e}")))?;
     let keys_on = raw.is_some();
     let notices = Notices { raw: keys_on };
     if let Some((_, cleared)) = &lock {
@@ -768,6 +809,9 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         }
     }
     notices.say(&banner(&path, opts, &port, applied, low_latency, keys_on));
+    if let Some(c) = &capture {
+        notices.say(&format!("capturing to {}", c.path().display()));
+    }
 
     let reason = {
         let pump_io = Pump {
@@ -790,6 +834,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             stdout.as_fd(),
             stderr.as_fd(),
             &signals,
+            capture,
         );
         let reason = pump(&pump_io, &mut live);
         live.finish();
