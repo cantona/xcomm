@@ -1,0 +1,475 @@
+use std::ffi::OsString;
+use std::time::Duration;
+use xcomm::cli::*;
+
+type Env = &'static [(&'static str, &'static str)];
+
+fn env_of(pairs: Env) -> impl Fn(&str) -> Option<String> {
+    move |k| {
+        pairs
+            .iter()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.to_string())
+    }
+}
+
+fn args(v: &[&str]) -> Vec<OsString> {
+    v.iter().map(OsString::from).collect()
+}
+
+fn parse_with(v: &[&str], env: Env) -> Result<Command, CliError> {
+    parse(args(v), &env_of(env))
+}
+
+fn term(v: &[&str], env: Env) -> TermOpts {
+    match parse_with(v, env).unwrap() {
+        Command::Term(t) => t,
+        c => panic!("expected Term, got {c:?}"),
+    }
+}
+
+fn err(v: &[&str], env: Env) -> String {
+    parse_with(v, env).unwrap_err().0
+}
+
+const CTRL_A: PrefixKey = PrefixKey {
+    modifier: Modifier::Ctrl,
+    letter: b'a',
+};
+const ALT_A: PrefixKey = PrefixKey {
+    modifier: Modifier::Alt,
+    letter: b'a',
+};
+
+#[test]
+fn minicom_style_device_and_baud() {
+    let t = term(&["-D", "/dev/ttyUSB1", "-b", "9600"], &[]);
+    assert_eq!(t.device, "/dev/ttyUSB1");
+    assert_eq!(t.line.baud, 9600);
+}
+
+#[test]
+fn positional_device() {
+    assert_eq!(term(&["ttyUSB1"], &[]).device, "ttyUSB1");
+}
+
+#[test]
+fn defaults_are_115200_8n1_no_flow() {
+    let t = term(&["x"], &[]);
+    assert_eq!(
+        t.line,
+        LineSettings {
+            baud: 115200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow: Flow::None,
+        }
+    );
+    assert_eq!(t.line, LineSettings::default());
+    assert_eq!(t.prefix_time, Duration::from_millis(25));
+    assert!(!t.no_init && !t.no_lock && !t.low_latency);
+}
+
+#[test]
+fn arbitrary_baud_accepted() {
+    assert_eq!(term(&["-b", "3000000", "x"], &[]).line.baud, 3_000_000);
+    assert_eq!(term(&["-b", "250000", "x"], &[]).line.baud, 250_000);
+}
+
+#[test]
+fn bad_baud_rejected() {
+    for b in ["0", "-1", "abc", "", "4294967296"] {
+        assert!(parse_with(&["-b", b, "x"], &[]).is_err(), "{b:?}");
+    }
+}
+
+#[test]
+fn device_given_twice_rejected() {
+    assert!(err(&["-D", "a", "b"], &[]).contains("device"));
+    assert!(err(&["a", "b"], &[]).contains("device"));
+}
+
+#[test]
+fn empty_device_rejected() {
+    assert!(parse_with(&["-D", ""], &[]).is_err());
+}
+
+#[test]
+fn no_device_is_usage_error() {
+    assert_eq!(err(&[], &[]), "usage: xcomm [options] <device>");
+}
+
+#[test]
+fn repeated_value_option_rejected() {
+    assert!(err(&["-b", "9600", "-b", "4800", "x"], &[]).contains("-b"));
+    assert!(parse_with(&["--parity", "odd", "--parity", "even", "x"], &[]).is_err());
+}
+
+#[test]
+fn line_format_options() {
+    let t = term(
+        &[
+            "--databits",
+            "7",
+            "--parity",
+            "even",
+            "--stopbits",
+            "2",
+            "--flow",
+            "rts",
+            "x",
+        ],
+        &[],
+    );
+    assert_eq!(
+        (
+            t.line.data_bits,
+            t.line.parity,
+            t.line.stop_bits,
+            t.line.flow
+        ),
+        (DataBits::Seven, Parity::Even, StopBits::Two, Flow::RtsCts)
+    );
+    assert_eq!(
+        term(&["--databits", "5", "x"], &[]).line.data_bits,
+        DataBits::Five
+    );
+    assert_eq!(
+        term(&["--databits", "6", "x"], &[]).line.data_bits,
+        DataBits::Six
+    );
+    assert_eq!(
+        term(&["--parity", "odd", "x"], &[]).line.parity,
+        Parity::Odd
+    );
+    assert_eq!(term(&["--flow", "xon", "x"], &[]).line.flow, Flow::XonXoff);
+    assert_eq!(term(&["--flow", "none", "x"], &[]).line.flow, Flow::None);
+}
+
+#[test]
+fn bad_line_format_values_rejected() {
+    for (opt, v) in [
+        ("--databits", "4"),
+        ("--databits", "9"),
+        ("--parity", "mark"),
+        ("--stopbits", "3"),
+        ("--flow", "dtr"),
+    ] {
+        let e = err(&[opt, v, "x"], &[]);
+        assert!(e.contains(opt), "{opt} {v}: {e}");
+    }
+}
+
+#[test]
+fn boolean_flags() {
+    let t = term(&["-o", "--no-lock", "--low-latency", "x"], &[]);
+    assert!(t.no_init && t.no_lock && t.low_latency);
+}
+
+#[test]
+fn metakey8_is_rejected_with_reason() {
+    for flag in ["-M", "--metakey8"] {
+        let e = err(&[flag, "x"], &[]);
+        assert!(e.contains("UTF-8") && e.contains("-m"), "{e}");
+    }
+}
+
+#[test]
+fn prefix_default_is_ctrl_a_outside_multiplexer() {
+    let p = term(&["x"], &[]).prefix;
+    assert_eq!(p.key, CTRL_A);
+    assert_eq!(p.source, PrefixSource::Default);
+}
+
+#[test]
+fn prefix_alt_a_inside_each_multiplexer() {
+    for (var, name) in [
+        ("HERDR_ENV", "herdr"),
+        ("HC_TERMINAL_ID", "Herdr app"),
+        ("TMUX", "tmux"),
+        ("STY", "screen"),
+        ("ZELLIJ", "zellij"),
+    ] {
+        let env = move |k: &str| (k == var).then(|| "1".to_string());
+        let Command::Term(t) = parse(args(&["x"]), &env).unwrap() else {
+            panic!()
+        };
+        assert_eq!(t.prefix.key, ALT_A, "{var}");
+        assert_eq!(t.prefix.source, PrefixSource::Multiplexer(name), "{var}");
+    }
+}
+
+#[test]
+fn empty_multiplexer_variable_counts_as_unset() {
+    assert_eq!(term(&["x"], &[("TMUX", "")]).prefix.key, CTRL_A);
+}
+
+#[test]
+fn env_beats_multiplexer_and_flag_beats_env() {
+    let t = term(&["x"], &[("TMUX", "1"), ("XCOMM_PREFIX", "ctrl-t")]);
+    assert_eq!(
+        t.prefix.key,
+        PrefixKey {
+            modifier: Modifier::Ctrl,
+            letter: b't'
+        }
+    );
+    assert_eq!(t.prefix.source, PrefixSource::Env);
+    let t = term(&["--prefix", "alt-x", "x"], &[("XCOMM_PREFIX", "ctrl-t")]);
+    assert_eq!(
+        t.prefix.key,
+        PrefixKey {
+            modifier: Modifier::Alt,
+            letter: b'x'
+        }
+    );
+    assert_eq!(t.prefix.source, PrefixSource::Flag);
+}
+
+#[test]
+fn escape_and_metakey_aliases() {
+    assert_eq!(term(&["-e", "ctrl-b", "x"], &[]).prefix.key.letter, b'b');
+    assert_eq!(
+        term(&["--escape", "ctrl-b", "x"], &[]).prefix.key.letter,
+        b'b'
+    );
+    assert_eq!(term(&["-m", "x"], &[]).prefix.key, ALT_A);
+    assert_eq!(term(&["--metakey", "x"], &[]).prefix.key, ALT_A);
+}
+
+#[test]
+fn prefix_given_twice_rejected_across_spellings() {
+    assert!(err(&["-m", "--prefix", "ctrl-b", "x"], &[]).contains("prefix"));
+    assert!(parse_with(&["-e", "ctrl-b", "--escape", "ctrl-c", "x"], &[]).is_err());
+}
+
+#[test]
+fn prefix_parse_accepts_case_insensitive_letters() {
+    assert_eq!(PrefixKey::parse("CTRL-A").unwrap(), CTRL_A);
+    assert_eq!(PrefixKey::parse("Alt-A").unwrap(), ALT_A);
+}
+
+#[test]
+fn bad_prefix_values_rejected() {
+    for v in [
+        "", "a", "ctrl-", "ctrl-1", "shift-a", "alt-ab", "ctrl-a ", "meta-a",
+    ] {
+        assert!(PrefixKey::parse(v).is_err(), "{v:?}");
+    }
+}
+
+#[test]
+fn prefix_keys_that_collide_with_terminal_input_rejected() {
+    // Ctrl-H is Backspace on many terminals; Ctrl-I, Ctrl-J and Ctrl-M are
+    // Tab, newline and Enter.
+    for v in ["ctrl-h", "ctrl-i", "ctrl-j", "ctrl-m"] {
+        let e = PrefixKey::parse(v).unwrap_err().0;
+        assert!(e.contains(v), "{v}: {e}");
+    }
+}
+
+#[test]
+fn alt_o_is_allowed() {
+    // Alt-O sends ESC o; F1-F4 and application arrow keys send ESC O.
+    assert!(PrefixKey::parse("alt-o").is_ok());
+}
+
+#[test]
+fn prefix_display() {
+    assert_eq!(CTRL_A.display(), "Ctrl-A");
+    assert_eq!(PrefixKey::parse("alt-x").unwrap().display(), "Alt-X");
+}
+
+#[test]
+fn bad_env_prefix_is_an_error_not_ignored() {
+    let e = err(&["x"], &[("XCOMM_PREFIX", "bogus")]);
+    assert!(e.contains("XCOMM_PREFIX"), "{e}");
+}
+
+#[test]
+fn empty_env_prefix_counts_as_unset() {
+    assert_eq!(term(&["x"], &[("XCOMM_PREFIX", "")]).prefix.key, CTRL_A);
+}
+
+#[test]
+fn prefix_time_bounds() {
+    assert_eq!(
+        term(&["--prefix-time", "100", "x"], &[]).prefix_time,
+        Duration::from_millis(100)
+    );
+    for v in ["0", "1001", "x"] {
+        assert!(parse_with(&["--prefix-time", v, "x"], &[]).is_err(), "{v}");
+    }
+}
+
+#[test]
+fn show_prefix_needs_no_device_and_honours_flags() {
+    match parse_with(&["--show-prefix"], &[("STY", "1")]).unwrap() {
+        Command::ShowPrefix(p) => assert_eq!(p.source, PrefixSource::Multiplexer("screen")),
+        c => panic!("{c:?}"),
+    }
+    match parse_with(&["--show-prefix", "-m"], &[]).unwrap() {
+        Command::ShowPrefix(p) => assert_eq!((p.key, p.source), (ALT_A, PrefixSource::Flag)),
+        c => panic!("{c:?}"),
+    }
+}
+
+#[test]
+fn show_prefix_with_device_rejected() {
+    assert!(parse_with(&["--show-prefix", "ttyUSB1"], &[]).is_err());
+}
+
+#[test]
+fn show_prefix_rejects_non_prefix_options() {
+    for extra in [
+        &["-o"][..],
+        &["-b", "9600"],
+        &["--prefix-time", "5"],
+        &["--no-lock"],
+    ] {
+        let mut v = vec!["--show-prefix"];
+        v.extend_from_slice(extra);
+        assert!(parse_with(&v, &[]).is_err(), "{v:?}");
+    }
+    assert!(parse_with(&["--show-prefix", "-e", "ctrl-b"], &[]).is_ok());
+}
+
+#[test]
+fn bad_env_prefix_without_device_is_still_usage_error() {
+    assert_eq!(
+        err(&[], &[("XCOMM_PREFIX", "bogus")]),
+        "usage: xcomm [options] <device>"
+    );
+}
+
+#[test]
+fn describe_names_each_source() {
+    let d = |v: &[&str], env: Env| match parse_with(v, env).unwrap() {
+        Command::ShowPrefix(p) => p.describe(),
+        c => panic!("{c:?}"),
+    };
+    assert_eq!(
+        d(&["--show-prefix", "--prefix", "alt-x"], &[]),
+        "Alt-X (command line)"
+    );
+    assert_eq!(
+        d(&["--show-prefix"], &[("XCOMM_PREFIX", "ctrl-t")]),
+        "Ctrl-T (XCOMM_PREFIX)"
+    );
+    assert_eq!(
+        d(&["--show-prefix"], &[("TMUX", "x")]),
+        "Alt-A (multiplexer: tmux)"
+    );
+    assert_eq!(d(&["--show-prefix"], &[]), "Ctrl-A (default)");
+}
+
+#[test]
+fn lexopt_spellings() {
+    assert_eq!(term(&["-b9600", "x"], &[]).line.baud, 9600);
+    assert_eq!(term(&["--prefix=alt-b", "x"], &[]).prefix.key.letter, b'b');
+    assert_eq!(term(&["x", "-b", "4800"], &[]).line.baud, 4800);
+    assert_eq!(term(&["--", "-x"], &[]).device, "-x");
+    assert!(err(&["-D", "-x"], &[]).contains("-D needs a device"));
+    assert!(err(&["-D", "-b", "x"], &[]).contains("-D needs a device"));
+    assert!(parse_with(&["-VV"], &[]).is_err());
+    assert!(parse_with(&["--version", "--version"], &[]).is_err());
+    assert!(parse_with(&["-V", "--version"], &[]).is_err());
+    assert!(parse_with(&["-D", "--", "x"], &[]).is_err());
+    assert!(parse_with(&["-D", "--"], &[]).is_err());
+}
+
+#[test]
+fn version_alone() {
+    assert!(matches!(
+        parse_with(&["--version"], &[]).unwrap(),
+        Command::Version
+    ));
+    assert!(matches!(
+        parse_with(&["-V"], &[]).unwrap(),
+        Command::Version
+    ));
+}
+
+#[test]
+fn version_with_other_arguments_rejected() {
+    assert!(parse_with(&["--version", "x"], &[]).is_err());
+    assert!(parse_with(&["-b", "9600", "--version"], &[]).is_err());
+}
+
+#[test]
+fn unknown_option_rejected() {
+    assert!(parse_with(&["--frobnicate", "x"], &[]).is_err());
+    assert!(parse_with(&["-Z", "x"], &[]).is_err());
+}
+
+#[test]
+fn combined_short_flags() {
+    let t = term(&["-om", "x"], &[]);
+    assert!(t.no_init);
+    assert_eq!(t.prefix.key, ALT_A);
+}
+
+#[test]
+fn bad_env_prefix_reported_even_when_a_flag_overrides_it() {
+    let e = err(
+        &["--show-prefix", "--prefix", "alt-b"],
+        &[("XCOMM_PREFIX", "garbage")],
+    );
+    assert!(e.contains("XCOMM_PREFIX"), "{e}");
+    assert!(parse_with(&["-m", "x"], &[("XCOMM_PREFIX", "garbage")]).is_err());
+}
+
+#[test]
+fn non_utf8_values_name_the_option() {
+    use std::os::unix::ffi::OsStringExt;
+    let bad = || OsString::from_vec(vec![0xff]);
+    for (opt, name) in [
+        ("-b", "-b"),
+        ("-D", "-D"),
+        ("--prefix", "--prefix"),
+        ("-e", "-e"),
+        ("--escape", "--escape"),
+        ("--parity", "--parity"),
+    ] {
+        let e = parse(
+            vec![OsString::from(opt), bad(), OsString::from("x")],
+            &env_of(&[]),
+        )
+        .unwrap_err()
+        .0;
+        assert!(e.contains(name) && e.contains("UTF-8"), "{opt}: {e}");
+    }
+    let e = parse(vec![bad()], &env_of(&[])).unwrap_err().0;
+    assert!(e.contains("device"), "{e}");
+}
+
+#[test]
+fn bare_separator_counts_as_an_argument_for_version_and_show_prefix() {
+    assert!(parse_with(&["--version", "--"], &[]).is_err());
+    assert!(parse_with(&["--show-prefix", "--"], &[]).is_err());
+}
+
+#[test]
+fn dash_devices_rejected_with_usable_hints() {
+    let e = err(&["-D", "--"], &[]);
+    assert!(!e.contains("use --"), "{e}");
+    let e = err(&["-D", "-"], &[]);
+    assert!(!e.contains("use --"), "{e}");
+    assert!(err(&["-D", "-foo"], &[]).contains("use -- -foo"));
+    assert_eq!(term(&["--", "-foo"], &[]).device, "-foo");
+    assert!(parse_with(&["-"], &[]).is_err());
+    assert!(parse_with(&["--", "--"], &[]).is_err());
+}
+
+#[test]
+fn numbers_must_be_plain_digits() {
+    for v in ["+9600", " 9600", "9600 ", "0x10"] {
+        assert!(parse_with(&["-b", v, "x"], &[]).is_err(), "{v:?}");
+    }
+    assert!(parse_with(&["--prefix-time", "+25", "x"], &[]).is_err());
+    assert_eq!(
+        term(&["--prefix-time", "0025", "x"], &[]).prefix_time,
+        Duration::from_millis(25)
+    );
+}

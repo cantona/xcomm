@@ -1,10 +1,24 @@
 use std::process::{Command, Stdio};
 
+/// Strips variables that change prefix resolution, so the tests do not
+/// depend on the environment they run in.
+fn cmd() -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_xcomm"));
+    for v in [
+        "XCOMM_PREFIX",
+        "HERDR_ENV",
+        "HC_TERMINAL_ID",
+        "TMUX",
+        "STY",
+        "ZELLIJ",
+    ] {
+        c.env_remove(v);
+    }
+    c
+}
+
 fn xcomm(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_xcomm"))
-        .args(args)
-        .output()
-        .unwrap()
+    cmd().args(args).output().unwrap()
 }
 
 #[test]
@@ -30,19 +44,52 @@ fn no_arguments_prints_usage_and_exits_2() {
 }
 
 #[test]
-fn version_with_extra_argument_is_a_usage_error() {
+fn version_with_extra_argument_is_rejected() {
     let out = xcomm(&["--version", "extra"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
-        "xcomm: usage: xcomm [options] <device>\n"
+        "xcomm: --version takes no other arguments\n"
     );
 }
 
 #[test]
+fn show_prefix_prints_key_and_reason() {
+    let out = cmd().args(["--show-prefix", "-m"]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "Alt-A (command line)\n"
+    );
+}
+
+#[test]
+fn bad_option_exits_2_with_message() {
+    let out = xcomm(&["--frobnicate"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.starts_with("xcomm: ") && err.contains("--frobnicate"),
+        "{err}"
+    );
+}
+
+#[test]
+fn non_utf8_prefix_env_is_an_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let out = cmd()
+        .arg("--show-prefix")
+        .env("XCOMM_PREFIX", std::ffi::OsStr::from_bytes(b"ctrl-\xff"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("XCOMM_PREFIX"));
+}
+
+#[test]
 fn version_to_closed_pipe_reports_error_without_aborting() {
-    let out = Command::new(env!("CARGO_BIN_EXE_xcomm"))
+    let out = cmd()
         .arg("--version")
         .stdout(closed_pipe())
         .stderr(Stdio::piped())
@@ -61,16 +108,13 @@ fn closed_pipe() -> std::io::PipeWriter {
 
 #[test]
 fn usage_error_with_closed_stderr_still_exits_2() {
-    let out = Command::new(env!("CARGO_BIN_EXE_xcomm"))
-        .stderr(closed_pipe())
-        .output()
-        .unwrap();
+    let out = cmd().stderr(closed_pipe()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
 fn version_with_stdout_and_stderr_closed_exits_1() {
-    let out = Command::new(env!("CARGO_BIN_EXE_xcomm"))
+    let out = cmd()
         .arg("--version")
         .stdout(closed_pipe())
         .stderr(closed_pipe())

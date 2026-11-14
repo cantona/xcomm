@@ -1,16 +1,34 @@
 use std::process::ExitCode;
+use xcomm::cli::{self, Command};
 use xcomm::out;
 
-fn main() -> ExitCode {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() == 1 && args[0] == "--version" {
-        let line = format!("xcomm {}\n", env!("CARGO_PKG_VERSION"));
-        if let Err(e) = out::stdout(line.as_bytes()) {
+fn env(name: &str) -> Option<String> {
+    // Lossy, not `var().ok()`: a non-UTF-8 value must reach the parser and fail
+    // there instead of being treated as unset.
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+fn print(line: &str) -> ExitCode {
+    match out::stdout(format!("{line}\n").as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
             out::report(&format!("cannot write to stdout: {e}"));
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-        return ExitCode::SUCCESS;
     }
-    out::report("usage: xcomm [options] <device>");
-    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    match cli::parse(std::env::args_os().skip(1), &env) {
+        Err(e) => {
+            out::report(&e.0);
+            ExitCode::from(2)
+        }
+        Ok(Command::Version) => print(&format!("xcomm {}", env!("CARGO_PKG_VERSION"))),
+        Ok(Command::ShowPrefix(p)) => print(&p.describe()),
+        Ok(Command::Term(_)) => {
+            out::report("terminal sessions are not implemented yet");
+            ExitCode::FAILURE
+        }
+    }
 }
