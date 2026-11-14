@@ -1,0 +1,17 @@
+[package]
+name = "xcomm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Fast serial terminal with an agent control interface and a herdr plugin"
+repository = "https://github.com/cantona/xcomm"
+keywords = ["serial", "terminal", "minicom", "uart", "tty"]
+categories = ["command-line-utilities", "hardware-support"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
