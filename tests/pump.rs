@@ -93,6 +93,7 @@ fn closed_input_with_a_full_queue_does_not_spin() {
             stdout: out_w.as_fd(),
             device: device.as_fd(),
             signals: &signals,
+            prefix: None,
         },
         &mut clock,
     )
@@ -143,6 +144,7 @@ fn sigterm_ends_the_session_while_a_nonblocking_terminal_is_stalled() {
             stdout: out_w.as_fd(),
             device: device.as_fd(),
             signals: &signals,
+            prefix: None,
         },
         &mut clock,
     )
@@ -207,6 +209,7 @@ fn sigterm_ends_the_session_while_a_blocking_terminal_is_stalled() {
             stdout: out_w.as_fd(),
             device: device.as_fd(),
             signals: &signals,
+            prefix: None,
         },
         &mut clock,
     )
@@ -245,6 +248,7 @@ fn a_terminal_that_goes_away_ends_the_session_as_gone() {
             stdout: slave.as_fd(),
             device: device.as_fd(),
             signals: &signals,
+            prefix: None,
         },
         &mut clock,
     )
@@ -273,6 +277,7 @@ fn a_pipe_reader_that_leaves_ends_the_session_as_gone() {
             stdout: out_w.as_fd(),
             device: device.as_fd(),
             signals: &signals,
+            prefix: None,
         },
         &mut clock,
     )
@@ -318,6 +323,7 @@ fn end_of_input_waits_until_everything_reached_the_device() {
             stdout: out_w.as_fd(),
             device: device.as_fd(),
             signals: &signals,
+            prefix: None,
         },
         &mut clock,
     )

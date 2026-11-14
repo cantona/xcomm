@@ -68,7 +68,7 @@ fn defaults_are_115200_8n1_no_flow() {
     );
     assert_eq!(t.line, LineSettings::default());
     assert_eq!(t.prefix_time, Duration::from_millis(25));
-    assert!(!t.no_init && !t.no_lock && !t.low_latency);
+    assert!(!t.no_init && !t.no_lock && !t.low_latency && !t.wrap);
 }
 
 #[test]
@@ -163,8 +163,8 @@ fn bad_line_format_values_rejected() {
 
 #[test]
 fn boolean_flags() {
-    let t = term(&["-o", "--no-lock", "--low-latency", "x"], &[]);
-    assert!(t.no_init && t.no_lock && t.low_latency);
+    let t = term(&["-o", "--no-lock", "--low-latency", "-w", "x"], &[]);
+    assert!(t.no_init && t.no_lock && t.low_latency && t.wrap);
 }
 
 #[test]

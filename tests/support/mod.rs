@@ -119,6 +119,27 @@ pub fn spawn_xcomm(args: &[&str], lock_dir: &std::path::Path) -> Spawned {
 
 /// Like spawn_xcomm, for any program (for example a shell that starts xcomm).
 pub fn spawn_in_pty(program: &str, args: &[&str], lock_dir: &std::path::Path) -> Spawned {
+    spawn_with_env(program, args, lock_dir, &[])
+}
+
+/// Like spawn_in_pty, with `env` set after the prefix variables are removed.
+pub fn spawn_with_env(
+    program: &str,
+    args: &[&str],
+    lock_dir: &std::path::Path,
+    env: &[(&str, &str)],
+) -> Spawned {
+    spawn_with(program, args, lock_dir, env, None)
+}
+
+/// Like spawn_with_env, with stdout sent to `stdout` instead of the pty.
+pub fn spawn_with(
+    program: &str,
+    args: &[&str],
+    lock_dir: &std::path::Path,
+    env: &[(&str, &str)],
+    stdout: Option<std::process::Stdio>,
+) -> Spawned {
     use std::os::unix::process::CommandExt;
     let host = pty();
     let slave = host.slave.try_clone().unwrap();
@@ -126,7 +147,7 @@ pub fn spawn_in_pty(program: &str, args: &[&str], lock_dir: &std::path::Path) ->
     cmd.args(args)
         .env("XCOMM_LOCK_DIR", lock_dir)
         .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
-        .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
+        .stdout(stdout.unwrap_or_else(|| std::process::Stdio::from(slave.try_clone().unwrap())))
         .stderr(std::process::Stdio::from(slave));
     for v in [
         "XCOMM_PREFIX",
@@ -138,6 +159,7 @@ pub fn spawn_in_pty(program: &str, args: &[&str], lock_dir: &std::path::Path) ->
     ] {
         cmd.env_remove(v);
     }
+    cmd.envs(env.iter().copied());
     // SAFETY: setsid and ioctl are async-signal-safe.
     unsafe {
         cmd.pre_exec(|| {

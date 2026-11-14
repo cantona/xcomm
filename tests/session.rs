@@ -34,7 +34,8 @@ fn device_bytes_reach_the_terminal_unchanged() {
 #[test]
 fn keyboard_bytes_reach_the_device_unchanged() {
     let (dev, s) = start(&[]);
-    let all: Vec<u8> = (0u8..=255).collect();
+    // All but the prefix, Ctrl-A (tests/session_keys.rs).
+    let all: Vec<u8> = (0u8..=255).filter(|&b| b != 0x01).collect();
     write_all(s.host.master.as_fd(), &all);
     assert_eq!(read_until(dev.master.as_fd(), &[255], T), all);
 }

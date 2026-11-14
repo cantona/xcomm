@@ -112,10 +112,12 @@ pub struct Port {
     fd: OwnedFd,
     path: PathBuf,
     tty_name: String,
-    settings: LineSettings,
+    /// In a Cell so the port can be reconfigured through a shared
+    /// reference while the session loop holds its fd.
+    settings: std::cell::Cell<LineSettings>,
     init: bool,
     /// Set once configure has applied settings to the tty.
-    configured: bool,
+    configured: std::cell::Cell<bool>,
 }
 
 /// ASYNC_LOW_LATENCY is a best-effort hint: a driver without it, or one
@@ -332,13 +334,13 @@ impl Port {
         // Seeded with what the tty has now, so a revert during the first
         // configure restores that and not the request.
         let current = tcgetattr(&fd).map_err(|e| open_err(e.into()))?;
-        let mut port = Port {
+        let port = Port {
             fd,
             path: path.to_path_buf(),
             tty_name,
-            settings: settings_from(&current),
+            settings: std::cell::Cell::new(settings_from(&current)),
             init,
-            configured: false,
+            configured: std::cell::Cell::new(false),
         };
         // Only now: from here on, dropping `port` clears TIOCEXCL again.
         ioctl_none(port.fd(), libc::TIOCEXCL as libc::c_ulong).map_err(|source| {
@@ -376,7 +378,7 @@ impl Port {
     /// `settings()` holds what the driver applied; `Applied::Different`
     /// reports when that is not `s`. An error after the termios was changed
     /// puts the previous one back.
-    pub fn configure(&mut self, s: &LineSettings) -> Result<Applied, PortError> {
+    pub fn configure(&self, s: &LineSettings) -> Result<Applied, PortError> {
         let config_err = |what: &'static str, source: io::Error| PortError::Config {
             path: self.path.clone(),
             what,
@@ -434,8 +436,8 @@ impl Port {
             Ok(applied) => applied,
             Err(cause) => return Err(self.revert(&prior, cause)),
         };
-        self.settings = applied;
-        self.configured = true;
+        self.settings.set(applied);
+        self.configured.set(true);
         let same_format = LineSettings {
             baud: s.baud,
             ..applied
@@ -479,8 +481,8 @@ impl Port {
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut result = tcsetattr(&self.fd, OptionalActions::Now, prior).map_err(io::Error::from);
         #[cfg(target_os = "macos")]
-        if result.is_ok() && termios_rate(self.settings.baud) != self.settings.baud {
-            result = self.set_macos_speed(self.settings.baud);
+        if result.is_ok() && termios_rate(self.settings.get().baud) != self.settings.get().baud {
+            result = self.set_macos_speed(self.settings.get().baud);
         }
         match result {
             Ok(()) => cause,
@@ -515,8 +517,8 @@ impl Port {
         Ok(settings_from(&t))
     }
 
-    pub fn settings(&self) -> &LineSettings {
-        &self.settings
+    pub fn settings(&self) -> LineSettings {
+        self.settings.get()
     }
 
     pub fn path(&self) -> &Path {
@@ -583,11 +585,11 @@ impl Port {
     /// Writes `t` with this port's rate, re-issuing IOSSIOSPEED on macOS,
     /// where termios only holds a standard placeholder rate.
     fn write_termios(&self, t: &mut Termios) -> io::Result<()> {
-        t.set_speed(termios_rate(self.settings.baud))?;
+        t.set_speed(termios_rate(self.settings.get().baud))?;
         tcsetattr(&self.fd, OptionalActions::Now, t)?;
         #[cfg(target_os = "macos")]
-        if termios_rate(self.settings.baud) != self.settings.baud {
-            self.set_macos_speed(self.settings.baud)?;
+        if termios_rate(self.settings.get().baud) != self.settings.get().baud {
+            self.set_macos_speed(self.settings.get().baud)?;
         }
         Ok(())
     }
@@ -596,7 +598,7 @@ impl Port {
     /// then restores them. IXOFF stays on, so xcomm still sends XOFF when
     /// its own input fills up.
     fn without_output_flow_control<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-        if self.settings.flow == Flow::None {
+        if self.settings.get().flow == Flow::None {
             return f();
         }
         let mut saved = tcgetattr(&self.fd)?;
@@ -728,8 +730,8 @@ impl Drop for Port {
         // gets a short time and what is left is discarded.
         // Only on a port this Port configured: after a failed open the tty
         // holds the previous program's settings, which are left as they are.
-        if self.configured
-            && self.settings.flow != Flow::None
+        if self.configured.get()
+            && self.settings.get().flow != Flow::None
             && let Ok(mut t) = tcgetattr(&self.fd)
         {
             t.control_modes.remove(ControlModes::CRTSCTS);

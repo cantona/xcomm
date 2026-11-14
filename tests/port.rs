@@ -27,7 +27,7 @@ fn open_configures_raw_8n1_and_custom_baud() {
     };
     let port = open(&p, &s);
     assert_eq!(port.read_settings().unwrap(), s);
-    assert_eq!(port.settings(), &s);
+    assert_eq!(port.settings(), s);
     let t = tcgetattr(port.fd()).unwrap();
     assert!(
         t.control_modes
@@ -38,7 +38,7 @@ fn open_configures_raw_8n1_and_custom_baud() {
 #[test]
 fn every_line_format_is_applied_or_reported_as_different() {
     let p = support::pty();
-    let mut port = open(&p, &LineSettings::default());
+    let port = open(&p, &LineSettings::default());
     let mut exact = 0;
     for data_bits in [
         DataBits::Five,
@@ -60,12 +60,12 @@ fn every_line_format_is_applied_or_reported_as_different() {
                         Applied::Exact => {
                             exact += 1;
                             assert_eq!(port.read_settings().unwrap(), s);
-                            assert_eq!(port.settings(), &s);
+                            assert_eq!(port.settings(), s);
                         }
                         Applied::Different(applied) => {
                             assert_ne!(applied, s);
                             assert_eq!(port.read_settings().unwrap(), applied);
-                            assert_eq!(port.settings(), &applied, "settings() must be the truth");
+                            assert_eq!(port.settings(), applied, "settings() must be the truth");
                         }
                     }
                 }
@@ -83,7 +83,7 @@ fn every_line_format_is_applied_or_reported_as_different() {
 #[test]
 fn standard_and_odd_bauds_round_trip() {
     let p = support::pty();
-    let mut port = open(&p, &LineSettings::default());
+    let port = open(&p, &LineSettings::default());
     for baud in [
         50, 300, 9600, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 3_000_000, 31_250,
         74_880,
@@ -283,14 +283,14 @@ fn baud_tolerance_is_one_percent() {
 #[test]
 fn baud_zero_is_refused_and_leaves_the_port_alone() {
     let p = support::pty();
-    let mut port = open(&p, &LineSettings::default());
+    let port = open(&p, &LineSettings::default());
     let s = LineSettings {
         baud: 0,
         ..LineSettings::default()
     };
     let e = port.configure(&s).err().unwrap().to_string();
     assert!(e.contains("baud rate 0"), "{e}");
-    assert_eq!(port.settings(), &LineSettings::default());
+    assert_eq!(port.settings(), LineSettings::default());
     assert_eq!(port.read_settings().unwrap(), LineSettings::default());
 }
 

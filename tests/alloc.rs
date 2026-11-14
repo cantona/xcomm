@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 
+use xcomm::cli::{Modifier, PrefixKey};
 use xcomm::hosttty::SignalPipe;
 use xcomm::session::{Control, ExitReason, Pump, pump};
 
@@ -37,6 +38,7 @@ struct Count {
     iterations: u64,
     warm: Option<u64>,
     end: u64,
+    echo: bool,
 }
 
 impl Control for Count {
@@ -54,10 +56,29 @@ impl Control for Count {
         }
         ControlFlow::Continue(())
     }
+    fn local_echo(&self) -> bool {
+        self.echo
+    }
 }
 
+/// One test: a process has one signal pipe at a time. The second run adds
+/// the prefix parser, local echo, held Alt sequences (a CSI arrow key, an
+/// ESC cut off at the end of a write) and commands.
 #[test]
 fn the_loop_does_not_allocate_in_steady_state() {
+    run(None, false, b"typed");
+    let alt_a = PrefixKey {
+        modifier: Modifier::Alt,
+        letter: b'a',
+    };
+    run(
+        Some((alt_a, std::time::Duration::from_millis(1))),
+        true,
+        b"typed\x1b[A\x1baz\x1b",
+    );
+}
+
+fn run(prefix: Option<(PrefixKey, std::time::Duration)>, echo: bool, typed: &'static [u8]) {
     let dev = support::pty();
     let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
     let (out_r, out_w) = std::io::pipe().unwrap();
@@ -71,7 +92,25 @@ fn the_loop_does_not_allocate_in_steady_state() {
         rustix::fs::fcntl_setfl(fd, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
     }
     let feeder = keep_writing(master, &[0x55u8; 4096], stop.clone());
-    let typist = keep_writing(in_w.into(), b"typed", stop.clone());
+    let typist = keep_writing(in_w.into(), typed, stop.clone());
+    // What the loop sends to the device must be taken, or the queue fills
+    // and the loop stops reading input.
+    let drainer = {
+        let master = dev.master.try_clone().unwrap();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match rustix::io::read(master.as_fd(), &mut buf[..]) {
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::AGAIN) => {
+                        std::thread::sleep(std::time::Duration::from_millis(1))
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
     let reader = std::thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         while let Ok(n) = rustix::io::read(out_r.as_fd(), &mut buf[..]) {
@@ -93,6 +132,7 @@ fn the_loop_does_not_allocate_in_steady_state() {
         iterations: 0,
         warm: None,
         end: 0,
+        echo,
     };
     let reason = {
         let p = Pump {
@@ -100,6 +140,7 @@ fn the_loop_does_not_allocate_in_steady_state() {
             stdout: out_w.as_fd(),
             device: port_fd.as_fd(),
             signals: &signals,
+            prefix,
         };
         pump(&p, &mut count).unwrap()
     };
@@ -113,6 +154,7 @@ fn the_loop_does_not_allocate_in_steady_state() {
     drop(dev);
     let _ = feeder.join();
     let _ = typist.join();
+    let _ = drainer.join();
     let _ = reader.join();
 }
 

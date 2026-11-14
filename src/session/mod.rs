@@ -1,17 +1,20 @@
 //! The terminal session: one poll(2) loop moving bytes between the host
 //! terminal and the serial port.
 
+mod commands;
 pub mod outq;
 
 use std::io;
 use std::ops::ControlFlow;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::cli::TermOpts;
 use crate::hosttty::{RawMode, SignalPipe};
+use crate::keys::{KeyAction, KeyParser};
 use crate::lock::{self, Cleared, UucpLock};
 use crate::port::{self, Applied, LowLatency, Port};
 use outq::OutQueue;
@@ -30,6 +33,25 @@ pub enum ExitReason {
     TerminalGone,
     /// The caller's `tick` asked to stop (tests).
     Requested,
+    /// The user's quit command.
+    Quit,
+}
+
+/// What a command key did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Continue,
+    Exit(ExitReason),
+}
+
+/// What a command may use: the keyboard (for prompts) and the signal pipe
+/// (which must still end the session while a prompt waits).
+pub struct CommandIo<'a> {
+    pub stdin: BorrowedFd<'a>,
+    pub signals: &'a SignalPipe,
+    /// Keys read after the command key and not yet handled. A prompt takes
+    /// its input from here first; what it leaves is handled as usual.
+    pub typed: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -55,6 +77,21 @@ pub trait Control {
     fn tick(&mut self) -> ControlFlow<()> {
         ControlFlow::Continue(())
     }
+    /// The key typed after the prefix.
+    fn command(
+        &mut self,
+        _key: u8,
+        _io: &mut CommandIo<'_>,
+    ) -> Result<CommandOutcome, SessionError> {
+        Ok(CommandOutcome::Continue)
+    }
+    /// Whether keyboard input is also shown on the terminal.
+    fn local_echo(&self) -> bool {
+        false
+    }
+    /// Keys were dropped: the device has taken nothing for STALL. Called
+    /// once per stall.
+    fn dropping_input(&mut self) {}
 }
 
 /// The file descriptors the loop moves bytes between.
@@ -66,7 +103,20 @@ pub struct Pump<'a> {
     pub stdout: BorrowedFd<'a>,
     pub device: BorrowedFd<'a>,
     pub signals: &'a SignalPipe,
+    /// The command prefix, when keyboard input is a terminal; None passes
+    /// every byte through (piped input must not trigger commands).
+    pub prefix: Option<(crate::cli::PrefixKey, std::time::Duration)>,
 }
+
+/// Room kept in the output queue for bytes the key parser holds, which it
+/// releases in addition to the bytes of the next read.
+const HELD_ROOM: usize = crate::keys::HELD_MAX;
+/// How long the device may take nothing from a full queue before keyboard
+/// input is read anyway, so that the commands (quit) still work. Keys that
+/// do not fit are dropped then.
+const STALL: Duration = Duration::from_secs(2);
+/// How long quitting waits for queued keys to reach the device.
+const QUIT_DRAIN: Duration = Duration::from_secs(1);
 
 const BUF_SIZE: usize = 64 * 1024;
 
@@ -219,6 +269,57 @@ fn write_out(
     })
 }
 
+/// Writes what is queued for the device, for up to QUIT_DRAIN: keys typed
+/// before a quit still go out, and a device that takes nothing (held off by
+/// flow control) cannot keep the session from ending. A termination signal
+/// ends the wait.
+fn drain_queue(
+    queue: &mut OutQueue,
+    p: &Pump<'_>,
+    ctl: &mut dyn Control,
+) -> Result<Option<ExitReason>, SessionError> {
+    let deadline = Instant::now() + QUIT_DRAIN;
+    let signal_fd = p.signals.fd();
+    while !queue.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let left = rustix::event::Timespec::try_from(left).expect("under QUIT_DRAIN");
+        let mut fds = [
+            PollFd::new(&p.device, PollFlags::OUT),
+            PollFd::new(&signal_fd, PollFlags::IN),
+        ];
+        match poll(&mut fds, Some(&left)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(SessionError(format!("poll: {e}"))),
+        }
+        if fds[1].revents().contains(PollFlags::IN) {
+            let bits = p.signals.drain().map_err(|e| SessionError(e.to_string()))?;
+            if let Signaled::Exit(exit) = on_signals(bits, p.signals, ctl)? {
+                return Ok(Some(exit));
+            }
+        }
+        if fds[0]
+            .revents()
+            .intersects(PollFlags::OUT | PollFlags::ERR | PollFlags::HUP)
+        {
+            match queue.write_to(p.device) {
+                Ok(_) => {}
+                // Gone: nothing more can reach it, and the session is ending.
+                Err(e)
+                    if e.raw_os_error()
+                        .is_some_and(|c| gone(rustix::io::Errno::from_raw_os_error(c))) =>
+                {
+                    break;
+                }
+                Err(e) => return Err(SessionError(format!("write to device: {e}"))),
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn gone(e: rustix::io::Errno) -> bool {
     matches!(
         e,
@@ -239,11 +340,32 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
     // or the queue is full) the slot holds the signal pipe with no events:
     // stdin itself would still report POLLHUP and make poll return at once.
     let signal_fd = p.signals.fd();
+    let mut keys = p.prefix.map(|(key, time)| KeyParser::new(key, time));
+    // Local echo of what goes to the device; never grows past this.
+    let mut echo = Vec::with_capacity(if keys.is_some() {
+        BUF_SIZE + HELD_ROOM
+    } else {
+        0
+    });
+    // Since when a full queue has kept keyboard input waiting, and whether
+    // that has lasted STALL. Piped input just waits for the device.
+    let mut full_since: Option<Instant> = None;
+    let mut stalled = false;
+    let mut told_dropping = false;
     loop {
         if ctl.tick().is_break() {
             return Ok(ExitReason::Requested);
         }
-        let want_stdin = stdin_open && queue.free() > 0;
+        let full = queue.free() <= HELD_ROOM;
+        if full && stdin_open && keys.is_some() {
+            let since = *full_since.get_or_insert_with(Instant::now);
+            stalled = stalled || since.elapsed() >= STALL;
+        } else {
+            full_since = None;
+            stalled = false;
+            told_dropping = false;
+        }
+        let want_stdin = stdin_open && (!full || stalled);
         let device_events = if queue.is_empty() {
             PollFlags::IN
         } else {
@@ -258,10 +380,53 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
             PollFd::new(&p.device, device_events),
             PollFd::new(&stdin_slot, stdin_events),
         ];
-        match poll(&mut fds, None) {
+        // A held lone ESC is given up on at its deadline; a full queue is
+        // looked at again when it would count as stalled.
+        let held_due = keys.as_ref().and_then(|k| k.deadline());
+        let stall_due = full_since.filter(|_| !stalled).map(|t| t + STALL);
+        let due = match (held_due, stall_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let timeout = due.map(|due| {
+            rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
+                .unwrap_or(rustix::event::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                })
+        });
+        match poll(&mut fds, timeout.as_ref()) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(SessionError(format!("poll: {e}"))),
+        }
+        if let Some(k) = keys.as_mut().filter(|k| k.deadline().is_some()) {
+            let echoing = ctl.local_echo();
+            // Room was kept for held bytes, except for what a stall held:
+            // that can find the queue still full.
+            let mut dropped = false;
+            k.on_deadline(Instant::now(), &mut |a| {
+                if let KeyAction::Forward(b) = a {
+                    let queued = queue.push(b);
+                    dropped |= !queued;
+                    if queued && echoing {
+                        echo.extend_from_slice(b);
+                    }
+                }
+            });
+            if dropped && !told_dropping {
+                told_dropping = true;
+                ctl.dropping_input();
+            }
+            if !echo.is_empty() {
+                let r = write_out(p.stdout, &echo, p, ctl)?;
+                echo.clear();
+                match r {
+                    Signaled::Exit(exit) => return Ok(exit),
+                    Signaled::Resumed => continue,
+                    Signaled::Nothing => {}
+                }
+            }
         }
         let sig_ready = fds[0].revents();
         let dev_ready = fds[1].revents();
@@ -296,29 +461,85 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
             }
         }
 
-        if dev_ready.contains(PollFlags::OUT) {
-            match queue.write_to(p.device) {
-                Ok(_) => {}
-                Err(e)
-                    if e.raw_os_error()
-                        .is_some_and(|c| gone(rustix::io::Errno::from_raw_os_error(c))) =>
-                {
-                    return Ok(ExitReason::DeviceGone);
-                }
-                Err(e) => return Err(SessionError(format!("write to device: {e}"))),
-            }
+        if dev_ready.contains(PollFlags::OUT)
+            && let Some(exit) = write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
+        {
+            return Ok(exit);
         }
 
+        // Held bytes released earlier in this pass may have used the room
+        // kept for them.
+        let room = if stalled {
+            buf.len()
+        } else {
+            queue.free().saturating_sub(HELD_ROOM).min(buf.len())
+        };
         if let Some(stdin) = stdin_fd
+            && room > 0
             && stdin_ready.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
         {
-            let room = queue.free().min(buf.len());
             match rustix::io::read(stdin, &mut buf[..room]) {
                 Ok(0) => stdin_open = false,
-                Ok(n) => {
-                    let queued = queue.push(&buf[..n]);
-                    debug_assert!(queued, "read was bounded by the free space");
-                }
+                Ok(n) => match keys.as_mut() {
+                    None => {
+                        let queued = queue.push(&buf[..n]);
+                        debug_assert!(queued, "read was bounded by the free space");
+                    }
+                    Some(k) => {
+                        // A command acts before the keys after it are
+                        // handled. Bytes queued before it may still reach
+                        // the device after it.
+                        let mut rest = &buf[..n];
+                        while !rest.is_empty() {
+                            let echoing = ctl.local_echo();
+                            let mut command = None;
+                            let mut dropped = false;
+                            let used = k.feed(rest, Instant::now(), &mut |a| match a {
+                                // The read was bounded by the free space,
+                                // except in a stall, or with bytes a stall
+                                // held.
+                                KeyAction::Forward(b) => {
+                                    let queued = queue.push(b);
+                                    dropped |= !queued;
+                                    if queued && echoing {
+                                        echo.extend_from_slice(b);
+                                    }
+                                }
+                                KeyAction::Command(c) => command = Some(c),
+                            });
+                            rest = &rest[used..];
+                            if dropped && !told_dropping {
+                                told_dropping = true;
+                                ctl.dropping_input();
+                            }
+                            if !echo.is_empty() {
+                                let r = write_out(p.stdout, &echo, p, ctl)?;
+                                echo.clear();
+                                if let Signaled::Exit(exit) = r {
+                                    return Ok(exit);
+                                }
+                            }
+                            let Some(c) = command else {
+                                continue;
+                            };
+                            let mut io = CommandIo {
+                                stdin,
+                                signals: p.signals,
+                                typed: rest,
+                            };
+                            let outcome = ctl.command(c, &mut io)?;
+                            rest = io.typed;
+                            match outcome {
+                                CommandOutcome::Continue => {}
+                                CommandOutcome::Exit(ExitReason::Quit) => {
+                                    return Ok(drain_queue(&mut queue, p, ctl)?
+                                        .unwrap_or(ExitReason::Quit));
+                                }
+                                CommandOutcome::Exit(exit) => return Ok(exit),
+                            }
+                        }
+                    }
+                },
                 Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
                 // The terminal is gone; that is the end of input too.
                 Err(e) if gone(e) => stdin_open = false,
@@ -330,6 +551,17 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
                 }
                 Err(e) => return Err(SessionError(format!("read from terminal: {e}"))),
             }
+        }
+        // Keys go out now, not after another poll says the device can take
+        // them: that pass is most of a keystroke's latency. Keyboard input
+        // only; piped input waits for poll as before. A device that cannot
+        // take them says EAGAIN, and poll takes over.
+        if keys.is_some()
+            && stdin_ready.intersects(PollFlags::IN)
+            && !queue.is_empty()
+            && let Some(exit) = write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
+        {
+            return Ok(exit);
         }
         // End of input (not the absence of input) ends the session once
         // everything read has reached the device (`cat file | xcomm dev` must not lose the tail). The
@@ -364,6 +596,30 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
     }
 }
 
+/// Writes what the device takes of `queue`; Some when the device is gone.
+fn write_queue(
+    queue: &mut OutQueue,
+    device: BorrowedFd<'_>,
+    full_since: &mut Option<Instant>,
+    stalled: &mut bool,
+) -> Result<Option<ExitReason>, SessionError> {
+    match queue.write_to(device) {
+        Ok(0) => Ok(None),
+        Ok(_) => {
+            *full_since = None;
+            *stalled = false;
+            Ok(None)
+        }
+        Err(e)
+            if e.raw_os_error()
+                .is_some_and(|c| gone(rustix::io::Errno::from_raw_os_error(c))) =>
+        {
+            Ok(Some(ExitReason::DeviceGone))
+        }
+        Err(e) => Err(SessionError(format!("write to device: {e}"))),
+    }
+}
+
 /// Whether `fd` was opened for reading. nohup reopens stdin as /dev/null
 /// write-only; there is then no input, and the session runs without it.
 fn readable(fd: BorrowedFd<'_>) -> bool {
@@ -392,32 +648,6 @@ impl Notices {
     fn say(&self, msg: &str) {
         let end = if self.raw { "\r\n" } else { "\n" };
         let _ = io::Write::write_all(&mut io::stderr(), format!("xcomm: {msg}{end}").as_bytes());
-    }
-}
-
-/// Stops on SIGTSTP. A session leader (an xcomm started as a tmux or herdr
-/// pane command) is in an orphaned process group with no shell to send
-/// SIGCONT; it stays stopped until something does (`kill -CONT`).
-struct Live<'a> {
-    raw: Option<&'a RawMode>,
-}
-
-impl Control for Live<'_> {
-    fn stop(&mut self) -> io::Result<()> {
-        if let Some(raw) = self.raw {
-            raw.suspend()?;
-        }
-        // SAFETY: raise(3) is safe to call; SIGSTOP stops this process here
-        // and execution continues after SIGCONT.
-        unsafe { libc::raise(libc::SIGSTOP) };
-        Ok(())
-    }
-
-    fn resume(&mut self) -> io::Result<()> {
-        match self.raw {
-            Some(raw) => raw.reenter(),
-            None => Ok(()),
-        }
     }
 }
 
@@ -479,7 +709,8 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     } else {
         None
     };
-    let notices = Notices { raw: raw.is_some() };
+    let keys_on = raw.is_some();
+    let notices = Notices { raw: keys_on };
     if let Some((_, cleared)) = &lock {
         match cleared {
             Some(Cleared::DeadPid(pid)) => {
@@ -489,7 +720,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             None => {}
         }
     }
-    notices.say(&banner(&path, opts, &port, applied, low_latency));
+    notices.say(&banner(&path, opts, &port, applied, low_latency, keys_on));
 
     let reason = {
         let pump_io = Pump {
@@ -497,9 +728,20 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             stdout: stdout.as_fd(),
             device: port.fd(),
             signals: &signals,
+            prefix: keys_on.then_some((opts.prefix.key, opts.prefix_time)),
         };
-        let mut live = Live { raw: raw.as_ref() };
-        pump(&pump_io, &mut live)
+        let stderr = io::stderr();
+        let mut live = commands::Live::new(
+            raw.as_ref(),
+            &port,
+            opts,
+            stdout.as_fd(),
+            stderr.as_fd(),
+            &signals,
+        );
+        let reason = pump(&pump_io, &mut live);
+        live.finish();
+        reason
     };
     drop(raw);
     let notices = Notices { raw: false };
@@ -557,12 +799,19 @@ fn take_lock(
     })
 }
 
-fn banner(path: &Path, opts: &TermOpts, port: &Port, applied: Applied, low: LowLatency) -> String {
+fn banner(
+    path: &Path,
+    opts: &TermOpts,
+    port: &Port,
+    applied: Applied,
+    low: LowLatency,
+    keys_on: bool,
+) -> String {
     let mut s = format!(
         "{} {} {}, pid {}",
         env!("CARGO_PKG_VERSION"),
         path.display(),
-        port::describe(port.settings()),
+        port::describe(&port.settings()),
         std::process::id()
     );
     if let Applied::Different(actual) = applied {
@@ -574,6 +823,13 @@ fn banner(path: &Path, opts: &TermOpts, port: &Port, applied: Applied, low: LowL
     }
     if low == LowLatency::Set {
         s.push_str(", low latency");
+    }
+    if keys_on {
+        s.push_str(&format!(
+            "; {} Z for help ({})",
+            opts.prefix.key.display(),
+            opts.prefix.source_text()
+        ));
     }
     s
 }

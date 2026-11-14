@@ -103,15 +103,19 @@ pub struct PrefixChoice {
 }
 
 impl PrefixChoice {
-    /// For example `Alt-A (multiplexer: tmux)`.
-    pub fn describe(&self) -> String {
-        let why = match self.source {
+    /// Why this key was chosen, for example `multiplexer: tmux`.
+    pub fn source_text(&self) -> String {
+        match self.source {
             PrefixSource::Flag => "command line".to_string(),
             PrefixSource::Env => "XCOMM_PREFIX".to_string(),
             PrefixSource::Multiplexer(name) => format!("multiplexer: {name}"),
             PrefixSource::Default => "default".to_string(),
-        };
-        format!("{} ({why})", self.key.display())
+        }
+    }
+
+    /// For example `Alt-A (multiplexer: tmux)`.
+    pub fn describe(&self) -> String {
+        format!("{} ({})", self.key.display(), self.source_text())
     }
 }
 
@@ -222,6 +226,8 @@ pub struct TermOpts {
     pub low_latency: bool,
     pub prefix: PrefixChoice,
     pub prefix_time: Duration,
+    /// `-w`: turn the terminal's line wrap on at startup.
+    pub wrap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -322,6 +328,7 @@ pub fn parse(
     let mut no_init = false;
     let mut no_lock = false;
     let mut low_latency = false;
+    let mut wrap = false;
     let mut show_prefix = false;
     let mut version = false;
     // For --version (alone) and --show-prefix (prefix options only).
@@ -406,6 +413,7 @@ pub fn parse(
             Short('o') => no_init = true,
             Long("no-lock") => no_lock = true,
             Long("low-latency") => low_latency = true,
+            Short('w') => wrap = true,
             Long("prefix") | Short('e') | Long("escape") => {
                 let name = match arg {
                     Short('e') => "-e",
@@ -465,5 +473,6 @@ pub fn parse(
         low_latency,
         prefix,
         prefix_time: prefix_time.unwrap_or(Duration::from_millis(25)),
+        wrap,
     }))
 }
