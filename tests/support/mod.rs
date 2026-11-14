@@ -191,3 +191,46 @@ pub fn wait_exit(child: &mut std::process::Child, timeout: Duration) -> std::pro
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// Waits until process `pid` is stopped (state T in /proc).
+#[cfg(target_os = "linux")]
+pub fn wait_stopped(pid: i32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        if stat.rsplit(") ").next().unwrap().starts_with('T') {
+            return;
+        }
+        assert!(Instant::now() < deadline, "process {pid} not stopped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits until process `pid` is inside a write(2) to its stdout. Reading
+/// /proc/<pid>/syscall needs ptrace access; where that is denied
+/// (kernel.yama.ptrace_scope 2 or 3) it waits a fixed time instead, which
+/// is usually enough.
+#[cfg(target_os = "linux")]
+pub fn wait_blocked_writing_stdout(pid: i32, timeout: Duration) {
+    let want = format!("{} 0x1 ", libc::SYS_write);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let call = match std::fs::read_to_string(format!("/proc/{pid}/syscall")) {
+            Ok(call) => call,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("/proc/{pid}/syscall: {e}; waiting 200 ms instead");
+                std::thread::sleep(Duration::from_millis(200));
+                return;
+            }
+            Err(e) => panic!("/proc/{pid}/syscall: {e}"),
+        };
+        if call.starts_with(&want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} not blocked writing stdout: {call}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

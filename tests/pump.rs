@@ -332,3 +332,103 @@ fn end_of_input_waits_until_everything_reached_the_device() {
     assert_eq!(reason, ExitReason::StdinClosed);
     assert_eq!(reader.join().unwrap(), expected);
 }
+
+/// Counts stops; the first one also catches a second SIGTSTP before it
+/// "stops", as a quick second Ctrl-Z can.
+struct StopTwice {
+    stops: u32,
+}
+
+impl Control for StopTwice {
+    fn stop(&mut self) -> std::io::Result<()> {
+        self.stops += 1;
+        if self.stops == 1 {
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_sigtstp_caught_before_the_stop_does_not_stop_again() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let signals = SignalPipe::install(&[libc::SIGTSTP, libc::SIGTERM]).unwrap();
+    let dev = support::pty();
+    let device = raw_device(&dev);
+    let (_out_r, out_w) = std::io::pipe().unwrap();
+    unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+    // Nothing else wakes the loop: SIGTERM ends it.
+    let me = unsafe { libc::pthread_self() } as usize;
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGTERM) };
+    });
+    let mut ctl = StopTwice { stops: 0 };
+    let reason = pump(
+        &Pump {
+            stdin: None,
+            stdout: out_w.as_fd(),
+            device: device.as_fd(),
+            signals: &signals,
+            prefix: None,
+        },
+        &mut ctl,
+    )
+    .unwrap();
+    killer.join().unwrap();
+    assert_eq!(reason, ExitReason::Signal(libc::SIGTERM));
+    assert_eq!(ctl.stops, 1);
+}
+
+/// The first resume catches a SIGTSTP, as one sent right after SIGCONT is.
+struct StopAfterContinue {
+    stops: u32,
+    resumes: u32,
+}
+
+impl Control for StopAfterContinue {
+    fn stop(&mut self) -> std::io::Result<()> {
+        self.stops += 1;
+        Ok(())
+    }
+    fn resume(&mut self) -> std::io::Result<()> {
+        self.resumes += 1;
+        if self.resumes == 1 {
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_sigtstp_after_the_continue_stops_again() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let signals = SignalPipe::install(&[libc::SIGTSTP, libc::SIGTERM]).unwrap();
+    let dev = support::pty();
+    let device = raw_device(&dev);
+    let (_out_r, out_w) = std::io::pipe().unwrap();
+    unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+    let me = unsafe { libc::pthread_self() } as usize;
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGTERM) };
+    });
+    let mut ctl = StopAfterContinue {
+        stops: 0,
+        resumes: 0,
+    };
+    let reason = pump(
+        &Pump {
+            stdin: None,
+            stdout: out_w.as_fd(),
+            device: device.as_fd(),
+            signals: &signals,
+            prefix: None,
+        },
+        &mut ctl,
+    )
+    .unwrap();
+    killer.join().unwrap();
+    assert_eq!(reason, ExitReason::Signal(libc::SIGTERM));
+    assert_eq!((ctl.stops, ctl.resumes), (2, 2));
+}

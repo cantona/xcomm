@@ -65,8 +65,11 @@ impl std::fmt::Display for SessionError {
 
 /// What the loop needs from its owner.
 pub trait Control {
-    /// SIGTSTP arrived: give the terminal back and stop until continued.
+    /// SIGTSTP arrived: give the terminal back. `halt` follows.
     fn stop(&mut self) -> io::Result<()>;
+    /// Stop the process until SIGCONT (raise SIGSTOP). A no-op by default,
+    /// for tests that drive the loop in-process.
+    fn halt(&mut self) {}
     /// Continued after `stop`: take the terminal again. EINTR (a signal
     /// while still stopped by SIGTTOU in the background) is retried by the
     /// caller unless that signal ends the session.
@@ -162,36 +165,56 @@ fn pending_exit(signals: &SignalPipe) -> Result<Option<ExitReason>, SessionError
 /// Acts on drained signal bits: a termination signal ends the loop, SIGTSTP
 /// stops the session until it is continued.
 fn on_signals(
-    bits: u64,
+    mut bits: u64,
     signals: &SignalPipe,
     ctl: &mut dyn Control,
 ) -> Result<Signaled, SessionError> {
-    if let Some(exit) = terminating(bits) {
-        return Ok(Signaled::Exit(exit));
-    }
-    if !has(bits, libc::SIGTSTP) {
-        return Ok(Signaled::Nothing);
-    }
-    // Closing the terminal while stopped sends SIGHUP and SIGCONT; the
-    // terminal is gone, so that hangup, not the failed call, is the reason.
-    if let Err(e) = ctl.stop() {
-        return match pending_exit(signals)? {
-            Some(exit) => Ok(Signaled::Exit(exit)),
-            None => Err(SessionError(format!("job control: {e}"))),
-        };
-    }
+    let mut resumed = false;
     loop {
-        match ctl.resume() {
-            Ok(()) => return Ok(Signaled::Resumed),
-            Err(e) => {
-                if let Some(exit) = pending_exit(signals)? {
-                    return Ok(Signaled::Exit(exit));
-                }
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(SessionError(format!("job control: {e}")));
+        if let Some(exit) = terminating(bits) {
+            return Ok(Signaled::Exit(exit));
+        }
+        if !has(bits, libc::SIGTSTP) {
+            return Ok(if resumed {
+                Signaled::Resumed
+            } else {
+                Signaled::Nothing
+            });
+        }
+        // Closing the terminal while stopped sends SIGHUP and SIGCONT; the
+        // terminal is gone, so that hangup, not the failed call, is the
+        // reason.
+        if let Err(e) = ctl.stop() {
+            return match pending_exit(signals)? {
+                Some(exit) => Ok(Signaled::Exit(exit)),
+                None => Err(SessionError(format!("job control: {e}"))),
+            };
+        }
+        // A SIGTSTP caught while giving the terminal back (a quick second
+        // Ctrl-Z) is part of this stop.
+        if let Some(exit) = pending_exit(signals)? {
+            return Ok(Signaled::Exit(exit));
+        }
+        ctl.halt();
+        loop {
+            match ctl.resume() {
+                Ok(()) => break,
+                Err(e) => {
+                    if let Some(exit) = pending_exit(signals)? {
+                        return Ok(Signaled::Exit(exit));
+                    }
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(SessionError(format!("job control: {e}")));
+                    }
                 }
             }
         }
+        resumed = true;
+        // A signal sent while stopped (`kill -TERM` then `-CONT`) was
+        // caught as the process continued, and one may have come since:
+        // act on it now, or the caller could block in a write with it
+        // unseen.
+        bits = signals.drain().map_err(|e| SessionError(e.to_string()))?;
     }
 }
 

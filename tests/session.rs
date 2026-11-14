@@ -469,3 +469,21 @@ fn an_inherited_ignored_sighup_stays_ignored() {
     assert!(alive, "SIGHUP ended the session although it was ignored");
     assert!(status.success());
 }
+
+/// Stopped inside a write to a terminal that takes nothing (output stopped,
+/// as by Ctrl-S), then `kill -TERM` and `kill -CONT`: the SIGTERM caught as
+/// the process continues ends the session.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_sent_while_stopped_in_a_blocked_write_ends_the_session() {
+    let (dev, mut s) = start(&[]);
+    rustix::termios::tcflow(&s.host.slave, rustix::termios::Action::OOff).unwrap();
+    write_all(dev.master.as_fd(), b"more");
+    let pid = s.child.id() as i32;
+    support::wait_blocked_writing_stdout(pid, T);
+    unsafe { libc::kill(pid, libc::SIGTSTP) };
+    support::wait_stopped(pid, T);
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(wait_exit(&mut s.child, T).success());
+}

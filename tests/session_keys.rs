@@ -445,3 +445,23 @@ fn sigterm_ends_a_session_with_wrap_off_and_the_terminal_stalled() {
     unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
     assert!(wait_exit(&mut s.child, T).success());
 }
+
+/// Stopped and continued with wrap off and the terminal taking nothing:
+/// neither the stop nor the continue blocks on the wrap sequence, and the
+/// SIGTERM sent while stopped ends the session.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_sent_while_stopped_with_wrap_off_and_the_terminal_stalled_ends_the_session() {
+    let (dev, mut s, _) = start(&[], &[]);
+    write_all(s.host.master.as_fd(), b"\x01w");
+    read_until(s.host.master.as_fd(), b"line wrap off\r\n", T);
+    stall_the_terminal(&s);
+    write_all(dev.master.as_fd(), b"more");
+    let pid = s.child.id() as i32;
+    support::wait_blocked_writing_stdout(pid, T);
+    unsafe { libc::kill(pid, libc::SIGTSTP) };
+    support::wait_stopped(pid, T);
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(wait_exit(&mut s.child, T).success());
+}

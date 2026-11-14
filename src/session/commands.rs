@@ -447,10 +447,13 @@ impl Control for Live<'_> {
         if let Some(raw) = self.raw {
             raw.suspend()?;
         }
+        Ok(())
+    }
+
+    fn halt(&mut self) {
         // SAFETY: raise(3) is safe to call; SIGSTOP stops this process here
         // and execution continues after SIGCONT.
         unsafe { libc::raise(libc::SIGSTOP) };
-        Ok(())
     }
 
     fn resume(&mut self) -> io::Result<()> {
