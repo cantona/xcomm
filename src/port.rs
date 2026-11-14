@@ -272,6 +272,22 @@ impl Port {
                 )));
             }
         }
+        // picocom (built with USE_FLOCK, as on Ubuntu) takes no UUCP lock
+        // and no TIOCEXCL; it only flocks the device. Honour that, and hold
+        // the flock ourselves for as long as the fd is open.
+        match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                return Err(open_err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "in use by another program (it holds a flock on the device)",
+                )));
+            }
+            Err(e) => {
+                let e = io::Error::from(e);
+                return Err(open_err(io::Error::new(e.kind(), format!("flock: {e}"))));
+            }
+        }
         // Named from the open fd, not the path: a by-id link can be
         // retargeted between open and a path lookup. Without /proc (a
         // minimal container) ttyname fails; the resolved path is used then.

@@ -315,3 +315,25 @@ fn a_port_already_held_exclusively_is_refused() {
     }
     drop(holder);
 }
+
+#[test]
+fn device_flocked_by_another_program_is_refused() {
+    // picocom built with USE_FLOCK only flocks the device.
+    let p = support::pty();
+    let other = std::fs::File::open(&p.slave_path).unwrap();
+    rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    let e = Port::open(&p.slave_path, &LineSettings::default(), false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("flock"), "{e}");
+    drop(other);
+    // Opened before the Port: TIOCEXCL refuses opens after it.
+    let probe = std::fs::File::open(&p.slave_path).unwrap();
+    let (port, _) = Port::open(&p.slave_path, &LineSettings::default(), false).unwrap();
+    // And xcomm holds one too, so such a program is kept off.
+    assert!(
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err()
+    );
+    drop(port);
+}
