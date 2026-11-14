@@ -118,6 +118,17 @@ pub struct Port {
     configured: bool,
 }
 
+/// ASYNC_LOW_LATENCY is a best-effort hint: a driver without it, or one
+/// that refuses it to this user, leaves a usable port.
+#[cfg(target_os = "linux")]
+fn low_latency_refused(e: &io::Error) -> bool {
+    unsupported(e)
+        || matches!(
+            e.raw_os_error(),
+            Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::EOPNOTSUPP)
+        )
+}
+
 /// ENOTTY and EINVAL mean "this device has no such control", as on a pty.
 fn unsupported(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOTTY) | Some(libc::EINVAL))
@@ -629,7 +640,7 @@ impl Port {
         };
         if rc < 0 {
             let e = io::Error::last_os_error();
-            return if unsupported(&e) {
+            return if low_latency_refused(&e) {
                 Ok(LowLatency::Unsupported)
             } else {
                 Err(e)
@@ -649,7 +660,7 @@ impl Port {
         };
         if rc < 0 {
             let e = io::Error::last_os_error();
-            return if unsupported(&e) {
+            return if low_latency_refused(&e) {
                 Ok(LowLatency::Unsupported)
             } else {
                 Err(e)
@@ -730,7 +741,12 @@ impl Drop for Port {
         {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = rustix::termios::tcflush(&self.fd, rustix::termios::QueueSelector::OFlush);
+        // Discard only output that is still stuck. With nothing queued there
+        // is nothing to drop, and on a pty TCOFLUSH would also throw away
+        // what the other end has not read yet.
+        if matches!(self.output_queued(), Ok(n) if n > 0) {
+            let _ = rustix::termios::tcflush(&self.fd, rustix::termios::QueueSelector::OFlush);
+        }
         // TIOCEXCL outlives this fd if another fd on the tty is still open.
         // macOS has no TIOCGEXCL, so a root-only second opener there can
         // clear another program's exclusivity here.

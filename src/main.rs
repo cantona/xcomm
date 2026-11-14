@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 use xcomm::cli::{self, Command};
 use xcomm::out;
+use xcomm::session::{self, ExitReason, Failure};
 
 fn env(name: &str) -> Option<String> {
     // Lossy, not `var().ok()`: a non-UTF-8 value must reach the parser and fail
@@ -26,9 +27,17 @@ fn main() -> ExitCode {
         }
         Ok(Command::Version) => print(&format!("xcomm {}", env!("CARGO_PKG_VERSION"))),
         Ok(Command::ShowPrefix(p)) => print(&p.describe()),
-        Ok(Command::Term(_)) => {
-            out::report("terminal sessions are not implemented yet");
-            ExitCode::FAILURE
-        }
+        Ok(Command::Term(opts)) => match session::run(&opts, &env) {
+            Ok(ExitReason::DeviceGone) => ExitCode::FAILURE,
+            Ok(_) => ExitCode::SUCCESS,
+            Err(Failure::Busy(msg)) => {
+                out::report(&msg);
+                ExitCode::from(2)
+            }
+            Err(Failure::Other(msg)) => {
+                out::report(&msg);
+                ExitCode::FAILURE
+            }
+        },
     }
 }

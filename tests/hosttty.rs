@@ -350,8 +350,9 @@ fn eintr_child() {
     if std::env::var_os("XCOMM_TEST_EINTR_CHILD").is_none() {
         return;
     }
-    let _sp = SignalPipe::install(&[libc::SIGTERM, libc::SIGWINCH]).unwrap();
+    let _sp = SignalPipe::install(&[libc::SIGTERM, libc::SIGTSTP, libc::SIGWINCH]).unwrap();
     assert_eq!(flags_of(libc::SIGTERM) & libc::SA_RESTART, 0);
+    assert_eq!(flags_of(libc::SIGTSTP) & libc::SA_RESTART, 0);
     assert_ne!(flags_of(libc::SIGWINCH) & libc::SA_RESTART, 0);
     let (r, w) = std::io::pipe().unwrap();
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
@@ -490,4 +491,131 @@ fn signal_pipe_lifecycle() {
         );
     }
     assert_eq!(handler_of(libc::SIGUSR1), libc::SIG_DFL);
+}
+
+#[test]
+fn a_suspended_raw_mode_leaves_the_foreground_programs_settings_alone() {
+    let _serial = serial();
+    let p = support::pty();
+    let raw = RawMode::enter(p.slave.as_fd()).unwrap();
+    raw.suspend().unwrap();
+    assert!(
+        tcgetattr(p.slave.as_fd())
+            .unwrap()
+            .local_modes
+            .contains(LocalModes::ICANON)
+    );
+    // The program now in the foreground sets its own modes.
+    let mut theirs = tcgetattr(p.slave.as_fd()).unwrap();
+    theirs
+        .local_modes
+        .remove(LocalModes::ECHO | LocalModes::ICANON);
+    rustix::termios::tcsetattr(
+        p.slave.as_fd(),
+        rustix::termios::OptionalActions::Now,
+        &theirs,
+    )
+    .unwrap();
+    drop(raw);
+    let after = tcgetattr(p.slave.as_fd()).unwrap();
+    assert!(
+        !after
+            .local_modes
+            .intersects(LocalModes::ECHO | LocalModes::ICANON),
+        "drop restored xcomm's saved settings over the foreground program's"
+    );
+    // And after reenter, it is ours again: drop restores.
+    let p2 = support::pty();
+    let raw = RawMode::enter(p2.slave.as_fd()).unwrap();
+    raw.suspend().unwrap();
+    raw.reenter().unwrap();
+    assert_raw(&tcgetattr(p2.slave.as_fd()).unwrap());
+    drop(raw);
+    assert!(
+        tcgetattr(p2.slave.as_fd())
+            .unwrap()
+            .local_modes
+            .contains(LocalModes::ICANON)
+    );
+}
+
+/// Child half of `a_background_job_does_not_restore_over_the_foreground`.
+#[cfg(target_os = "linux")]
+#[test]
+fn background_child() {
+    if std::env::var_os("XCOMM_TEST_BG_CHILD").is_none() {
+        return;
+    }
+    let stdin = std::io::stdin();
+    let raw = RawMode::enter(stdin.as_fd()).unwrap();
+    // Another process group takes the foreground, as `bg` plus a foreground
+    // program would arrange (a kill -STOP cannot be caught, so xcomm never
+    // gave the terminal back itself).
+    let other = unsafe { libc::fork() };
+    if other == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::pause();
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::setpgid(other, other);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        assert_eq!(libc::tcsetpgrp(0, other), 0);
+        // The foreground program's own settings.
+        let mut theirs = tcgetattr(stdin.as_fd()).unwrap();
+        theirs.local_modes.insert(LocalModes::ICANON);
+        theirs.local_modes.remove(LocalModes::ECHO);
+        rustix::termios::tcsetattr(
+            stdin.as_fd(),
+            rustix::termios::OptionalActions::Now,
+            &theirs,
+        )
+        .unwrap();
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+    }
+    drop(raw);
+    unsafe { libc::kill(other, libc::SIGKILL) };
+    println!("XCOMM-BG-CHILD-OK");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_job_does_not_restore_over_the_foreground() {
+    use std::os::unix::process::CommandExt;
+    let p = support::pty();
+    let slave = p.slave.try_clone().unwrap();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "background_child",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env("XCOMM_TEST_BG_CHILD", "1")
+    .stdin(Stdio::from(slave))
+    .stderr(Stdio::null());
+    // SAFETY: setsid and ioctl are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("XCOMM-BG-CHILD-OK"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let after = tcgetattr(p.slave.as_fd()).unwrap();
+    assert!(
+        after.local_modes.contains(LocalModes::ICANON)
+            && !after.local_modes.contains(LocalModes::ECHO),
+        "the background job restored its saved settings over the foreground program's: {:?}",
+        after.local_modes
+    );
 }

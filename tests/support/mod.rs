@@ -81,3 +81,91 @@ pub fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) {
 pub fn borrow(fd: &OwnedFd) -> BorrowedFd<'_> {
     fd.as_fd()
 }
+
+pub struct Spawned {
+    pub child: std::process::Child,
+    /// xcomm's terminal: write to `host.master` to type, read it to see.
+    pub host: Pty,
+    pub lock_dir: PathBuf,
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.lock_dir);
+    }
+}
+
+/// A fresh, empty lock directory for one test.
+pub fn lock_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "xcomm-test-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Runs xcomm with a pty as its controlling terminal (stdin, stdout and
+/// stderr), a private lock directory and no prefix-related environment.
+pub fn spawn_xcomm(args: &[&str], lock_dir: &std::path::Path) -> Spawned {
+    spawn_in_pty(env!("CARGO_BIN_EXE_xcomm"), args, lock_dir)
+}
+
+/// Like spawn_xcomm, for any program (for example a shell that starts xcomm).
+pub fn spawn_in_pty(program: &str, args: &[&str], lock_dir: &std::path::Path) -> Spawned {
+    use std::os::unix::process::CommandExt;
+    let host = pty();
+    let slave = host.slave.try_clone().unwrap();
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .env("XCOMM_LOCK_DIR", lock_dir)
+        .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
+        .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
+        .stderr(std::process::Stdio::from(slave));
+    for v in [
+        "XCOMM_PREFIX",
+        "HERDR_ENV",
+        "HC_TERMINAL_ID",
+        "TMUX",
+        "STY",
+        "ZELLIJ",
+    ] {
+        cmd.env_remove(v);
+    }
+    // SAFETY: setsid and ioctl are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().unwrap();
+    Spawned {
+        child,
+        host,
+        lock_dir: lock_dir.to_path_buf(),
+    }
+}
+
+/// Waits for the child to exit, killing it after `timeout`.
+pub fn wait_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("child still running after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

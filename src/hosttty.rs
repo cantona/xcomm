@@ -31,7 +31,19 @@ static CLAIMED: AtomicBool = AtomicBool::new(false);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static RESTORE_HOOKS: OnceLock<Result<(), String>> = OnceLock::new();
 
-/// Async-signal-safe: an atomic load and tcsetattr(3).
+/// Whether this process's group is the terminal's foreground group: only
+/// then is the terminal still ours to restore. A job moved to the background
+/// (including after an uncatchable SIGSTOP and `bg`) must not overwrite the
+/// settings of the program now in the foreground. Async-signal-safe.
+fn in_foreground(fd: BorrowedFd<'_>) -> bool {
+    match rustix::termios::tcgetpgrp(fd) {
+        Ok(group) => group == rustix::process::getpgrp(),
+        // Not a controlling terminal of ours: nobody else owns it either.
+        Err(_) => true,
+    }
+}
+
+/// Async-signal-safe: an atomic load, tcgetpgrp(3) and tcsetattr(3).
 fn restore_saved() {
     if ARMED.load(Ordering::Acquire) {
         // SAFETY: ARMED implies SAVED is initialised (see Saved).
@@ -40,7 +52,9 @@ fn restore_saved() {
         // only after disarm(), and leaked (never closed) if the guard is
         // forgotten, so the number always names that terminal.
         let fd = unsafe { BorrowedFd::borrow_raw(*fd) };
-        let _ = tcsetattr(fd, OptionalActions::Now, termios);
+        if in_foreground(fd) {
+            let _ = tcsetattr(fd, OptionalActions::Now, termios);
+        }
     }
 }
 
@@ -169,15 +183,19 @@ fn context(e: impl Into<io::Error>, what: impl std::fmt::Display) -> io::Error {
 ///
 /// Install the SignalPipe for SIGTERM, SIGHUP and SIGINT before entering raw
 /// mode and drop it after the RawMode, so those signals always reach the
-/// session (and its restore path) while the terminal is raw. Job-control
-/// stops (SIGTSTP, SIGTTIN, SIGTTOU) are the session's job too: catch them
-/// through the pipe, restore, stop, and enter raw mode again on resume.
+/// session (and its restore path) while the terminal is raw. SIGTSTP is the
+/// session's job too: catch it through the pipe, restore, stop, and enter
+/// raw mode again on resume. Never catch SIGTTIN or SIGTTOU (see
+/// SignalPipe): their default stop is what a background session needs.
 pub struct RawMode {
     /// A duplicate of the caller's fd, owned here so the number registered
     /// for the restore paths cannot be closed and reused for another file
     /// while it is registered. If the guard is leaked, so is the duplicate.
     fd: OwnedFd,
     saved: Termios,
+    raw: Termios,
+    /// False while suspended: the terminal is not ours to restore then.
+    active: std::cell::Cell<bool>,
 }
 
 impl RawMode {
@@ -213,11 +231,20 @@ impl RawMode {
         // SAFETY: CLAIMED is ours and ARMED is false, so no reader exists.
         unsafe { (*SAVED.0.get()).write((fd.as_raw_fd(), saved.clone())) };
         ARMED.store(true, Ordering::Release);
+        // A background process is stopped by SIGTTOU here until brought to
+        // the foreground. A caught signal meanwhile (one without SA_RESTART,
+        // such as SIGTERM) fails the call with EINTR: the error has kind
+        // Interrupted, so the caller can look at its signals and try again.
         if let Err(e) = tcsetattr(&fd, OptionalActions::Now, &raw) {
             disarm();
             return Err(context(e, format_args!("tcsetattr on fd {raw_fd}")));
         }
-        Ok(RawMode { fd, saved })
+        Ok(RawMode {
+            fd,
+            saved,
+            raw,
+            active: std::cell::Cell::new(true),
+        })
     }
 
     /// The fd number registered for the restore paths.
@@ -225,8 +252,47 @@ impl RawMode {
         self.fd.as_raw_fd()
     }
 
+    /// Puts the terminal back into raw mode, for example after a job-control
+    /// stop during which it was restored.
+    pub fn reenter(&self) -> io::Result<()> {
+        tcsetattr(&self.fd, OptionalActions::Now, &self.raw).map_err(|e| {
+            context(
+                e,
+                format_args!("tcsetattr (raw) on fd {}", self.fd.as_raw_fd()),
+            )
+        })?;
+        self.active.set(true);
+        ARMED.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Gives the terminal back (a job-control stop). Until `reenter`, the
+    /// terminal belongs to whatever runs in the foreground, so neither the
+    /// drop nor the crash paths restore it over that program's settings.
+    pub fn suspend(&self) -> io::Result<()> {
+        self.restore()?;
+        self.active.set(false);
+        ARMED.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Restores the saved settings. SIGTTOU is blocked for the call: from
+    /// the background, tcsetattr would otherwise stop the process (keeping
+    /// the port and its lock) just to give back a cooked terminal.
     pub fn restore(&self) -> io::Result<()> {
-        tcsetattr(&self.fd, OptionalActions::Now, &self.saved).map_err(|e| {
+        // SAFETY: plain sigset manipulation on this thread's mask.
+        let old = unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTTOU);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            old
+        };
+        let result = tcsetattr(&self.fd, OptionalActions::Now, &self.saved);
+        // SAFETY: restores the mask saved above.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+        result.map_err(|e| {
             context(
                 e,
                 format_args!("tcsetattr (restore) on fd {}", self.fd.as_raw_fd()),
@@ -242,8 +308,20 @@ fn disarm() {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = self.restore();
+        if self.active.get() && in_foreground(self.fd.as_fd()) {
+            let _ = self.restore();
+        }
         disarm();
+    }
+}
+
+/// Whether `sig` is currently set to be ignored (inherited from the parent,
+/// for example SIGHUP under nohup).
+pub fn ignored(sig: libc::c_int) -> bool {
+    // SAFETY: queries the disposition only.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
     }
 }
 
@@ -305,9 +383,13 @@ extern "C" fn on_signal(sig: libc::c_int) {
 /// Process-wide: only one may exist at a time. Dropping it restores the
 /// previous handlers.
 ///
-/// SIGTERM, SIGINT and SIGHUP are installed without SA_RESTART, so a read or
-/// write blocked on a stalled terminal returns EINTR and the caller can get
-/// back to `drain()` and exit. Other signals restart interrupted calls.
+/// SIGTERM, SIGINT, SIGHUP and SIGTSTP are installed without SA_RESTART, so
+/// a read or write blocked on a stalled terminal returns EINTR and the
+/// caller can get back to `drain()` and exit or stop. Other signals restart
+/// interrupted calls. Do not catch SIGTTIN or SIGTTOU here: a background
+/// process's tcsetattr would get SIGTTOU, the handler would run, and the
+/// restarted call would get it again, for ever; their default action (stop
+/// until brought to the foreground) is the right one.
 pub struct SignalPipe {
     read: OwnedFd,
     /// Never closed: a handler running on another thread may have loaded the
@@ -360,7 +442,10 @@ impl SignalPipe {
             // SAFETY: a zeroed sigaction is a valid starting value.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-            action.sa_flags = if matches!(sig, libc::SIGTERM | libc::SIGINT | libc::SIGHUP) {
+            action.sa_flags = if matches!(
+                sig,
+                libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGTSTP
+            ) {
                 0
             } else {
                 libc::SA_RESTART
