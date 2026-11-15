@@ -91,19 +91,27 @@ static PREVIOUS: Previous = Previous(UnsafeCell::new(
 
 /// Restores the terminal, then hands the signal to whatever was installed
 /// before: a handler is called (Rust's own SIGSEGV handler among them), the
-/// default action is re-raised, an ignored signal stays ignored.
+/// default action is re-raised. An ignored signal that is not a fault stays
+/// ignored and leaves the terminal alone (the session goes on in raw mode),
+/// except SIGABRT from abort(3).
 extern "C" fn restore_on_fatal(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    restore_saved();
     let Some(i) = FATAL.iter().position(|&s| s == sig) else {
         return;
     };
     // SAFETY: written before this handler was installed (see Previous).
     let previous = unsafe { (*PREVIOUS.0.get())[i].assume_init_ref() };
     let handler = previous.sa_sigaction;
+    // abort(3) forces the default action on an ignored SIGABRT once this
+    // returns, so one the process sent itself is not really ignored.
+    let forced = sig == libc::SIGABRT && sent_by_self(info);
+    if handler == libc::SIG_IGN && !is_fault(sig) && !forced {
+        return;
+    }
+    restore_saved();
     // SIG_DFL and SIG_IGN are checked before SA_SIGINFO: macOS keeps that
     // flag across exec while resetting the handler to SIG_DFL, so a parent's
     // SA_SIGINFO handler leaves SIG_DFL with SA_SIGINFO set.
@@ -119,7 +127,8 @@ extern "C" fn restore_on_fatal(
             libc::raise(sig);
         }
     } else if handler == libc::SIG_IGN {
-        // An ignored signal that is not a fault stays ignored.
+        // SIGABRT the process sent itself: abort(3) re-raises it with the
+        // default action, raise(3) just returns.
     } else if previous.sa_flags & libc::SA_SIGINFO != 0 {
         // SAFETY: an SA_SIGINFO handler obtained from sigaction.
         let h: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
@@ -130,6 +139,14 @@ extern "C" fn restore_on_fatal(
         let h: extern "C" fn(libc::c_int) = unsafe { std::mem::transmute(handler) };
         h(sig);
     }
+}
+
+/// Whether the signal came from this process (abort(3), raise(3)).
+/// Async-signal-safe.
+fn sent_by_self(info: *const libc::siginfo_t) -> bool {
+    // SAFETY: the kernel hands an SA_SIGINFO handler a valid siginfo.
+    !info.is_null()
+        && unsafe { (*info).si_pid() } == rustix::process::getpid().as_raw_nonzero().get()
 }
 
 extern "C" fn restore_at_exit() {

@@ -151,6 +151,12 @@ fn death_child() {
     if kind == "quit-siginfo-ignored" {
         siginfo_without_handler(libc::SIGQUIT, libc::SIG_IGN);
     }
+    if kind == "quit-ignored" {
+        unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) };
+    }
+    if kind == "abort-ignored" {
+        unsafe { libc::signal(libc::SIGABRT, libc::SIG_IGN) };
+    }
     let stdin = std::io::stdin();
     let raw = RawMode::enter(stdin.as_fd()).unwrap();
     std::mem::forget(raw);
@@ -173,7 +179,9 @@ fn death_child() {
             }));
             panic!("deliberate");
         }
-        "abort" | "abort-chained" | "abort-siginfo-default" => std::process::abort(),
+        "abort" | "abort-chained" | "abort-siginfo-default" | "abort-ignored" => {
+            std::process::abort()
+        }
         "alloc" => std::alloc::handle_alloc_error(std::alloc::Layout::new::<[u8; 4096]>()),
         "overflow" => {
             std::hint::black_box(recurse(0));
@@ -185,9 +193,34 @@ fn death_child() {
         "quit" => unsafe {
             libc::raise(libc::SIGQUIT);
         },
-        // Ignored, so it lives on to exit.
-        "quit-siginfo-ignored" => {
-            unsafe { libc::raise(libc::SIGQUIT) };
+        // Ignored: it lives on, still in raw mode, to exit. Sent from another
+        // process; one sent to itself is taken for abort's.
+        "quit-siginfo-ignored" | "quit-ignored" => {
+            let me = unsafe { libc::getpid() };
+            // SAFETY: the child calls only kill(2) and _exit(2).
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe {
+                    libc::_exit(if libc::kill(me, libc::SIGQUIT) == 0 {
+                        0
+                    } else {
+                        1
+                    })
+                };
+            }
+            assert!(child > 0, "fork: {}", std::io::Error::last_os_error());
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the SIGQUIT was not sent: {status:#x}"
+            );
+            // Delivered to any thread: give the handler time to run.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let t = tcgetattr(std::io::stdin().as_fd()).unwrap();
+            if !t.local_modes.contains(LocalModes::ICANON) {
+                println!("XCOMM-STILL-RAW");
+            }
             std::process::exit(3)
         }
         other => panic!("unknown death {other}"),
@@ -276,6 +309,12 @@ fn dies_in_raw_mode_by_abort_with_sa_siginfo_left_on_the_default() {
 }
 
 #[test]
+fn dies_in_raw_mode_by_abort_with_sigabrt_ignored() {
+    let status = die_in_raw_mode("abort-ignored");
+    assert!(aborted(status), "{status:?}");
+}
+
+#[test]
 fn dies_in_raw_mode_by_allocation_failure() {
     let status = die_in_raw_mode("alloc");
     assert!(aborted(status), "{status:?}");
@@ -317,7 +356,16 @@ fn dies_in_raw_mode_by_sigquit() {
 
 #[test]
 fn an_ignored_sigquit_with_sa_siginfo_stays_ignored() {
-    assert_eq!(die_in_raw_mode("quit-siginfo-ignored").code(), Some(3));
+    let out = die_in_raw_mode_output("quit-siginfo-ignored");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("XCOMM-STILL-RAW"));
+}
+
+#[test]
+fn an_ignored_sigquit_leaves_the_terminal_raw() {
+    let out = die_in_raw_mode_output("quit-ignored");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("XCOMM-STILL-RAW"));
 }
 
 #[test]
