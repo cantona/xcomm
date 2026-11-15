@@ -17,6 +17,8 @@ lexopt = "0.3.2"
 memchr = "2.8.3"
 libc = "0.2.191"
 rustix = { version = "1.1.6", features = ["termios", "pipe", "fs", "process", "event"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 rustix = { version = "1.1.6", features = ["termios", "pipe", "pty", "fs", "event"] }

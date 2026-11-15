@@ -245,6 +245,50 @@ pub struct TermOpts {
     pub capture: Option<PathBuf>,
     /// `--ring-size`: how much device output is kept, in bytes.
     pub ring_size: usize,
+    /// `--ctl`: what the control socket allows.
+    pub ctl: crate::ctl::CtlMode,
+}
+
+/// What `xcomm ctl` sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendData {
+    Text(String),
+    Hex(Vec<u8>),
+    File(PathBuf),
+}
+
+/// What `xcomm ctl send` adds after the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    None,
+    Cr,
+    Lf,
+    CrLf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtlCmd {
+    Status,
+    Sessions,
+    Send {
+        data: SendData,
+        ending: LineEnding,
+    },
+    Read {
+        since: Option<u64>,
+        last: Option<u64>,
+        max_bytes: u64,
+        from_oldest: bool,
+        color: ColorMode,
+    },
+}
+
+/// `xcomm ctl [--json] <device> <command> ...` or `xcomm ctl sessions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtlArgs {
+    pub device: Option<String>,
+    pub cmd: CtlCmd,
+    pub json: bool,
 }
 
 /// `--ring-size` when not given.
@@ -260,6 +304,7 @@ pub enum Command {
     Version,
     ShowPrefix(PrefixChoice),
     Term(TermOpts),
+    Ctl(CtlArgs),
 }
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
@@ -279,6 +324,8 @@ xcomm {version}: a serial terminal
 
 Usage:
   xcomm [options] <device>
+  xcomm ctl [--json] <device> status|send|read ...
+  xcomm ctl [--json] sessions
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
@@ -312,6 +359,22 @@ Display:
   --ring-size <bytes>        device output kept in memory for the control
                              socket (4k to 1g, default 1m; k, m and g are
                              KiB, MiB and GiB)
+
+Control socket (for scripts and agents, from another terminal):
+  --ctl rw|ro|off            what the session's socket allows: everything,
+                             status and read only, or no socket (default rw)
+  xcomm ctl <device> status  port, settings, modem lines and offsets
+  xcomm ctl <device> send <text>
+                             send <text> and Enter (CR); -n for no line
+                             ending, --lf or --crlf for another; --hex <hex>
+                             or --file <path> send bytes as they are
+  xcomm ctl <device> read    device output the session keeps (escape
+                             sequences removed when piped, see --color);
+                             --since <offset> or --last <bytes>,
+                             --max-bytes <n>, --from-oldest; the next offset
+                             goes to stderr as next=<offset>
+  xcomm ctl sessions         the running sessions
+  --json                     the reply as JSON
 
 Keys:
   --prefix <key>             the command prefix: ctrl-<letter> (not h, i,
@@ -428,6 +491,205 @@ fn parse_ring_size(value: &str) -> Result<usize, CliError> {
         })
 }
 
+fn parse_offset(value: &str, name: &str) -> Result<u64, CliError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|_| digits(value))
+        .ok_or_else(|| {
+            CliError(format!(
+                "invalid value '{value}' for {name}: expected a number"
+            ))
+        })
+}
+
+fn parse_hex(value: &str) -> Result<Vec<u8>, CliError> {
+    let digits: Vec<u8> = value
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b':'))
+        .collect();
+    let bad = || {
+        CliError(format!(
+            "invalid value '{value}' for --hex: expected hex bytes (0d0a, 0d 0a or 0d:0a)"
+        ))
+    };
+    if digits.is_empty() || !digits.len().is_multiple_of(2) {
+        return Err(bad());
+    }
+    digits
+        .chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .ok_or_else(bad)
+        })
+        .collect()
+}
+
+pub const CTL_USAGE: &str =
+    "usage: xcomm ctl [--json] <device> status|send|read ..., or xcomm ctl [--json] sessions";
+
+fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
+    let mut p = lexopt::Parser::from_args(args.iter().cloned());
+    let mut json = false;
+    let mut words: Vec<String> = Vec::new();
+    let mut ending: Option<LineEnding> = None;
+    let mut hex: Option<Vec<u8>> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut since: Option<u64> = None;
+    let mut last: Option<u64> = None;
+    let mut max_bytes: Option<u64> = None;
+    let mut from_oldest = false;
+    let mut color: Option<ColorMode> = None;
+    // Options that belong to one command, for the check below.
+    let mut send_opts: Vec<&str> = Vec::new();
+    let mut read_opts: Vec<&str> = Vec::new();
+    while let Some(arg) = p.next()? {
+        match arg {
+            Long("json") => json = true,
+            Short('n') => {
+                set_once(&mut ending, LineEnding::None, "a line ending")?;
+                send_opts.push("-n");
+            }
+            Long("cr") => {
+                set_once(&mut ending, LineEnding::Cr, "a line ending")?;
+                send_opts.push("--cr");
+            }
+            Long("lf") => {
+                set_once(&mut ending, LineEnding::Lf, "a line ending")?;
+                send_opts.push("--lf");
+            }
+            Long("crlf") => {
+                set_once(&mut ending, LineEnding::CrLf, "a line ending")?;
+                send_opts.push("--crlf");
+            }
+            Long("hex") => {
+                set_once(&mut hex, parse_hex(&text(p.value()?, "--hex")?)?, "--hex")?;
+                send_opts.push("--hex");
+            }
+            Long("file") => {
+                set_once(&mut file, PathBuf::from(p.value()?), "--file")?;
+                send_opts.push("--file");
+            }
+            Long("since") => {
+                let v = parse_offset(&text(p.value()?, "--since")?, "--since")?;
+                set_once(&mut since, v, "--since")?;
+                read_opts.push("--since");
+            }
+            Long("last") => {
+                let v = parse_offset(&text(p.value()?, "--last")?, "--last")?;
+                set_once(&mut last, v, "--last")?;
+                read_opts.push("--last");
+            }
+            Long("max-bytes") => {
+                let v = parse_offset(&text(p.value()?, "--max-bytes")?, "--max-bytes")?;
+                set_once(&mut max_bytes, v, "--max-bytes")?;
+                read_opts.push("--max-bytes");
+            }
+            Long("from-oldest") => {
+                from_oldest = true;
+                read_opts.push("--from-oldest");
+            }
+            Long("color") => {
+                let v = choose(
+                    &text(p.value()?, "--color")?,
+                    "--color",
+                    &[
+                        ("auto", ColorMode::Auto),
+                        ("always", ColorMode::Always),
+                        ("never", ColorMode::Never),
+                    ],
+                )?;
+                set_once(&mut color, v, "--color")?;
+                read_opts.push("--color");
+            }
+            Value(v) => words.push(text(v, "argument")?),
+            _ => return Err(arg.unexpected().into()),
+        }
+    }
+    let usage = || CliError(CTL_USAGE.into());
+    let (device, cmd, rest) = match words.as_slice() {
+        [cmd, rest @ ..] if cmd == "sessions" => (None, "sessions", rest),
+        [device, cmd, rest @ ..] => (Some(device.clone()), cmd.as_str(), rest),
+        _ => return Err(usage()),
+    };
+    let only = |opts: &[&str], cmd_name: &str| -> Result<(), CliError> {
+        match opts.first() {
+            Some(o) if cmd != cmd_name => Err(CliError(format!("{o} is for ctl {cmd_name}"))),
+            _ => Ok(()),
+        }
+    };
+    only(&send_opts, "send")?;
+    only(&read_opts, "read")?;
+    let extra = |n: usize| -> Result<(), CliError> {
+        match rest.get(n) {
+            Some(word) => Err(CliError(format!("ctl {cmd}: unexpected argument '{word}'"))),
+            None => Ok(()),
+        }
+    };
+    let cmd = match cmd {
+        "sessions" => {
+            extra(0)?;
+            CtlCmd::Sessions
+        }
+        "status" => {
+            extra(0)?;
+            CtlCmd::Status
+        }
+        "send" => {
+            let data = match (rest.first(), hex, file) {
+                (Some(t), None, None) => {
+                    extra(1)?;
+                    SendData::Text(t.clone())
+                }
+                (None, Some(h), None) => SendData::Hex(h),
+                (None, None, Some(f)) => SendData::File(f),
+                (None, None, None) => {
+                    return Err(CliError(
+                        "ctl send needs <text>, --hex <hex> or --file <path>".into(),
+                    ));
+                }
+                _ => {
+                    return Err(CliError(
+                        "ctl send takes one of <text>, --hex and --file".into(),
+                    ));
+                }
+            };
+            // Raw bytes go as they are unless a line ending is asked for.
+            let default = match data {
+                SendData::Text(_) => LineEnding::Cr,
+                _ => LineEnding::None,
+            };
+            CtlCmd::Send {
+                data,
+                ending: ending.unwrap_or(default),
+            }
+        }
+        "read" => {
+            extra(0)?;
+            if since.is_some() && last.is_some() {
+                return Err(CliError(
+                    "ctl read takes --since or --last, not both".into(),
+                ));
+            }
+            CtlCmd::Read {
+                since,
+                last,
+                max_bytes: max_bytes.unwrap_or(crate::ctl::proto::READ_MAX),
+                from_oldest,
+                color: color.unwrap_or(ColorMode::Auto),
+            }
+        }
+        other => {
+            return Err(CliError(format!(
+                "unknown ctl command '{other}'; {CTL_USAGE}"
+            )));
+        }
+    };
+    Ok(Command::Ctl(CtlArgs { device, cmd, json }))
+}
+
 fn parse_prefix_time(value: &str) -> Result<Duration, CliError> {
     match value
         .parse::<u64>()
@@ -447,6 +709,9 @@ pub fn parse(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Command, CliError> {
     let args: Vec<OsString> = args.into_iter().collect();
+    if args.first().is_some_and(|a| a == "ctl") {
+        return parse_ctl(&args[1..]);
+    }
     // lexopt consumes a bare `--` without returning it; count it here so
     // `--version --` is rejected like any other extra argument.
     let separator = args.iter().any(|a| a == "--");
@@ -466,6 +731,7 @@ pub fn parse(
     let mut color: Option<ColorMode> = None;
     let mut capture: Option<PathBuf> = None;
     let mut ring_size: Option<usize> = None;
+    let mut ctl: Option<crate::ctl::CtlMode> = None;
     let mut show_prefix = false;
     let mut version = false;
     let mut help = false;
@@ -551,6 +817,18 @@ pub fn parse(
             Short('o') => no_init = true,
             Long("no-lock") => no_lock = true,
             Long("low-latency") => low_latency = true,
+            Long("ctl") => {
+                let v = choose(
+                    &text(p.value()?, "--ctl")?,
+                    "--ctl",
+                    &[
+                        ("rw", crate::ctl::CtlMode::ReadWrite),
+                        ("ro", crate::ctl::CtlMode::ReadOnly),
+                        ("off", crate::ctl::CtlMode::Off),
+                    ],
+                )?;
+                set_once(&mut ctl, v, "--ctl")?;
+            }
             Long("ring-size") => set_once(
                 &mut ring_size,
                 parse_ring_size(&text(p.value()?, "--ring-size")?)?,
@@ -669,5 +947,6 @@ pub fn parse(
         color: color.unwrap_or(ColorMode::Auto),
         capture,
         ring_size: ring_size.unwrap_or(DEFAULT_RING_SIZE),
+        ctl: ctl.unwrap_or(crate::ctl::CtlMode::ReadWrite),
     }))
 }

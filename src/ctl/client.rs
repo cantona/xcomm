@@ -1,0 +1,422 @@
+//! `xcomm ctl`: one request to a running session, or a few for a large
+//! send, and the reply printed.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::Duration;
+
+use super::proto::{self, Request};
+use super::{code, path};
+use crate::cli::{ColorMode, CtlArgs, CtlCmd, LineEnding, SendData};
+
+/// How long a reply may take. A session busy in a prompt the user has
+/// open does not answer until it is closed. A send's reply comes once the
+/// device has taken all but the session's queue of it, so a send gets the
+/// time its bytes take at the line's rate on top (twice that, for slack).
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Raw bytes per `send` request: base64 of this stays under the line limit.
+const SEND_CHUNK: usize = 512 << 10;
+
+/// Runs `args` and returns the exit status (spec 4.4). Messages go to
+/// stderr here; the caller only exits.
+pub fn run(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> u8 {
+    match run_inner(args, env) {
+        Ok(status) => status,
+        Err((status, msg)) => {
+            crate::out::report(&msg);
+            status
+        }
+    }
+}
+
+type Failed = (u8, String);
+
+fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8, Failed> {
+    let dirs = Dirs::find(env);
+    let device = match (&args.cmd, &args.device) {
+        (CtlCmd::Sessions, _) => return sessions(&dirs, args.json),
+        (_, Some(device)) => device,
+        (_, None) => return Err((code::USAGE, "a device is needed".into())),
+    };
+    let mut conn = Conn::open(&dirs, device)?;
+    match &args.cmd {
+        CtlCmd::Sessions => unreachable!("handled above"),
+        CtlCmd::Status => {
+            let reply = conn.request(&Request::Status)?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                print_status(&reply)?;
+            }
+        }
+        CtlCmd::Send { data, ending } => {
+            let mut bytes = match data {
+                SendData::Text(t) => t.as_bytes().to_vec(),
+                SendData::Hex(b) => b.clone(),
+                SendData::File(p) => std::fs::read(p)
+                    .map_err(|e| (code::FAILED, format!("--file {}: {e}", p.display())))?,
+            };
+            bytes.extend_from_slice(match ending {
+                LineEnding::None => b"",
+                LineEnding::Cr => b"\r",
+                LineEnding::Lf => b"\n",
+                LineEnding::CrLf => b"\r\n",
+            });
+            let mut first = None;
+            // In order on one connection: the session serves a client's
+            // requests one after another.
+            let chunks: Vec<&[u8]> = if bytes.is_empty() {
+                vec![&[]]
+            } else {
+                bytes.chunks(SEND_CHUNK).collect()
+            };
+            // Even a short send waits while other clients fill the queue.
+            // A status that fails ends it here: a late reply left on the
+            // connection would be read as the send's.
+            let rate = bits_per_second(&conn.request(&Request::Status)?);
+            for chunk in chunks {
+                let wire = rate.map_or(Duration::ZERO, |(bits, per_sec)| {
+                    Duration::from_secs_f64(2.0 * (chunk.len() as f64) * bits / per_sec)
+                });
+                conn.timeout = REPLY_TIMEOUT + wire;
+                let reply = conn
+                    .request(&Request::Send {
+                        data_b64: proto::base64_encode(chunk),
+                    })
+                    .map_err(|(status, msg)| match first {
+                        // Closing cancels the send: what the session had
+                        // not yet taken goes nowhere.
+                        Some(_) => (status, format!("{msg}; the rest was not sent")),
+                        None => (status, msg),
+                    })?;
+                first.get_or_insert(reply);
+            }
+            let reply = first.expect("at least one request");
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                print_out(format!("{}\n", reply["offset"]).as_bytes())?;
+            }
+        }
+        CtlCmd::Read {
+            since,
+            last,
+            max_bytes,
+            from_oldest,
+            color,
+        } => {
+            let reply = conn.request(&Request::Read {
+                since: *since,
+                last: *last,
+                max_bytes: *max_bytes,
+                from_oldest: *from_oldest,
+            })?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                let data = reply["data_b64"]
+                    .as_str()
+                    .and_then(proto::base64_decode)
+                    .ok_or((code::FAILED, "the session sent a bad reply".to_string()))?;
+                let keep = match color {
+                    ColorMode::Always => true,
+                    ColorMode::Never => false,
+                    ColorMode::Auto => rustix::termios::isatty(std::io::stdout()),
+                };
+                if keep {
+                    print_out(&data)?;
+                } else {
+                    let mut plain = Vec::with_capacity(data.len());
+                    crate::ansi::EscapeStripper::new().strip(&data, &mut plain);
+                    print_out(&plain)?;
+                }
+                eprintln!("next={}", reply["next"]);
+            }
+        }
+    }
+    Ok(code::OK)
+}
+
+/// Bits a character takes on the line, and the line's bits per second,
+/// from a status reply; None while disconnected.
+fn bits_per_second(status: &serde_json::Value) -> Option<(f64, f64)> {
+    let s = &status["settings"];
+    let baud = s["baud"].as_f64().filter(|&b| b > 0.0)?;
+    let parity = if s["parity"] == "none" { 0.0 } else { 1.0 };
+    let bits = 1.0 + s["data_bits"].as_f64()? + parity + s["stop_bits"].as_f64()?;
+    Some((bits, baud))
+}
+
+/// The socket directories a client may trust, and why any other was not.
+struct Dirs {
+    ok: Vec<std::path::PathBuf>,
+    skipped: Vec<String>,
+}
+
+impl Dirs {
+    fn find(env: &dyn Fn(&str) -> Option<String>) -> Dirs {
+        let mut dirs = Dirs {
+            ok: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for dir in path::socket_dirs(env) {
+            if std::fs::symlink_metadata(&dir).is_err() {
+                continue;
+            }
+            // In /tmp anyone could have made it, with a socket of theirs
+            // inside to hear what is sent.
+            match path::check_dir(&dir) {
+                Ok(()) => dirs.ok.push(dir),
+                Err(e) => dirs.skipped.push(e.0),
+            }
+        }
+        dirs
+    }
+
+    /// "no session for X", with any directory passed over.
+    fn none(&self, device: &str) -> Failed {
+        let mut msg = format!("no session for {device}");
+        for why in &self.skipped {
+            msg.push_str(&format!(" (not looked in: {why})"));
+        }
+        (code::NO_SESSION, msg)
+    }
+}
+
+struct Conn {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+    /// For the next reply.
+    timeout: Duration,
+}
+
+impl Conn {
+    fn open(dirs: &Dirs, device: &str) -> Result<Conn, Failed> {
+        let mut socks: Vec<std::path::PathBuf> = match path::tty_name(device) {
+            Some(tty) => dirs
+                .ok
+                .iter()
+                .map(|dir| path::socket_path(dir, &tty))
+                .collect(),
+            None => Vec::new(),
+        };
+        // A link that went with its device (udev removes by-id links on an
+        // unplug) names nothing now; the session waiting on it still knows
+        // the name it was started with. A name that leads to a device is
+        // that device's, whichever session once had it.
+        if std::fs::metadata(crate::session::device_path(device)).is_err() {
+            socks.extend(find_by_name(&dirs.ok, device));
+        }
+        let mut failed = None;
+        for sock in &socks {
+            match UnixStream::connect(sock) {
+                Ok(stream) => {
+                    return Conn::new(stream, REPLY_TIMEOUT)
+                        .map_err(|e| (code::FAILED, e.to_string()));
+                }
+                // None there, or one a killed session left: look on.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    failed.get_or_insert((code::DENIED, format!("{}: {e}", sock.display())));
+                }
+                Err(e) => {
+                    failed.get_or_insert((code::FAILED, format!("{}: {e}", sock.display())));
+                }
+            }
+        }
+        Err(failed.unwrap_or_else(|| dirs.none(device)))
+    }
+
+    fn new(stream: UnixStream, timeout: Duration) -> std::io::Result<Conn> {
+        let writer = stream.try_clone()?;
+        Ok(Conn {
+            reader: BufReader::new(stream),
+            writer,
+            timeout,
+        })
+    }
+
+    /// Sends `request` and returns the reply's fields; a failed reply is
+    /// an error with its code.
+    fn request(&mut self, request: &Request) -> Result<serde_json::Value, Failed> {
+        let mut line = serde_json::to_vec(request).expect("a request serializes");
+        line.push(b'\n');
+        self.writer
+            .write_all(&line)
+            .map_err(|e| (code::FAILED, format!("sending to the session: {e}")))?;
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| (code::FAILED, e.to_string()))?;
+        read_reply(&mut self.reader, self.timeout)
+    }
+}
+
+/// The socket of the session started with `device` (or reopening the
+/// device by that name), asking each session in `dir`.
+fn find_by_name(dirs: &[std::path::PathBuf], device: &str) -> Option<std::path::PathBuf> {
+    let want = crate::session::device_path(device).display().to_string();
+    socket_files(dirs).into_iter().find(|sock| {
+        status_of(sock)
+            .is_some_and(|s| s["device"] == want.as_str() || s["stable"] == want.as_str())
+    })
+}
+
+/// The `*.sock` files in `dirs`, each directory's sorted.
+fn socket_files(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut all = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut socks: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+            .collect();
+        socks.sort();
+        all.extend(socks);
+    }
+    all
+}
+
+/// What the session on `sock` says of itself; None when nothing answers
+/// there (gone, refusing, not answering).
+fn status_of(sock: &Path) -> Option<serde_json::Value> {
+    let stream = UnixStream::connect(sock).ok()?;
+    let mut conn = Conn::new(stream, Duration::from_secs(2)).ok()?;
+    conn.request(&Request::Status).ok()
+}
+
+fn read_reply(reader: &mut impl BufRead, timeout: Duration) -> Result<serde_json::Value, Failed> {
+    let mut line = Vec::new();
+    match reader.read_until(b'\n', &mut line) {
+        Ok(0) => {
+            return Err((
+                code::FAILED,
+                "the session closed the connection without a reply".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err((
+                code::FAILED,
+                format!("no reply from the session in {} s", timeout.as_secs()),
+            ));
+        }
+        Err(e) => return Err((code::FAILED, format!("reading the reply: {e}"))),
+    }
+    let reply: serde_json::Value = serde_json::from_slice(&line)
+        .map_err(|e| (code::FAILED, format!("the session sent a bad reply: {e}")))?;
+    if reply["ok"] == true {
+        return Ok(reply);
+    }
+    let status = reply["code"]
+        .as_u64()
+        .and_then(|c| u8::try_from(c).ok())
+        .filter(|&c| c != 0)
+        .unwrap_or(code::FAILED);
+    let msg = reply["error"].as_str().unwrap_or("the request failed");
+    Err((status, msg.to_string()))
+}
+
+fn print_out(bytes: &[u8]) -> Result<(), Failed> {
+    crate::out::stdout(bytes).map_err(|e| (code::FAILED, format!("cannot write to stdout: {e}")))
+}
+
+fn print_json(v: &serde_json::Value) -> Result<(), Failed> {
+    let mut line = serde_json::to_vec(v).expect("a JSON value serializes");
+    line.push(b'\n');
+    print_out(&line)
+}
+
+fn print_status(v: &serde_json::Value) -> Result<(), Failed> {
+    let text = |key: &str| match &v[key] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "-".into(),
+        other => other.to_string(),
+    };
+    let settings = match &v["settings"] {
+        serde_json::Value::Object(s) => format!(
+            "{} {}{}{} flow {}",
+            s["baud"],
+            s["data_bits"],
+            s["parity"].as_str().map_or("?", |p| &p[..1]).to_uppercase(),
+            s["stop_bits"],
+            s["flow"].as_str().unwrap_or("?")
+        ),
+        _ => "-".into(),
+    };
+    let modem = match &v["modem"] {
+        serde_json::Value::Object(m) => ["dtr", "rts", "cts", "dsr", "dcd", "ri"]
+            .iter()
+            .map(|k| format!("{}={}", k.to_uppercase(), if m[*k] == true { 1 } else { 0 }))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => "-".into(),
+    };
+    let out = format!(
+        "device     {}\ntty        {}\nstable     {}\nconnected  {}\nsettings   {settings}\n\
+         modem      {modem}\noffset     {}\noldest     {}\ncapture    {}\ntransfer   {}\n\
+         ctl        {}\nherdr pane {}\npid        {}\n",
+        text("device"),
+        text("tty"),
+        text("stable"),
+        text("connected"),
+        text("offset"),
+        text("oldest"),
+        text("capture"),
+        text("transfer"),
+        text("ctl"),
+        text("herdr_pane"),
+        text("pid"),
+    );
+    print_out(out.as_bytes())
+}
+
+/// Every session that answers on a socket in `dirs`.
+fn sessions(dirs: &Dirs, json: bool) -> Result<u8, Failed> {
+    for why in &dirs.skipped {
+        crate::out::report(&format!("not looked in: {why}"));
+    }
+    let mut found: Vec<serde_json::Value> = Vec::new();
+    for sock in socket_files(&dirs.ok) {
+        if let Some(mut status) = status_of(&sock) {
+            if let serde_json::Value::Object(map) = &mut status {
+                map.remove("ok");
+                map.remove("code");
+            }
+            found.push(status);
+        }
+    }
+    if json {
+        print_json(&serde_json::Value::Array(found))?;
+        return Ok(code::OK);
+    }
+    let mut out = String::new();
+    for s in &found {
+        let state = if s["connected"] == true {
+            "connected"
+        } else {
+            "disconnected"
+        };
+        out.push_str(&format!(
+            "{}\t{}\tpid {}\t{state}\toffset {}\n",
+            s["tty"].as_str().unwrap_or("?"),
+            s["device"].as_str().unwrap_or("?"),
+            s["pid"],
+            s["offset"],
+        ));
+    }
+    print_out(out.as_bytes())?;
+    Ok(code::OK)
+}

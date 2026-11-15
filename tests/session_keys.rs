@@ -259,6 +259,7 @@ fn piped_input_passes_the_prefix_through() {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"));
     cmd.arg(&dev.slave_path)
         .env("XCOMM_LOCK_DIR", &dir)
+        .env("XDG_RUNTIME_DIR", &dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

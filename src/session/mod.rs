@@ -20,7 +20,7 @@ use crate::keys::{KeyAction, KeyParser};
 use crate::lock::{self, Cleared, UucpLock};
 use crate::port::{self, Applied, LowLatency, Port};
 use crate::reconnect::{self, DeviceWatch, NodeId, Track};
-use outq::OutQueue;
+pub use outq::OutQueue;
 
 /// How a session ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,11 +104,53 @@ pub trait Control {
     }
     /// A capture write failed: stop capturing, and say so.
     fn capture_failed(&mut self, _error: io::Error) {}
-    /// The ring device output is kept in, by offset.
-    fn ring(&mut self) -> Option<&mut crate::ring::Ring> {
+    /// Device bytes as read (after the terminal has them): the ring and
+    /// the control socket's subscribers take them.
+    fn device_output(&mut self, _bytes: &[u8]) {}
+    /// Appends the control socket's descriptors to poll, and returns when
+    /// it wants a pass with no event.
+    fn ctl_fds(&self, _out: &mut Vec<libc::pollfd>) -> Option<Instant> {
         None
     }
+    /// Serves the control socket: `ready` is what `ctl_fds` appended,
+    /// after poll; `queue` takes bytes clients send to the device.
+    fn ctl_serve(&mut self, _ready: &[libc::pollfd], _queue: &mut OutQueue) {}
 }
+
+/// Entries for poll(2) are kept raw: the loops add the control socket's
+/// descriptors, which the controller owns, to their own.
+fn entry(fd: BorrowedFd<'_>, events: PollFlags) -> libc::pollfd {
+    libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
+        events: events.bits() as libc::c_short,
+        revents: 0,
+    }
+}
+
+fn revents(e: &libc::pollfd) -> PollFlags {
+    PollFlags::from_bits_retain(e.revents as _)
+}
+
+/// poll(2), with the timeout rounded up to whole milliseconds so that a
+/// deadline is never woken for early.
+fn poll_entries(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> rustix::io::Result<()> {
+    let ms = match timeout {
+        None => -1,
+        Some(t) => t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int,
+    };
+    // SAFETY: `fds` is a valid slice of pollfd entries for the call.
+    let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+    if r < 0 {
+        return Err(rustix::io::Errno::from_raw_os_error(
+            io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
+    }
+    Ok(())
+}
+
+/// Room for the session's own entries plus a control socket with all its
+/// clients: the entries vector never grows while the loop runs.
+const POLL_ROOM: usize = 4 + 1 + crate::ctl::server::MAX_CLIENTS;
 
 /// The file descriptors the loop moves bytes between.
 pub struct Pump<'a> {
@@ -130,6 +172,10 @@ pub struct Pump<'a> {
 /// Room kept in the output queue for bytes the key parser holds, which it
 /// releases in addition to the bytes of the next read.
 const HELD_ROOM: usize = crate::keys::HELD_MAX;
+/// Room a control client's send leaves in the output queue: the queue
+/// never counts as full on its account, so the keyboard is still read
+/// (and the commands work) through a long send.
+const KEYS_ROOM: usize = HELD_ROOM + BUF_SIZE / 4;
 /// How long the device may take nothing from a full queue before keyboard
 /// input is read anyway, so that the commands (quit) still work. Keys that
 /// do not fit are dropped then.
@@ -430,6 +476,7 @@ fn pump_with(
     // the terminal blocks, the capture waits too: a file write per device
     // read is what honouring the deadline there would cost.
     let mut capture_since: Option<Instant> = None;
+    let mut polled: Vec<libc::pollfd> = Vec::with_capacity(POLL_ROOM);
     loop {
         if ctl.tick().is_break() {
             return Ok(ExitReason::Requested);
@@ -453,29 +500,23 @@ fn pump_with(
             Some(fd) if want_stdin => (fd, PollFlags::IN),
             _ => (signal_fd, PollFlags::empty()),
         };
-        let mut fds = [
-            PollFd::new(&signal_fd, PollFlags::IN),
-            PollFd::new(&p.device, device_events),
-            PollFd::new(&stdin_slot, stdin_events),
-        ];
+        polled.clear();
+        polled.push(entry(signal_fd, PollFlags::IN));
+        polled.push(entry(p.device, device_events));
+        polled.push(entry(stdin_slot, stdin_events));
+        let ctl_due = ctl.ctl_fds(&mut polled);
         // A held lone ESC is given up on at its deadline; a full queue is
         // looked at again when it would count as stalled.
         let held_due = keys.as_ref().and_then(|k| k.deadline());
         let stall_due = full_since.filter(|_| !stalled).map(|t| t + STALL);
         let capture_due = capture_since.map(|t| t + CAPTURE_FLUSH);
-        let due = [held_due, stall_due, capture_due]
+        let due = [held_due, stall_due, capture_due, ctl_due]
             .into_iter()
             .flatten()
             .min();
-        let timeout = due.map(|due| {
-            rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
-                .unwrap_or(rustix::event::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                })
-        });
-        match poll(&mut fds, timeout.as_ref()) {
-            Ok(_) => {}
+        let timeout = due.map(|due| due.saturating_duration_since(Instant::now()));
+        match poll_entries(&mut polled, timeout) {
+            Ok(()) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(SessionError(format!("poll: {e}"))),
         }
@@ -516,10 +557,10 @@ fn pump_with(
                 }
             }
         }
-        let sig_ready = fds[0].revents();
-        let dev_ready = fds[1].revents();
+        let sig_ready = revents(&polled[0]);
+        let dev_ready = revents(&polled[1]);
         let stdin_ready = if want_stdin {
-            fds[2].revents()
+            revents(&polled[2])
         } else {
             PollFlags::empty()
         };
@@ -561,9 +602,7 @@ fn pump_with(
                     let shown = write_out(p.stdout, shown, p, ctl);
                     // After the terminal has them, whatever the write did,
                     // as the capture has them: raw, as read.
-                    if let Some(ring) = ctl.ring() {
-                        ring.push(&buf[..n]);
-                    }
+                    ctl.device_output(&buf[..n]);
                     match shown? {
                         Signaled::Exit(exit) => return Ok(exit),
                         Signaled::Resumed => continue,
@@ -678,6 +717,8 @@ fn pump_with(
         {
             return Ok(exit);
         }
+        // Last: what clients send queues behind the keys typed meanwhile.
+        ctl.ctl_serve(&polled[3..], &mut queue);
         // End of input (not the absence of input) ends the session once
         // everything read has reached the device (`cat file | xcomm dev` must not lose the tail). The
         // loop keeps writing meanwhile; a signal still ends it at any time.
@@ -838,6 +879,18 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     let low_latency = port
         .set_async_low_latency()
         .map_err(|e| Failure::Other(format!("ASYNC_LOW_LATENCY: {e}")))?;
+    // Named as the lock is: one socket per tty, found from any name of it.
+    let tty = lock::lock_name(&resolved).unwrap_or_else(|| port.tty_name().to_string());
+    let server = match opts.ctl {
+        crate::ctl::CtlMode::Off => None,
+        mode => {
+            let dir = crate::ctl::path::make_socket_dir(env).map_err(|e| Failure::Other(e.0))?;
+            Some(
+                crate::ctl::server::CtlServer::bind(&dir, &tty, mode)
+                    .map_err(|e| Failure::Other(e.0))?,
+            )
+        }
+    };
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -892,7 +945,13 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         rustix::termios::isatty(stdout.as_fd()),
         env,
     );
-    let mut kept = commands::Kept::new(capture, ring);
+    let names = commands::Names {
+        device: path.display().to_string(),
+        stable: stable.display().to_string(),
+        tty: tty.clone(),
+        herdr_pane: env("HERDR_PANE_ID").filter(|p| !p.is_empty()),
+    };
+    let mut kept = commands::Kept::new(capture, ring, server, names);
     let mut port_tty = port.tty_name().to_string();
     // Taken at the open: a descriptor revoked by a hangup cannot be asked
     // (macOS fstat fails on it).
@@ -1010,6 +1069,9 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
                 live.say(&msg);
                 for note in notes.iter().chain(&live.restore_lines(&new)) {
                     live.say(note);
+                }
+                if let Some(name) = lock::lock_name(&new_resolved) {
+                    live.renamed(&name);
                 }
                 kept = live.into_kept();
                 resolved = new_resolved;
@@ -1208,6 +1270,7 @@ fn wait_for_device(
 ) -> Result<Waited, SessionError> {
     let mut buf = [0u8; 256];
     let signal_fd = signals.fd();
+    let mut polled: Vec<libc::pollfd> = Vec::with_capacity(POLL_ROOM);
     let mut look = true;
     // The last failure told, so that retries do not repeat it.
     let mut told: Option<String> = None;
@@ -1256,13 +1319,6 @@ fn wait_for_device(
             .into_iter()
             .flatten()
             .min();
-        let timeout = due.map(|due| {
-            rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
-                .unwrap_or(rustix::event::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                })
-        });
         let (sig_ready, watch_ready, stdin_ready) = {
             let (watch_slot, watch_events) = match watch.fd() {
                 Some(fd) => (fd, PollFlags::IN),
@@ -1274,30 +1330,33 @@ fn wait_for_device(
                 Some(fd) if hung_up.is_none() => (fd, PollFlags::IN),
                 _ => (signal_fd, PollFlags::empty()),
             };
-            let mut fds = [
-                PollFd::new(&signal_fd, PollFlags::IN),
-                PollFd::new(&watch_slot, watch_events),
-                PollFd::new(&stdin_slot, stdin_events),
-            ];
-            match poll(&mut fds, timeout.as_ref()) {
-                Ok(_) => {}
+            polled.clear();
+            polled.push(entry(signal_fd, PollFlags::IN));
+            polled.push(entry(watch_slot, watch_events));
+            polled.push(entry(stdin_slot, stdin_events));
+            let due = due.into_iter().chain(live.ctl_fds(&mut polled)).min();
+            let timeout = due.map(|due| due.saturating_duration_since(Instant::now()));
+            match poll_entries(&mut polled, timeout) {
+                Ok(()) => {}
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(SessionError(format!("poll: {e}"))),
             }
             (
-                fds[0].revents(),
+                revents(&polled[0]),
                 if watch_events.is_empty() {
                     PollFlags::empty()
                 } else {
-                    fds[1].revents()
+                    revents(&polled[1])
                 },
                 if stdin_events.is_empty() {
                     PollFlags::empty()
                 } else {
-                    fds[2].revents()
+                    revents(&polled[2])
                 },
             )
         };
+        // Clients are told the device is gone if they send.
+        live.serve_ctl(&polled[3..], crate::ctl::code::DISCONNECTED);
         look = watch_ready.contains(PollFlags::IN)
             || watch.deadline().is_some_and(|d| Instant::now() >= d);
 

@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         ),
         Ok(Command::Version) => print(&format!("xcomm {}", env!("CARGO_PKG_VERSION"))),
         Ok(Command::ShowPrefix(p)) => print(&p.describe()),
+        Ok(Command::Ctl(args)) => ExitCode::from(xcomm::ctl::client::run(&args, &env)),
         Ok(Command::Term(opts)) => match session::run(&opts, &env) {
             Ok(ExitReason::DeviceGone) => ExitCode::FAILURE,
             Ok(_) => ExitCode::SUCCESS,

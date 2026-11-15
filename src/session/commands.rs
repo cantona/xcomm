@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 
+use super::outq::OutQueue;
 use super::{CommandIo, CommandOutcome, Control, ExitReason, SessionError, Signaled, on_signals};
 use crate::capture::Capture;
 use crate::cli::{LineSettings, PrefixChoice, TermOpts};
+use crate::ctl::{self, proto, server::CtlServer};
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{self, EscKey, HELD_MAX, KeyAction, KeyParser};
 use crate::port::{self, Applied, ModemLines, Port};
@@ -181,6 +183,11 @@ pub(super) struct Live<'a> {
     capture: Option<Capture>,
     /// Device output by offset; it outlives a disconnect, so offsets go on.
     ring: Ring,
+    /// The control socket; None with --ctl off.
+    server: Option<CtlServer>,
+    names: Names,
+    /// A file transfer has the port.
+    transferring: bool,
     /// DTR and RTS as the user last set them; None where they did not.
     lines: (Option<bool>, Option<bool>),
     /// The last prompt of this command ended on CR: an LF right after it is
@@ -195,22 +202,162 @@ pub(super) struct Kept {
     wrap: bool,
     capture: Option<Capture>,
     ring: Ring,
+    server: Option<CtlServer>,
+    names: Names,
     lines: (Option<bool>, Option<bool>),
 }
 
 impl Kept {
-    pub(super) fn new(capture: Option<Capture>, ring: Ring) -> Kept {
+    pub(super) fn new(
+        capture: Option<Capture>,
+        ring: Ring,
+        server: Option<CtlServer>,
+        names: Names,
+    ) -> Kept {
         Kept {
             echo: false,
             wrap: true,
             capture,
             ring,
+            server,
+            names,
             lines: (None, None),
         }
     }
 }
 
+/// What `status` names the session by.
+pub(super) struct Names {
+    /// The device as given.
+    pub(super) device: String,
+    /// The name it is reopened by.
+    pub(super) stable: String,
+    /// The tty it is now.
+    pub(super) tty: String,
+    pub(super) herdr_pane: Option<String>,
+}
+
+/// What the control socket sees of the session while it serves it.
+struct View<'v> {
+    port: Option<&'v Port>,
+    ring: &'v Ring,
+    capture: Option<&'v Capture>,
+    names: &'v Names,
+    transferring: bool,
+    /// Where sent bytes go, or the reply code why they cannot.
+    queue: Result<&'v mut OutQueue, u8>,
+}
+
+impl ctl::server::Session for View<'_> {
+    fn status(&self) -> proto::Status {
+        let settings = self.port.map(|p| {
+            let s = p.settings();
+            proto::SettingsView {
+                baud: s.baud,
+                data_bits: match s.data_bits {
+                    crate::cli::DataBits::Five => 5,
+                    crate::cli::DataBits::Six => 6,
+                    crate::cli::DataBits::Seven => 7,
+                    crate::cli::DataBits::Eight => 8,
+                },
+                parity: match s.parity {
+                    crate::cli::Parity::None => "none",
+                    crate::cli::Parity::Even => "even",
+                    crate::cli::Parity::Odd => "odd",
+                }
+                .into(),
+                stop_bits: match s.stop_bits {
+                    crate::cli::StopBits::One => 1,
+                    crate::cli::StopBits::Two => 2,
+                },
+                flow: match s.flow {
+                    crate::cli::Flow::None => "none",
+                    crate::cli::Flow::RtsCts => "rts",
+                    crate::cli::Flow::XonXoff => "xon",
+                }
+                .into(),
+            }
+        });
+        let modem = self
+            .port
+            .and_then(|p| p.modem_lines().ok())
+            .map(|m| proto::ModemView {
+                dtr: m.dtr,
+                rts: m.rts,
+                cts: m.cts,
+                dsr: m.dsr,
+                dcd: m.dcd,
+                ri: m.ri,
+            });
+        proto::Status {
+            device: self.names.device.clone(),
+            tty: self.names.tty.clone(),
+            stable: self.names.stable.clone(),
+            settings,
+            modem,
+            connected: self.port.is_some(),
+            offset: self.ring.end(),
+            oldest: self.ring.oldest(),
+            capture: self.capture.map(|c| c.path().display().to_string()),
+            transfer: self.transferring,
+            ctl: String::new(),
+            herdr_pane: self.names.herdr_pane.clone(),
+            pid: std::process::id(),
+        }
+    }
+
+    fn ring(&self) -> &Ring {
+        self.ring
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> Result<usize, (u8, String)> {
+        match &mut self.queue {
+            Ok(queue) => {
+                let n = bytes
+                    .len()
+                    .min(queue.free().saturating_sub(super::KEYS_ROOM));
+                let queued = queue.push(&bytes[..n]);
+                debug_assert!(queued, "bounded by the free space");
+                Ok(n)
+            }
+            Err(code) if *code == ctl::code::BUSY => {
+                Err((*code, "a file transfer has the port".into()))
+            }
+            Err(code) => Err((*code, "the device is disconnected".into())),
+        }
+    }
+}
+
 impl<'a> Live<'a> {
+    fn serve(&mut self, ready: &[libc::pollfd], queue: Result<&mut OutQueue, u8>) {
+        let Some(server) = &mut self.server else {
+            return;
+        };
+        let mut view = View {
+            port: self.port,
+            ring: &self.ring,
+            capture: self.capture.as_ref(),
+            names: &self.names,
+            transferring: self.transferring,
+            queue,
+        };
+        server.serve(ready, &mut view);
+    }
+
+    /// The device came back as `tty`: the socket follows its name.
+    pub(super) fn renamed(&mut self, tty: &str) {
+        self.names.tty = tty.to_string();
+        if let Some(Err(e)) = self.server.as_mut().map(|s| s.rename(tty)) {
+            self.say(&e.0);
+        }
+    }
+
+    /// Serves the control socket while nothing can go to the device:
+    /// `why` is the code a send gets.
+    pub(super) fn serve_ctl(&mut self, ready: &[libc::pollfd], why: u8) {
+        self.serve(ready, Err(why));
+    }
+
     pub(super) fn new(
         raw: Option<&'a RawMode>,
         port: Option<&'a Port>,
@@ -237,6 +384,9 @@ impl<'a> Live<'a> {
             wrap: kept.wrap,
             capture: kept.capture,
             ring: kept.ring,
+            server: kept.server,
+            names: kept.names,
+            transferring: false,
             lines: kept.lines,
             cr_ended: false,
         }
@@ -248,6 +398,8 @@ impl<'a> Live<'a> {
             wrap: self.wrap,
             capture: self.capture,
             ring: self.ring,
+            server: self.server,
+            names: self.names,
             lines: self.lines,
         }
     }
@@ -577,7 +729,9 @@ impl<'a> Live<'a> {
             format!("{key} x or Ctrl-C aborts")
         };
         self.say_after_prompt(&format!("transfer started: {} ({how})", transfer.program()));
+        self.transferring = true;
         let ended = self.wait_transfer(&mut transfer, io);
+        self.transferring = false;
         if let Err(e) = transfer.release() {
             self.say(&format!("after the transfer: port: {e}"));
         }
@@ -618,6 +772,7 @@ impl<'a> Live<'a> {
         let mut aborted: Option<Instant> = None;
         let signal_fd = io.signals.fd();
         let mut buf = [0u8; 256];
+        let mut polled: Vec<libc::pollfd> = Vec::with_capacity(super::POLL_ROOM);
         loop {
             match transfer.try_finish() {
                 // Done before the abort took effect: done.
@@ -655,30 +810,31 @@ impl<'a> Live<'a> {
             .into_iter()
             .flatten()
             .min();
-            let timeout = due.map(|due| {
-                rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
-                    .expect("under ABORT_GRACE")
-            });
             let (stdin_slot, stdin_events) = if stdin_open {
                 (io.stdin, PollFlags::IN)
             } else {
                 (signal_fd, PollFlags::empty())
             };
-            let mut fds = [
-                PollFd::new(&signal_fd, PollFlags::IN),
-                PollFd::new(&stdin_slot, stdin_events),
-            ];
-            match poll(&mut fds, timeout.as_ref()) {
-                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            polled.clear();
+            polled.push(super::entry(signal_fd, PollFlags::IN));
+            polled.push(super::entry(stdin_slot, stdin_events));
+            let due = due.into_iter().chain(self.ctl_fds(&mut polled)).min();
+            let timeout = due.map(|due| due.saturating_duration_since(Instant::now()));
+            match super::poll_entries(&mut polled, timeout) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::INTR) => polled.iter_mut().for_each(|e| e.revents = 0),
                 Err(e) => return Err(SessionError(format!("poll: {e}"))),
             }
+            // The program has the port: clients cannot send meanwhile, and
+            // subscribers get nothing (the program reads the device).
+            self.serve_ctl(&polled[2..], ctl::code::BUSY);
             // A lone ESC held past its time is a key like any other here.
             keys.on_deadline(Instant::now(), &mut |a| {
                 if let KeyAction::Forward(b) = a {
                     abort |= has_ctrl_c(b);
                 }
             });
-            if fds[0].revents().contains(PollFlags::IN) {
+            if super::revents(&polled[0]).contains(PollFlags::IN) {
                 // SIGCHLD only wakes the loop; try_finish looks.
                 let bits = io
                     .signals
@@ -706,8 +862,7 @@ impl<'a> Live<'a> {
                 }
             }
             if stdin_open
-                && fds[1]
-                    .revents()
+                && super::revents(&polled[1])
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             {
                 match rustix::io::read(io.stdin, &mut buf) {
@@ -1052,8 +1207,21 @@ impl Control for Live<'_> {
         self.capture.as_mut()
     }
 
-    fn ring(&mut self) -> Option<&mut Ring> {
-        Some(&mut self.ring)
+    fn device_output(&mut self, bytes: &[u8]) {
+        self.ring.push(bytes);
+        if let Some(server) = &mut self.server {
+            server.device_output(&self.ring);
+        }
+    }
+
+    fn ctl_fds(&self, out: &mut Vec<libc::pollfd>) -> Option<Instant> {
+        self.server
+            .as_ref()
+            .and_then(|server| server.poll_fds(self.ring.end(), out))
+    }
+
+    fn ctl_serve(&mut self, ready: &[libc::pollfd], queue: &mut OutQueue) {
+        self.serve(ready, Ok(queue));
     }
 
     fn capture_failed(&mut self, error: io::Error) {

@@ -313,6 +313,8 @@ pub fn spawn_with(
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
         .env("XCOMM_LOCK_DIR", lock_dir)
+        // Control sockets go under the test's own directory.
+        .env("XDG_RUNTIME_DIR", lock_dir)
         .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
         .stdout(stdout.unwrap_or_else(|| std::process::Stdio::from(slave.try_clone().unwrap())))
         .stderr(std::process::Stdio::from(slave));

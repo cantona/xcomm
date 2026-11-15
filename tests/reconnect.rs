@@ -414,6 +414,7 @@ fn piped_input_ends_the_session_at_a_disconnect() {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
         .arg(&link)
         .env("XCOMM_LOCK_DIR", &locks)
+        .env("XDG_RUNTIME_DIR", &locks)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

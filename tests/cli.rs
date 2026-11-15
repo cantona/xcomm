@@ -581,3 +581,137 @@ fn ring_size_takes_bytes_with_a_unit() {
     let e = err(&["--ring-size", "4k", "--ring-size", "8k", "x"], &[]);
     assert!(e.contains("more than once"), "{e}");
 }
+
+fn ctl(v: &[&str]) -> CtlArgs {
+    let mut all = vec!["ctl"];
+    all.extend_from_slice(v);
+    match parse_with(&all, &[]).unwrap() {
+        Command::Ctl(c) => c,
+        c => panic!("expected Ctl, got {c:?}"),
+    }
+}
+
+fn ctl_err(v: &[&str]) -> String {
+    let mut all = vec!["ctl"];
+    all.extend_from_slice(v);
+    err(&all, &[])
+}
+
+#[test]
+fn ctl_commands_parse() {
+    let c = ctl(&["ttyUSB1", "status"]);
+    assert_eq!(
+        (c.device.as_deref(), &c.cmd, c.json),
+        (Some("ttyUSB1"), &CtlCmd::Status, false)
+    );
+    let c = ctl(&["--json", "sessions"]);
+    assert_eq!((c.device, c.cmd, c.json), (None, CtlCmd::Sessions, true));
+    assert!(ctl(&["sessions", "--json"]).json);
+    assert_eq!(
+        ctl(&["ttyUSB1", "send", "ls"]).cmd,
+        CtlCmd::Send {
+            data: SendData::Text("ls".into()),
+            ending: LineEnding::Cr
+        }
+    );
+    assert_eq!(
+        ctl(&["ttyUSB1", "send", "-n", "ls"]).cmd,
+        CtlCmd::Send {
+            data: SendData::Text("ls".into()),
+            ending: LineEnding::None
+        }
+    );
+    assert_eq!(
+        ctl(&["ttyUSB1", "send", "--hex", "0d 0A:ff"]).cmd,
+        CtlCmd::Send {
+            data: SendData::Hex(vec![0x0d, 0x0a, 0xff]),
+            ending: LineEnding::None
+        }
+    );
+    assert_eq!(
+        ctl(&["ttyUSB1", "send", "--crlf", "--file", "f.bin"]).cmd,
+        CtlCmd::Send {
+            data: SendData::File("f.bin".into()),
+            ending: LineEnding::CrLf
+        }
+    );
+    assert_eq!(
+        ctl(&["ttyUSB1", "read", "--last", "10", "--color", "never"]).cmd,
+        CtlCmd::Read {
+            since: None,
+            last: Some(10),
+            max_bytes: 1 << 20,
+            from_oldest: false,
+            color: ColorMode::Never
+        }
+    );
+    assert_eq!(
+        ctl(&[
+            "ttyUSB1",
+            "read",
+            "--since",
+            "5",
+            "--max-bytes",
+            "7",
+            "--from-oldest"
+        ])
+        .cmd,
+        CtlCmd::Read {
+            since: Some(5),
+            last: None,
+            max_bytes: 7,
+            from_oldest: true,
+            color: ColorMode::Auto
+        }
+    );
+}
+
+#[test]
+fn ctl_usage_errors() {
+    for (v, want) in [
+        (&[][..], "usage: xcomm ctl"),
+        (&["ttyUSB1"], "usage: xcomm ctl"),
+        (
+            &["ttyUSB1", "frobnicate"],
+            "unknown ctl command 'frobnicate'",
+        ),
+        (
+            &["ttyUSB1", "status", "extra"],
+            "unexpected argument 'extra'",
+        ),
+        (&["sessions", "extra"], "unexpected argument 'extra'"),
+        (&["ttyUSB1", "send"], "needs <text>"),
+        (&["ttyUSB1", "send", "a", "b"], "unexpected argument 'b'"),
+        (&["ttyUSB1", "send", "a", "--hex", "00"], "one of"),
+        (&["ttyUSB1", "send", "--hex", "0"], "--hex"),
+        (&["ttyUSB1", "send", "--hex", "zz"], "--hex"),
+        (&["ttyUSB1", "send", "-n", "--cr", "a"], "more than once"),
+        (
+            &["ttyUSB1", "status", "--hex", "00"],
+            "--hex is for ctl send",
+        ),
+        (
+            &["ttyUSB1", "send", "--last", "3", "a"],
+            "--last is for ctl read",
+        ),
+        (
+            &["ttyUSB1", "read", "--since", "1", "--last", "2"],
+            "not both",
+        ),
+        (&["ttyUSB1", "read", "--since", "-1"], "--since"),
+        (&["ttyUSB1", "read", "--since", "x"], "--since"),
+    ] {
+        let e = ctl_err(v);
+        assert!(e.contains(want), "{v:?}: {e}");
+    }
+}
+
+#[test]
+fn ctl_option_of_a_session() {
+    use xcomm::ctl::CtlMode;
+    assert_eq!(term(&["x"], &[]).ctl, CtlMode::ReadWrite);
+    assert_eq!(term(&["--ctl", "ro", "x"], &[]).ctl, CtlMode::ReadOnly);
+    assert_eq!(term(&["--ctl", "off", "x"], &[]).ctl, CtlMode::Off);
+    assert!(err(&["--ctl", "rx", "x"], &[]).contains("--ctl"));
+    assert!(err(&["--ctl", "ro", "--ctl", "rw", "x"], &[]).contains("more than once"));
+}

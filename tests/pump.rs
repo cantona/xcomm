@@ -458,8 +458,8 @@ impl Control for Ringed {
         }
         ControlFlow::Continue(())
     }
-    fn ring(&mut self) -> Option<&mut xcomm::ring::Ring> {
-        Some(&mut self.ring)
+    fn device_output(&mut self, bytes: &[u8]) {
+        self.ring.push(bytes);
     }
 }
 

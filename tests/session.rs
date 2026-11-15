@@ -331,6 +331,7 @@ fn a_write_only_stdin_means_no_input_not_an_error() {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
         .arg(&dev.slave_path)
         .env("XCOMM_LOCK_DIR", &dir)
+        .env("XDG_RUNTIME_DIR", &dir)
         .stdin(null)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -397,6 +398,7 @@ fn piped_input_reaches_the_device_complete_before_exit() {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
             .arg(&dev.slave_path)
             .env("XCOMM_LOCK_DIR", &dir)
+            .env("XDG_RUNTIME_DIR", &dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -448,6 +450,7 @@ fn an_inherited_ignored_sighup_stays_ignored() {
         .unwrap();
     cmd.arg(&dev.slave_path)
         .env("XCOMM_LOCK_DIR", &dir)
+        .env("XDG_RUNTIME_DIR", &dir)
         .stdin(null)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

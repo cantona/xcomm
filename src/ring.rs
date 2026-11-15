@@ -92,6 +92,15 @@ impl Ring {
     /// the offset after them. From `end` (or beyond: not sent yet) nothing
     /// is appended and `since` comes back.
     pub fn read(&self, since: u64, max: usize, out: &mut Vec<u8>) -> Result<u64, Evicted> {
+        let (a, b) = self.slices(since, max)?;
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        Ok(since + (a.len() + b.len()) as u64)
+    }
+
+    /// The bytes [`read`](Self::read) would append, in place: the second
+    /// slice is the part after the wrap, often empty.
+    pub fn slices(&self, since: u64, max: usize) -> Result<(&[u8], &[u8]), Evicted> {
         let oldest = self.oldest();
         if since < oldest {
             return Err(Evicted {
@@ -104,9 +113,7 @@ impl Ring {
             .min(max);
         let at = self.index(since);
         let first = n.min(self.buf.len() - at);
-        out.extend_from_slice(&self.buf[at..at + first]);
-        out.extend_from_slice(&self.buf[..n - first]);
-        Ok(since + n as u64)
+        Ok((&self.buf[at..at + first], &self.buf[..n - first]))
     }
 
     fn index(&self, offset: u64) -> usize {

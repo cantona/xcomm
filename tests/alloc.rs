@@ -9,8 +9,11 @@ use std::os::fd::AsFd;
 
 use xcomm::capture::Capture;
 use xcomm::cli::{Modifier, PrefixKey};
+use xcomm::ctl::CtlMode;
+use xcomm::ctl::proto::Status;
+use xcomm::ctl::server::{CtlServer, Session};
 use xcomm::hosttty::SignalPipe;
-use xcomm::session::{Control, ExitReason, Pump, pump};
+use xcomm::session::{Control, ExitReason, OutQueue, Pump, pump};
 
 struct Counting;
 
@@ -42,6 +45,41 @@ struct Count {
     echo: bool,
     capture: Option<Capture>,
     ring: xcomm::ring::Ring,
+    server: Option<CtlServer>,
+}
+
+/// What the control server sees of the session.
+struct View<'a> {
+    ring: &'a xcomm::ring::Ring,
+    queue: &'a mut OutQueue,
+}
+
+impl Session for View<'_> {
+    fn status(&self) -> Status {
+        Status {
+            device: String::new(),
+            tty: String::new(),
+            stable: String::new(),
+            settings: None,
+            modem: None,
+            connected: true,
+            offset: self.ring.end(),
+            oldest: self.ring.oldest(),
+            capture: None,
+            transfer: false,
+            ctl: String::new(),
+            herdr_pane: None,
+            pid: 0,
+        }
+    }
+    fn ring(&self) -> &xcomm::ring::Ring {
+        self.ring
+    }
+    fn send(&mut self, bytes: &[u8]) -> Result<usize, (u8, String)> {
+        let n = bytes.len().min(self.queue.free());
+        assert!(self.queue.push(&bytes[..n]));
+        Ok(n)
+    }
 }
 
 impl Control for Count {
@@ -68,18 +106,37 @@ impl Control for Count {
     fn capture_failed(&mut self, e: std::io::Error) {
         panic!("capture failed: {e}");
     }
-    fn ring(&mut self) -> Option<&mut xcomm::ring::Ring> {
-        Some(&mut self.ring)
+    fn device_output(&mut self, bytes: &[u8]) {
+        self.ring.push(bytes);
+        if let Some(server) = &mut self.server {
+            server.device_output(&self.ring);
+        }
+    }
+    fn ctl_fds(&self, out: &mut Vec<libc::pollfd>) -> Option<std::time::Instant> {
+        self.server
+            .as_ref()
+            .and_then(|s| s.poll_fds(self.ring.end(), out))
+    }
+    fn ctl_serve(&mut self, ready: &[libc::pollfd], queue: &mut OutQueue) {
+        if let Some(server) = &mut self.server {
+            let mut view = View {
+                ring: &self.ring,
+                queue,
+            };
+            server.serve(ready, &mut view);
+        }
     }
 }
 
 /// One test: a process has one signal pipe at a time. The second run adds
 /// the prefix parser, local echo, held Alt sequences (a CSI arrow key, an
 /// ESC cut off at the end of a write) and commands; the third the SGR
-/// filter, with sequences cut at the ends of reads, and capture.
+/// filter, with sequences cut at the ends of reads, and capture; the
+/// fourth the control socket with one subscriber reading the output.
 #[test]
 fn the_loop_does_not_allocate_in_steady_state() {
     run(None, false, b"typed", None);
+    run_with_subscriber();
     let alt_a = PrefixKey {
         modifier: Modifier::Alt,
         letter: b'a',
@@ -105,6 +162,56 @@ fn run(
     echo: bool,
     typed: &'static [u8],
     colored: Option<&'static [u8]>,
+) {
+    run_full(prefix, echo, typed, colored, None, 4093);
+}
+
+fn run_with_subscriber() {
+    let dir = support::lock_dir("alloc-ctl");
+    let server = CtlServer::bind(&dir, "alloc", CtlMode::ReadWrite).unwrap();
+    let mut sub = std::os::unix::net::UnixStream::connect(server.path()).unwrap();
+    std::io::Write::write_all(&mut sub, b"{\"cmd\":\"subscribe\"}\n").unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut sub = std::io::BufReader::new(sub);
+        let mut reply = String::new();
+        std::io::BufRead::read_line(&mut sub, &mut reply).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["ok"], true, "{reply}");
+        let start = v["start"].as_u64().unwrap();
+        let mut buf = vec![0u8; 65536];
+        let mut total = 0u64;
+        let mut tail = Vec::new();
+        while let Ok(n) = std::io::Read::read(&mut sub, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            tail.extend_from_slice(&buf[..n]);
+            let keep = tail.len().saturating_sub(200);
+            tail.drain(..keep);
+        }
+        (start + total, tail)
+    });
+    // A subscriber is dropped (which allocates its message) only once it
+    // is a ring behind, and the socket buffers more than that first.
+    run_full(None, false, b"typed", None, Some(server), 65521);
+    let (reached, tail) = reader.join().unwrap();
+    // Fed after the ring had wrapped: late in the counted passes.
+    assert!(reached > 65521, "the subscriber reached offset {reached}");
+    assert!(
+        !String::from_utf8_lossy(&tail).contains("too slow"),
+        "the subscriber was dropped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn run_full(
+    prefix: Option<(PrefixKey, std::time::Duration)>,
+    echo: bool,
+    typed: &'static [u8],
+    colored: Option<&'static [u8]>,
+    server: Option<CtlServer>,
+    ring_size: usize,
 ) {
     let dev = support::pty();
     let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
@@ -162,7 +269,8 @@ fn run(
         echo,
         capture: colored.map(|_| Capture::start(std::path::Path::new("/dev/null")).unwrap()),
         // Small, so it wraps many times while counted.
-        ring: xcomm::ring::Ring::new(4093),
+        ring: xcomm::ring::Ring::new(ring_size),
+        server,
     };
     let reason = {
         let p = Pump {
@@ -178,7 +286,8 @@ fn run(
     assert_eq!(reason, ExitReason::Requested);
     let warm = count.warm.unwrap();
     assert_eq!(count.end - warm, 0, "allocations in steady state");
-    assert!(count.ring.end() > 4093, "the ring did not wrap");
+    assert!(count.ring.end() > ring_size as u64, "the ring did not wrap");
+    drop(count);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(out_w);
     drop(in_r);
