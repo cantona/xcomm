@@ -408,6 +408,17 @@ impl EscapeStripper {
     /// Appends `input` without its escape sequences to `out`: at most
     /// `input.len()` bytes.
     pub fn strip(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        self.strip_mapped(input, out, |_, _, _| {});
+    }
+
+    /// As `strip`, and before each run of `input[at..at + len]` is appended
+    /// to `out`, calls `kept(at, out.len(), len)`.
+    pub fn strip_mapped(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        mut kept: impl FnMut(usize, usize, usize),
+    ) {
         let mut i = 0;
         while i < input.len() {
             let b = input[i];
@@ -421,6 +432,7 @@ impl EscapeStripper {
             if in_sequence && (runs_inside_sequence(b) || b == DEL) {
                 // Carried out (DEL ignored) without ending the sequence.
                 if b != DEL {
+                    kept(i, out.len(), 1);
                     out.push(b);
                 }
                 i += 1;
@@ -429,10 +441,12 @@ impl EscapeStripper {
             match self.state {
                 Strip::Ground => match memchr::memchr(ESC, &input[i..]) {
                     None => {
+                        kept(i, out.len(), input.len() - i);
                         out.extend_from_slice(&input[i..]);
                         return;
                     }
                     Some(p) => {
+                        kept(i, out.len(), p);
                         out.extend_from_slice(&input[i..i + p]);
                         i += p + 1;
                         self.state = Strip::Esc;

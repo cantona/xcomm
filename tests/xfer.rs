@@ -694,7 +694,11 @@ fn closing_the_client_aborts_its_transfer() {
         T,
     );
     // The port is the program's meanwhile.
-    for args in [&[path.as_str(), "break"][..], &[&path, "send", "x"]] {
+    for args in [
+        &[path.as_str(), "break"][..],
+        &[&path, "send", "x"],
+        &[&path, "run", "x", "--until", "y"],
+    ] {
         let o = ctl(&s, args).output().unwrap();
         assert_eq!(o.status.code(), Some(5), "{args:?}");
     }

@@ -281,10 +281,7 @@ impl Client {
             }
             // The ring moved past what it had not taken yet.
             Err(_) => {
-                let line = format!(
-                    "\n{{\"ok\":false,\"code\":{},\"error\":\"subscriber too slow at offset {at}\"}}\n",
-                    code::DROPPED
-                );
+                let line = proto::dropped_line(at);
                 // Only if it fits now: the session does not wait for it.
                 let _ = self.stream.write(line.as_bytes());
                 self.dead = true;

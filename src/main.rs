@@ -1,5 +1,5 @@
 use std::process::ExitCode;
-use xcomm::cli::{self, Command};
+use xcomm::cli::{self, Command, CtlCmd};
 use xcomm::out;
 use xcomm::session::{self, ExitReason, Failure};
 
@@ -17,6 +17,29 @@ fn print(line: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ctl wait` and `ctl run` match regexes: xcomm-wait, beside this binary,
+/// does that, so the regex engine is not in every session's memory.
+fn exec_wait() -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    let helper = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(exe) => exe.with_file_name(xcomm::ctl::WAIT_HELPER),
+        Err(e) => {
+            out::report(&format!("cannot find the xcomm binary's path: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+    let e = std::process::Command::new(&helper)
+        .arg0(xcomm::ctl::WAIT_HELPER)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    // Not 1: that is a wait that timed out, which an agent would retry.
+    out::report(&format!(
+        "{}: {e}; xcomm ctl wait and run need it installed beside xcomm",
+        helper.display()
+    ));
+    ExitCode::from(2)
 }
 
 fn main() -> ExitCode {
@@ -39,6 +62,9 @@ fn main() -> ExitCode {
         ),
         Ok(Command::Version) => print(&format!("xcomm {}", env!("CARGO_PKG_VERSION"))),
         Ok(Command::ShowPrefix(p)) => print(&p.describe()),
+        Ok(Command::Ctl(args)) if matches!(args.cmd, CtlCmd::Wait { .. } | CtlCmd::Run { .. }) => {
+            exec_wait()
+        }
         Ok(Command::Ctl(args)) => ExitCode::from(xcomm::ctl::client::run(&args, &env)),
         Ok(Command::Term(opts)) => match session::run(&opts, &env) {
             Ok(ExitReason::DeviceGone) => ExitCode::FAILURE,

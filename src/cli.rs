@@ -299,7 +299,40 @@ pub enum CtlCmd {
         proto: crate::ctl::proto::XferProto,
         files: Vec<PathBuf>,
     },
+    /// Output from `since` (default: from now on) until a pattern matches.
+    Wait {
+        since: Option<u64>,
+        opts: WaitOpts,
+    },
+    /// `text` sent, then a wait from the offset of the send.
+    Run {
+        text: String,
+        ending: LineEnding,
+        opts: WaitOpts,
+        /// Most text kept for the output.
+        max_bytes: u64,
+    },
 }
+
+/// What `ctl wait` and `ctl run` wait for, and how long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitOpts {
+    pub until: Option<String>,
+    pub fail_on: Vec<String>,
+    /// None waits as long as it takes.
+    pub timeout: Option<Duration>,
+    /// Done once the device has sent nothing for this long.
+    pub idle: Option<Duration>,
+    /// Match escape sequences too.
+    pub raw: bool,
+    /// Unicode-aware `\w`, `\d`, `\s` and `(?i)` (the `unicode` feature).
+    pub unicode: bool,
+}
+
+/// `--timeout` of `wait` and `run` when not given.
+pub const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// `--max-bytes` of `run` when not given.
+pub const RUN_MAX_BYTES: u64 = 16 << 20;
 
 /// `xcomm ctl [--json] <device> <command> ...` or `xcomm ctl sessions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,7 +375,7 @@ xcomm {version}: a serial terminal
 
 Usage:
   xcomm [options] <device>
-  xcomm ctl [--json] <device> status|send|read ...
+  xcomm ctl [--json] <device> status|send|read|wait|run ...
   xcomm ctl [--json] sessions
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
@@ -391,6 +424,29 @@ Control socket (for scripts and agents, from another terminal):
                              --since <offset> or --last <bytes>,
                              --max-bytes <n>, --from-oldest; the next offset
                              goes to stderr as next=<offset>
+  xcomm ctl <device> wait <regex>
+                             wait for device output to match <regex>, from
+                             --since <offset> or from now on, and print the
+                             match; the offset after it goes to stderr as
+                             end=<offset>. Escape sequences are removed
+                             first unless --raw; a match spans at most
+                             64 KiB, and one that reaches the end of the
+                             output so far waits 50 ms for more (the rest
+                             of a number; end the pattern with what comes
+                             after it, as in 'inet ([0-9.]+)/', to be sure
+                             of all of it). --timeout <s> (default 10, 0
+                             for none) exits 1, --fail-on <regex>
+                             (repeatable) exits 7 when it matches first,
+                             --idle <ms> ends the wait (exit 0) once the
+                             device is that quiet. \\w, \\d, \\s and (?i) are
+                             ASCII; --unicode makes them Unicode-aware in
+                             a build with --features unicode
+  xcomm ctl <device> run <text> --until <regex>
+                             send <text> as send does, then wait as wait
+                             does from the offset of the send (or --idle
+                             instead of --until); prints the output between
+                             the echoed line and the match, at most
+                             --max-bytes <n> (default 16 MiB)
   xcomm ctl <device> break [ms]
                              send a break (default 250 ms, at most 5000)
   xcomm ctl <device> dtr|rts on|off|toggle|pulse [ms]
@@ -558,7 +614,8 @@ fn parse_hex(value: &str) -> Result<Vec<u8>, CliError> {
 }
 
 pub const CTL_USAGE: &str = "usage: xcomm ctl [--json] <device> \
-     status|send|read|break|dtr|rts|set|capture|xfer ..., or xcomm ctl [--json] sessions";
+     status|send|read|wait|run|break|dtr|rts|set|capture|xfer ..., \
+     or xcomm ctl [--json] sessions";
 
 fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     let mut p = lexopt::Parser::from_args(args.iter().cloned());
@@ -572,54 +629,64 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     let mut max_bytes: Option<u64> = None;
     let mut from_oldest = false;
     let mut color: Option<ColorMode> = None;
-    // Options that belong to one command, for the check below.
-    let mut send_opts: Vec<&str> = Vec::new();
-    let mut read_opts: Vec<&str> = Vec::new();
+    let mut timeout: Option<Option<Duration>> = None;
+    let mut idle: Option<Duration> = None;
+    let mut until: Option<String> = None;
+    let mut fail_on: Vec<String> = Vec::new();
+    let mut raw = false;
+    let mut unicode = false;
+    // Each option given, and the commands it belongs to, for the check
+    // below.
+    const SEND: &[&str] = &["send"];
+    const SEND_RUN: &[&str] = &["send", "run"];
+    const READ: &[&str] = &["read"];
+    const WAIT_RUN: &[&str] = &["wait", "run"];
+    let mut given: Vec<(&str, &[&str])> = Vec::new();
     while let Some(arg) = p.next()? {
         match arg {
             Long("json") => json = true,
             Short('n') => {
                 set_once(&mut ending, LineEnding::None, "a line ending")?;
-                send_opts.push("-n");
+                given.push(("-n", SEND_RUN));
             }
             Long("cr") => {
                 set_once(&mut ending, LineEnding::Cr, "a line ending")?;
-                send_opts.push("--cr");
+                given.push(("--cr", SEND_RUN));
             }
             Long("lf") => {
                 set_once(&mut ending, LineEnding::Lf, "a line ending")?;
-                send_opts.push("--lf");
+                given.push(("--lf", SEND_RUN));
             }
             Long("crlf") => {
                 set_once(&mut ending, LineEnding::CrLf, "a line ending")?;
-                send_opts.push("--crlf");
+                given.push(("--crlf", SEND_RUN));
             }
             Long("hex") => {
                 set_once(&mut hex, parse_hex(&text(p.value()?, "--hex")?)?, "--hex")?;
-                send_opts.push("--hex");
+                given.push(("--hex", SEND));
             }
             Long("file") => {
                 set_once(&mut file, PathBuf::from(p.value()?), "--file")?;
-                send_opts.push("--file");
+                given.push(("--file", SEND));
             }
             Long("since") => {
                 let v = parse_offset(&text(p.value()?, "--since")?, "--since")?;
                 set_once(&mut since, v, "--since")?;
-                read_opts.push("--since");
+                given.push(("--since", &["read", "wait"]));
             }
             Long("last") => {
                 let v = parse_offset(&text(p.value()?, "--last")?, "--last")?;
                 set_once(&mut last, v, "--last")?;
-                read_opts.push("--last");
+                given.push(("--last", READ));
             }
             Long("max-bytes") => {
                 let v = parse_offset(&text(p.value()?, "--max-bytes")?, "--max-bytes")?;
                 set_once(&mut max_bytes, v, "--max-bytes")?;
-                read_opts.push("--max-bytes");
+                given.push(("--max-bytes", &["read", "run"]));
             }
             Long("from-oldest") => {
                 from_oldest = true;
-                read_opts.push("--from-oldest");
+                given.push(("--from-oldest", READ));
             }
             Long("color") => {
                 let v = choose(
@@ -632,7 +699,48 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
                     ],
                 )?;
                 set_once(&mut color, v, "--color")?;
-                read_opts.push("--color");
+                given.push(("--color", READ));
+            }
+            Long("timeout") => {
+                let v = parse_timeout(&text(p.value()?, "--timeout")?)?;
+                set_once(&mut timeout, v, "--timeout")?;
+                given.push(("--timeout", WAIT_RUN));
+            }
+            Long("idle") => {
+                let value = text(p.value()?, "--idle")?;
+                let ms = parse_offset(&value, "--idle")
+                    .ok()
+                    .filter(|&ms| ms > 0)
+                    .ok_or_else(|| {
+                        CliError(format!(
+                            "invalid value '{value}' for --idle: expected ms, at least 1"
+                        ))
+                    })?;
+                set_once(&mut idle, Duration::from_millis(ms), "--idle")?;
+                given.push(("--idle", WAIT_RUN));
+            }
+            Long("until") => {
+                set_once(&mut until, text(p.value()?, "--until")?, "--until")?;
+                given.push(("--until", &["run"]));
+            }
+            Long("fail-on") => {
+                fail_on.push(text(p.value()?, "--fail-on")?);
+                given.push(("--fail-on", WAIT_RUN));
+            }
+            Long("raw") => {
+                raw = true;
+                given.push(("--raw", WAIT_RUN));
+            }
+            Long("unicode") => {
+                if !cfg!(feature = "unicode") {
+                    return Err(CliError(
+                        "--unicode: this xcomm was built without it \
+                         (cargo build --features unicode)"
+                            .into(),
+                    ));
+                }
+                unicode = true;
+                given.push(("--unicode", WAIT_RUN));
             }
             Value(v) => words.push(text(v, "argument")?),
             _ => return Err(arg.unexpected().into()),
@@ -644,14 +752,20 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
         [device, cmd, rest @ ..] => (Some(device.clone()), cmd.as_str(), rest),
         _ => return Err(usage()),
     };
-    let only = |opts: &[&str], cmd_name: &str| -> Result<(), CliError> {
-        match opts.first() {
-            Some(o) if cmd != cmd_name => Err(CliError(format!("{o} is for ctl {cmd_name}"))),
-            _ => Ok(()),
-        }
+    if let Some((o, cmds)) = given.iter().find(|(_, cmds)| !cmds.contains(&cmd)) {
+        return Err(CliError(format!(
+            "{o} is for ctl {}",
+            cmds.join(" or ctl ")
+        )));
+    }
+    let wait_opts = |until: Option<String>| WaitOpts {
+        until,
+        fail_on: fail_on.clone(),
+        timeout: timeout.unwrap_or(Some(WAIT_TIMEOUT)),
+        idle,
+        raw,
+        unicode,
     };
-    only(&send_opts, "send")?;
-    only(&read_opts, "read")?;
     let extra = |n: usize| -> Result<(), CliError> {
         match rest.get(n) {
             Some(word) => Err(CliError(format!("ctl {cmd}: unexpected argument '{word}'"))),
@@ -709,6 +823,34 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
                 max_bytes: max_bytes.unwrap_or(crate::ctl::proto::READ_MAX),
                 from_oldest,
                 color: color.unwrap_or(ColorMode::Auto),
+            }
+        }
+        "wait" => {
+            extra(1)?;
+            let pattern = rest.first().cloned();
+            if pattern.is_none() && idle.is_none() {
+                return Err(CliError("ctl wait needs <regex> or --idle <ms>".into()));
+            }
+            CtlCmd::Wait {
+                since,
+                opts: wait_opts(pattern),
+            }
+        }
+        "run" => {
+            let Some(text) = rest.first() else {
+                return Err(CliError("ctl run needs <text>".into()));
+            };
+            extra(1)?;
+            if until.is_none() && idle.is_none() {
+                return Err(CliError(
+                    "ctl run needs --until <regex> or --idle <ms>".into(),
+                ));
+            }
+            CtlCmd::Run {
+                text: text.clone(),
+                ending: ending.unwrap_or(LineEnding::Cr),
+                opts: wait_opts(until.clone()),
+                max_bytes: max_bytes.unwrap_or(RUN_MAX_BYTES),
             }
         }
         "break" => {
@@ -815,6 +957,21 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
         }
     };
     Ok(Command::Ctl(CtlArgs { device, cmd, json }))
+}
+
+/// Seconds, fractions allowed; 0 for none.
+fn parse_timeout(value: &str) -> Result<Option<Duration>, CliError> {
+    let secs = value
+        .parse::<f64>()
+        .ok()
+        .filter(|_| value.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+        .ok_or_else(|| {
+            CliError(format!(
+                "invalid value '{value}' for --timeout: expected seconds (0 for none)"
+            ))
+        })?;
+    Ok((!secs.is_zero()).then_some(secs))
 }
 
 /// A break's or pulse's length in ms.

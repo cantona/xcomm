@@ -722,6 +722,161 @@ fn ctl_line_commands_parse() {
 }
 
 #[test]
+fn ctl_wait_and_run_parse() {
+    use std::time::Duration;
+    use xcomm::cli::WaitOpts;
+    let base = WaitOpts {
+        until: Some("login:".into()),
+        fail_on: vec![],
+        timeout: Some(Duration::from_secs(10)),
+        idle: None,
+        raw: false,
+        unicode: false,
+    };
+    assert_eq!(
+        ctl(&["d", "wait", "login:"]).cmd,
+        CtlCmd::Wait {
+            since: None,
+            opts: base.clone()
+        }
+    );
+    assert_eq!(
+        ctl(&[
+            "d",
+            "wait",
+            "login:",
+            "--since",
+            "12",
+            "--timeout",
+            "0.25",
+            "--idle",
+            "300",
+            "--fail-on",
+            "a",
+            "--fail-on",
+            "b",
+            "--raw"
+        ])
+        .cmd,
+        CtlCmd::Wait {
+            since: Some(12),
+            opts: WaitOpts {
+                fail_on: vec!["a".into(), "b".into()],
+                timeout: Some(Duration::from_millis(250)),
+                idle: Some(Duration::from_millis(300)),
+                raw: true,
+                ..base.clone()
+            }
+        }
+    );
+    assert_eq!(
+        ctl(&["d", "wait", "--idle", "5", "--timeout", "0"]).cmd,
+        CtlCmd::Wait {
+            since: None,
+            opts: WaitOpts {
+                until: None,
+                timeout: None,
+                idle: Some(Duration::from_millis(5)),
+                ..base.clone()
+            }
+        }
+    );
+    assert_eq!(
+        ctl(&["d", "run", "ls", "--until", "login:"]).cmd,
+        CtlCmd::Run {
+            text: "ls".into(),
+            ending: LineEnding::Cr,
+            opts: base.clone(),
+            max_bytes: 16 << 20
+        }
+    );
+    assert_eq!(
+        ctl(&[
+            "d",
+            "run",
+            "ls",
+            "--crlf",
+            "--until",
+            "login:",
+            "--max-bytes",
+            "100"
+        ])
+        .cmd,
+        CtlCmd::Run {
+            text: "ls".into(),
+            ending: LineEnding::CrLf,
+            opts: base,
+            max_bytes: 100
+        }
+    );
+}
+
+#[test]
+fn ctl_unicode_needs_the_feature() {
+    let v = ["d", "wait", r"\w+", "--unicode"];
+    if cfg!(feature = "unicode") {
+        let CtlCmd::Wait { opts, .. } = ctl(&v).cmd else {
+            panic!("not wait");
+        };
+        assert!(opts.unicode);
+        assert!(ctl_err(&["d", "send", "x", "--unicode"]).contains("ctl wait or ctl run"));
+    } else {
+        assert!(ctl_err(&v).contains("--features unicode"));
+    }
+}
+
+#[test]
+fn ctl_wait_and_run_errors() {
+    for (v, want) in [
+        (&["d", "wait"][..], "needs <regex> or --idle"),
+        (&["d", "wait", "a", "b"], "unexpected argument 'b'"),
+        (&["d", "wait", "a", "--timeout", "-1"], "--timeout"),
+        (&["d", "wait", "a", "--timeout", "x"], "--timeout"),
+        (&["d", "wait", "a", "--timeout", "1e3"], "--timeout"),
+        (&["d", "wait", "a", "--idle", "0"], "--idle"),
+        (
+            &["d", "wait", "a", "--until", "b"],
+            "--until is for ctl run",
+        ),
+        (&["d", "wait", "a", "--last", "3"], "--last is for ctl read"),
+        (
+            &["d", "wait", "a", "--max-bytes", "3"],
+            "--max-bytes is for ctl read or ctl run",
+        ),
+        (
+            &["d", "wait", "a", "--cr"],
+            "--cr is for ctl send or ctl run",
+        ),
+        (&["d", "run"], "needs <text>"),
+        (&["d", "run", "x"], "needs --until <regex> or --idle"),
+        (
+            &["d", "run", "x", "y", "--until", "z"],
+            "unexpected argument 'y'",
+        ),
+        (
+            &["d", "run", "x", "--until", "z", "--since", "1"],
+            "--since is for ctl read or ctl wait",
+        ),
+        (
+            &["d", "run", "x", "--until", "z", "--hex", "00"],
+            "--hex is for ctl send",
+        ),
+        (
+            &["d", "send", "x", "--fail-on", "z"],
+            "--fail-on is for ctl wait or ctl run",
+        ),
+        (&["d", "read", "--raw"], "--raw is for ctl wait or ctl run"),
+        (
+            &["d", "wait", "a", "--timeout", "1", "--timeout", "2"],
+            "more than once",
+        ),
+    ] {
+        let e = ctl_err(v);
+        assert!(e.contains(want), "{v:?}: {e}");
+    }
+}
+
+#[test]
 fn ctl_line_command_errors() {
     for (v, want) in [
         (&["d", "break", "0"][..], "1 to 5000"),

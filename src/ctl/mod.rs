@@ -2,9 +2,14 @@
 //! to read device output and send to the device (`xcomm ctl`).
 
 pub mod client;
+pub mod matcher;
 pub mod path;
 pub mod proto;
 pub mod server;
+pub mod wait;
+
+/// The binary beside `xcomm` that runs `ctl wait` and `ctl run`.
+pub const WAIT_HELPER: &str = "xcomm-wait";
 
 /// Exit codes of `xcomm ctl` (spec 4.4), also the `code` of a reply.
 pub mod code {
@@ -16,6 +21,8 @@ pub mod code {
     pub const DISCONNECTED: u8 = 4;
     pub const BUSY: u8 = 5;
     pub const EVICTED: u8 = 6;
+    /// A `--fail-on` pattern of `wait`/`run` matched.
+    pub const FAIL_ON: u8 = 7;
     pub const DENIED: u8 = 8;
     pub const DROPPED: u8 = 9;
 }

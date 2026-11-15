@@ -30,7 +30,7 @@ pub fn run(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> u8 {
     }
 }
 
-type Failed = (u8, String);
+pub(super) type Failed = (u8, String);
 
 fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8, Failed> {
     let dirs = Dirs::find(env);
@@ -57,47 +57,19 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                 SendData::File(p) => std::fs::read(p)
                     .map_err(|e| (code::FAILED, format!("--file {}: {e}", p.display())))?,
             };
-            bytes.extend_from_slice(match ending {
-                LineEnding::None => b"",
-                LineEnding::Cr => b"\r",
-                LineEnding::Lf => b"\n",
-                LineEnding::CrLf => b"\r\n",
-            });
-            let mut first = None;
-            // In order on one connection: the session serves a client's
-            // requests one after another.
-            let chunks: Vec<&[u8]> = if bytes.is_empty() {
-                vec![&[]]
-            } else {
-                bytes.chunks(SEND_CHUNK).collect()
-            };
-            // Even a short send waits while other clients fill the queue.
-            // A status that fails ends it here: a late reply left on the
-            // connection would be read as the send's.
-            let rate = bits_per_second(&conn.request(&Request::Status)?);
-            for chunk in chunks {
-                let wire = rate.map_or(Duration::ZERO, |(bits, per_sec)| {
-                    Duration::from_secs_f64(2.0 * (chunk.len() as f64) * bits / per_sec)
-                });
-                conn.timeout = Some(REPLY_TIMEOUT + wire);
-                let reply = conn
-                    .request(&Request::Send {
-                        data_b64: proto::base64_encode(chunk),
-                    })
-                    .map_err(|(status, msg)| match first {
-                        // Closing cancels the send: what the session had
-                        // not yet taken goes nowhere.
-                        Some(_) => (status, format!("{msg}; the rest was not sent")),
-                        None => (status, msg),
-                    })?;
-                first.get_or_insert(reply);
-            }
-            let reply = first.expect("at least one request");
+            bytes.extend_from_slice(ending_bytes(*ending));
+            let reply = send(&mut conn, &bytes)?;
             if args.json {
                 print_json(&reply)?;
             } else {
                 print_out(format!("{}\n", reply["offset"]).as_bytes())?;
             }
+        }
+        CtlCmd::Wait { .. } | CtlCmd::Run { .. } => {
+            return Err((
+                code::USAGE,
+                format!("ctl wait and ctl run are {}'s", super::WAIT_HELPER),
+            ));
         }
         CtlCmd::Read {
             since,
@@ -224,6 +196,61 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
     Ok(code::OK)
 }
 
+pub(super) fn ending_bytes(ending: LineEnding) -> &'static [u8] {
+    match ending {
+        LineEnding::None => b"",
+        LineEnding::Cr => b"\r",
+        LineEnding::Lf => b"\n",
+        LineEnding::CrLf => b"\r\n",
+    }
+}
+
+/// Sends `bytes`, in as many requests as it takes, and returns the first
+/// reply: its offset is the one at send time.
+pub(super) fn send(conn: &mut Conn, bytes: &[u8]) -> Result<serde_json::Value, Failed> {
+    // Even a short send waits while other clients fill the queue. A status
+    // that fails ends it here: a late reply left on the connection would
+    // be read as the send's.
+    let status = conn.request(&Request::Status)?;
+    send_after(conn, bytes, &status)
+}
+
+/// `send`, with a status reply already had.
+pub(super) fn send_after(
+    conn: &mut Conn,
+    bytes: &[u8],
+    status: &serde_json::Value,
+) -> Result<serde_json::Value, Failed> {
+    let mut first = None;
+    // In order on one connection: the session serves a client's requests
+    // one after another.
+    let chunks: Vec<&[u8]> = if bytes.is_empty() {
+        vec![&[]]
+    } else {
+        bytes.chunks(SEND_CHUNK).collect()
+    };
+    let rate = bits_per_second(status);
+    for chunk in chunks {
+        let wire = rate.map_or(Duration::ZERO, |(bits, per_sec)| {
+            Duration::from_secs_f64(2.0 * (chunk.len() as f64) * bits / per_sec)
+        });
+        conn.timeout = Some(REPLY_TIMEOUT + wire);
+        let reply = conn
+            .request(&Request::Send {
+                data_b64: proto::base64_encode(chunk),
+            })
+            .map_err(|(status, msg)| match first {
+                // Closing cancels the send: what the session had not yet
+                // taken goes nowhere.
+                Some(_) => (status, format!("{msg}; the rest was not sent")),
+                None => (status, msg),
+            })?;
+        first.get_or_insert(reply);
+    }
+    conn.timeout = Some(REPLY_TIMEOUT);
+    Ok(first.expect("at least one request"))
+}
+
 /// How long an action's reply may take: it waits for what the session
 /// has queued for the device (its queue at the line's rate, twice for the
 /// driver's buffer and slack, or STALL if the line takes nothing), then
@@ -263,13 +290,13 @@ fn bits_per_second(status: &serde_json::Value) -> Option<(f64, f64)> {
 }
 
 /// The socket directories a client may trust, and why any other was not.
-struct Dirs {
-    ok: Vec<std::path::PathBuf>,
+pub(super) struct Dirs {
+    pub(super) ok: Vec<std::path::PathBuf>,
     skipped: Vec<String>,
 }
 
 impl Dirs {
-    fn find(env: &dyn Fn(&str) -> Option<String>) -> Dirs {
+    pub(super) fn find(env: &dyn Fn(&str) -> Option<String>) -> Dirs {
         let mut dirs = Dirs {
             ok: Vec::new(),
             skipped: Vec::new(),
@@ -298,15 +325,16 @@ impl Dirs {
     }
 }
 
-struct Conn {
-    reader: BufReader<UnixStream>,
+pub(super) struct Conn {
+    pub(super) path: std::path::PathBuf,
+    pub(super) reader: BufReader<UnixStream>,
     writer: UnixStream,
     /// For the next reply; None waits as long as it takes.
     timeout: Option<Duration>,
 }
 
 impl Conn {
-    fn open(dirs: &Dirs, device: &str) -> Result<Conn, Failed> {
+    pub(super) fn open(dirs: &Dirs, device: &str) -> Result<Conn, Failed> {
         let mut socks: Vec<std::path::PathBuf> = match path::tty_name(device) {
             Some(tty) => dirs
                 .ok
@@ -326,7 +354,7 @@ impl Conn {
         for sock in &socks {
             match UnixStream::connect(sock) {
                 Ok(stream) => {
-                    return Conn::new(stream, Some(REPLY_TIMEOUT))
+                    return Conn::new(sock, stream, Some(REPLY_TIMEOUT))
                         .map_err(|e| (code::FAILED, e.to_string()));
                 }
                 // None there, or one a killed session left: look on.
@@ -346,9 +374,14 @@ impl Conn {
         Err(failed.unwrap_or_else(|| dirs.none(device)))
     }
 
-    fn new(stream: UnixStream, timeout: Option<Duration>) -> std::io::Result<Conn> {
+    pub(super) fn new(
+        path: &Path,
+        stream: UnixStream,
+        timeout: Option<Duration>,
+    ) -> std::io::Result<Conn> {
         let writer = stream.try_clone()?;
         Ok(Conn {
+            path: path.to_path_buf(),
             reader: BufReader::new(stream),
             writer,
             timeout,
@@ -357,7 +390,7 @@ impl Conn {
 
     /// Sends `request` and returns the reply's fields; a failed reply is
     /// an error with its code.
-    fn request(&mut self, request: &Request) -> Result<serde_json::Value, Failed> {
+    pub(super) fn request(&mut self, request: &Request) -> Result<serde_json::Value, Failed> {
         // The session does not run it once this client has given up.
         let envelope = proto::Envelope {
             request: request.clone(),
@@ -389,7 +422,7 @@ fn find_by_name(dirs: &[std::path::PathBuf], device: &str) -> Option<std::path::
 }
 
 /// The `*.sock` files in `dirs`, each directory's sorted.
-fn socket_files(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+pub(super) fn socket_files(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     let mut all = Vec::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -407,9 +440,9 @@ fn socket_files(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
 
 /// What the session on `sock` says of itself; None when nothing answers
 /// there (gone, refusing, not answering).
-fn status_of(sock: &Path) -> Option<serde_json::Value> {
+pub(super) fn status_of(sock: &Path) -> Option<serde_json::Value> {
     let stream = UnixStream::connect(sock).ok()?;
-    let mut conn = Conn::new(stream, Some(Duration::from_secs(2))).ok()?;
+    let mut conn = Conn::new(sock, stream, Some(Duration::from_secs(2))).ok()?;
     conn.request(&Request::Status).ok()
 }
 
@@ -456,11 +489,11 @@ fn read_reply(
     Err((status, msg.to_string()))
 }
 
-fn print_out(bytes: &[u8]) -> Result<(), Failed> {
+pub(super) fn print_out(bytes: &[u8]) -> Result<(), Failed> {
     crate::out::stdout(bytes).map_err(|e| (code::FAILED, format!("cannot write to stdout: {e}")))
 }
 
-fn print_json(v: &serde_json::Value) -> Result<(), Failed> {
+pub(super) fn print_json(v: &serde_json::Value) -> Result<(), Failed> {
     let mut line = serde_json::to_vec(v).expect("a JSON value serializes");
     line.push(b'\n');
     print_out(&line)

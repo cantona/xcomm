@@ -82,6 +82,47 @@ pub struct Envelope {
     pub deadline_ms: Option<u64>,
 }
 
+/// A subscriber that falls behind gets this line, with the offset it had
+/// reached, as its last bytes; then the session closes it.
+pub fn dropped_line(at: u64) -> String {
+    format!("{DROPPED_HEAD}{at}{DROPPED_TAIL}")
+}
+
+const DROPPED_HEAD: &str = "\n{\"ok\":false,\"code\":9,\"error\":\"subscriber too slow at offset ";
+const DROPPED_TAIL: &str = "\"}\n";
+
+/// Where `bytes` ends with a `dropped_line`, and its offset.
+pub fn dropped_at(bytes: &[u8]) -> Option<(usize, u64)> {
+    let body = bytes.strip_suffix(DROPPED_TAIL.as_bytes())?;
+    let digits = body.iter().rev().take_while(|b| b.is_ascii_digit()).count();
+    let (head, at) = body.split_at(body.len() - digits);
+    let line = head.strip_suffix(DROPPED_HEAD.as_bytes())?;
+    let at = std::str::from_utf8(at).ok()?.parse().ok()?;
+    Some((line.len(), at))
+}
+
+/// How many bytes at the end of `bytes` could be a `dropped_line` cut
+/// short: 2 at least, as a lone newline is too common to hold back.
+pub fn dropped_start(bytes: &[u8]) -> usize {
+    let longest = DROPPED_HEAD.len() + 20 + DROPPED_TAIL.len();
+    let look = bytes.len().saturating_sub(longest);
+    memchr::memchr_iter(b'\n', &bytes[look..])
+        .map(|p| &bytes[look + p..])
+        .find(|t| t.len() >= 2 && starts_dropped(t))
+        .map_or(0, <[u8]>::len)
+}
+
+/// Whether `t` is the start of a `dropped_line`, but not all of it.
+fn starts_dropped(t: &[u8]) -> bool {
+    let head = DROPPED_HEAD.as_bytes();
+    let Some(rest) = t.strip_prefix(head) else {
+        return head.starts_with(t);
+    };
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let after = &rest[digits..];
+    after.len() < DROPPED_TAIL.len() && DROPPED_TAIL.as_bytes().starts_with(after)
+}
+
 /// Now as Unix time in ms, as `deadline_ms` counts.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()

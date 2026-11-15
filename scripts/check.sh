@@ -61,6 +61,8 @@ done
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo clippy --locked --all-targets --features unicode -- -D warnings
+cargo test --locked --features unicode --lib --test cli --test ctl_wait
 cargo "+$toolchain" check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets --target "$macos_target" -- -D warnings
 RUSTFLAGS="${RUSTFLAGS:-} -D warnings" cargo "+$toolchain" check --locked --workspace --all-targets --target "$macos_target"
