@@ -104,12 +104,10 @@ extern "C" fn restore_on_fatal(
     // SAFETY: written before this handler was installed (see Previous).
     let previous = unsafe { (*PREVIOUS.0.get())[i].assume_init_ref() };
     let handler = previous.sa_sigaction;
-    if previous.sa_flags & libc::SA_SIGINFO != 0 {
-        // SAFETY: an SA_SIGINFO handler obtained from sigaction.
-        let h: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
-            unsafe { std::mem::transmute(handler) };
-        h(sig, info, context);
-    } else if handler == libc::SIG_DFL || (handler == libc::SIG_IGN && is_fault(sig)) {
+    // SIG_DFL and SIG_IGN are checked before SA_SIGINFO: macOS keeps that
+    // flag across exec while resetting the handler to SIG_DFL, so a parent's
+    // SA_SIGINFO handler leaves SIG_DFL with SA_SIGINFO set.
+    if handler == libc::SIG_DFL || (handler == libc::SIG_IGN && is_fault(sig)) {
         // An ignored fault cannot be ignored: returning would re-execute the
         // faulting instruction forever. The kernel forces the default action
         // in that case, and so does this.
@@ -120,7 +118,14 @@ extern "C" fn restore_on_fatal(
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
         }
-    } else if handler != libc::SIG_IGN {
+    } else if handler == libc::SIG_IGN {
+        // An ignored signal that is not a fault stays ignored.
+    } else if previous.sa_flags & libc::SA_SIGINFO != 0 {
+        // SAFETY: an SA_SIGINFO handler obtained from sigaction.
+        let h: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+            unsafe { std::mem::transmute(handler) };
+        h(sig, info, context);
+    } else {
         // SAFETY: a plain handler obtained from sigaction.
         let h: extern "C" fn(libc::c_int) = unsafe { std::mem::transmute(handler) };
         h(sig);

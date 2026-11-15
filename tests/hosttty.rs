@@ -137,6 +137,20 @@ fn death_child() {
         }
         unsafe { libc::signal(libc::SIGABRT, earlier as *const () as libc::sighandler_t) };
     }
+    // What macOS exec leaves when the parent had an SA_SIGINFO handler:
+    // the handler reset, the flag kept.
+    let siginfo_without_handler = |sig: libc::c_int, handler: libc::sighandler_t| unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler;
+        action.sa_flags = libc::SA_SIGINFO;
+        assert_eq!(libc::sigaction(sig, &action, std::ptr::null_mut()), 0);
+    };
+    if kind == "abort-siginfo-default" {
+        siginfo_without_handler(libc::SIGABRT, libc::SIG_DFL);
+    }
+    if kind == "quit-siginfo-ignored" {
+        siginfo_without_handler(libc::SIGQUIT, libc::SIG_IGN);
+    }
     let stdin = std::io::stdin();
     let raw = RawMode::enter(stdin.as_fd()).unwrap();
     std::mem::forget(raw);
@@ -159,7 +173,7 @@ fn death_child() {
             }));
             panic!("deliberate");
         }
-        "abort" | "abort-chained" => std::process::abort(),
+        "abort" | "abort-chained" | "abort-siginfo-default" => std::process::abort(),
         "alloc" => std::alloc::handle_alloc_error(std::alloc::Layout::new::<[u8; 4096]>()),
         "overflow" => {
             std::hint::black_box(recurse(0));
@@ -171,6 +185,11 @@ fn death_child() {
         "quit" => unsafe {
             libc::raise(libc::SIGQUIT);
         },
+        // Ignored, so it lives on to exit.
+        "quit-siginfo-ignored" => {
+            unsafe { libc::raise(libc::SIGQUIT) };
+            std::process::exit(3)
+        }
         other => panic!("unknown death {other}"),
     }
 }
@@ -251,6 +270,12 @@ fn dies_in_raw_mode_by_abort() {
 }
 
 #[test]
+fn dies_in_raw_mode_by_abort_with_sa_siginfo_left_on_the_default() {
+    let status = die_in_raw_mode("abort-siginfo-default");
+    assert!(aborted(status), "{status:?}");
+}
+
+#[test]
 fn dies_in_raw_mode_by_allocation_failure() {
     let status = die_in_raw_mode("alloc");
     assert!(aborted(status), "{status:?}");
@@ -288,6 +313,11 @@ fn dies_in_raw_mode_by_segfault_even_if_sigsegv_was_ignored() {
 fn dies_in_raw_mode_by_sigquit() {
     let status = die_in_raw_mode("quit");
     assert!(killed_by(status, libc::SIGQUIT), "{status:?}");
+}
+
+#[test]
+fn an_ignored_sigquit_with_sa_siginfo_stays_ignored() {
+    assert_eq!(die_in_raw_mode("quit-siginfo-ignored").code(), Some(3));
 }
 
 #[test]
