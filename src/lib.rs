@@ -8,5 +8,6 @@ pub mod keys;
 pub mod lock;
 pub mod out;
 pub mod port;
+pub mod reconnect;
 pub mod session;
 pub mod xfer;

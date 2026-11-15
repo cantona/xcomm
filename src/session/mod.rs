@@ -14,11 +14,12 @@ use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::ansi::{SGR_HELD_MAX, SgrFilter};
 use crate::capture::Capture;
-use crate::cli::TermOpts;
+use crate::cli::{LineSettings, TermOpts};
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{KeyAction, KeyParser};
 use crate::lock::{self, Cleared, UucpLock};
 use crate::port::{self, Applied, LowLatency, Port};
+use crate::reconnect::{self, DeviceWatch, NodeId, Track};
 use outq::OutQueue;
 
 /// How a session ended.
@@ -133,6 +134,12 @@ const STALL: Duration = Duration::from_secs(2);
 const CAPTURE_FLUSH: Duration = Duration::from_millis(50);
 /// How long quitting waits for queued keys to reach the device.
 const QUIT_DRAIN: Duration = Duration::from_secs(1);
+/// A device that went away has its node removed at once (an unplug); one
+/// still there this much later was hung up instead.
+const HANGUP_GRACE: Duration = Duration::from_secs(1);
+const HANGUP_TICK: Duration = Duration::from_millis(20);
+/// How often a device another program holds is tried again.
+const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 const BUF_SIZE: usize = 64 * 1024;
 
@@ -374,6 +381,17 @@ fn gone(e: rustix::io::Errno) -> bool {
 /// Moves bytes until something ends the session. Does not allocate once
 /// running: the buffer and queue are made before the loop.
 pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionError> {
+    let mut keys = p.prefix.map(|(key, time)| KeyParser::new(key, time));
+    pump_with(p, &mut keys, ctl)
+}
+
+/// [`pump`] with the key parser given, so that a prefix typed just before
+/// the device goes away (or comes back) still takes the next key.
+fn pump_with(
+    p: &Pump<'_>,
+    keys: &mut Option<KeyParser>,
+    ctl: &mut dyn Control,
+) -> Result<ExitReason, SessionError> {
     let mut buf = vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut queue = OutQueue::with_capacity(BUF_SIZE);
     let stdin_fd = p.stdin;
@@ -384,7 +402,6 @@ pub fn pump(p: &Pump<'_>, ctl: &mut dyn Control) -> Result<ExitReason, SessionEr
     // or the queue is full) the slot holds the signal pipe with no events:
     // stdin itself would still report POLLHUP and make poll return at once.
     let signal_fd = p.signals.fd();
-    let mut keys = p.prefix.map(|(key, time)| KeyParser::new(key, time));
     // Only in the path when color is off. An unfinished sequence it holds
     // when the session ends is dropped: never text, only a cut-off escape.
     let mut sgr = p.strip_color.then(SgrFilter::new);
@@ -752,6 +769,20 @@ impl From<SessionError> for Failure {
     }
 }
 
+/// The identity of `path` when it is a symbolic link.
+fn through_link(path: &Path) -> Option<NodeId> {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_symlink())
+        .then(|| NodeId::link_at(path).ok())
+        .flatten()
+}
+
+/// A UUCP lock held for the device, and the tty name it is for.
+struct Held {
+    lock: UucpLock,
+    name: String,
+}
+
 /// Runs an interactive session on the process's own stdin and stdout.
 pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<ExitReason, Failure> {
     let path = device_path(&opts.device);
@@ -759,17 +790,34 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     // process with lock files half made.
     let signals =
         SignalPipe::install(&signals()).map_err(|e| Failure::Other(format!("signals: {e}")))?;
-    let lock = if opts.no_lock {
-        None
+    let (mut held, cleared) = if opts.no_lock {
+        (None, None)
     } else {
-        Some(take_lock(&path, env)?)
+        let real = std::fs::canonicalize(&path)
+            .map_err(|e| Failure::Other(format!("cannot open {}: {e}", path.display())))?;
+        let (held, cleared) = take_lock(&real, env).map_err(|e| match e {
+            LockFailure::Busy(msg) => Failure::Busy(msg),
+            LockFailure::Other(msg) => Failure::Other(msg),
+        })?;
+        (Some(held), cleared)
     };
+    // Taken before the open: a link replaced after it is a change to see.
+    let stable = reconnect::stable_path(&path);
+    let mut resolved = std::fs::canonicalize(&stable).unwrap_or_else(|_| stable.clone());
+    // The link the path went through, if it is one.
+    let mut link = through_link(&stable);
     let (port, applied) = Port::open(&path, &opts.line, !opts.no_init).map_err(|e| match &e {
         port::PortError::Open { source, .. } if source.kind() == io::ErrorKind::ResourceBusy => {
             Failure::Busy(e.to_string())
         }
         _ => Failure::Other(e.to_string()),
     })?;
+    if through_link(&stable) != link {
+        return Err(Failure::Other(format!(
+            "{} changed while being opened",
+            stable.display()
+        )));
+    }
     if opts.low_latency {
         port.set_ftdi_latency_timer(1)
             .map_err(|e| Failure::Other(format!("--low-latency: {e}")))?;
@@ -786,8 +834,8 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             // Ended by a signal before the session started.
             None => {
                 drop(port);
-                if let Some((lock, _)) = lock
-                    && let Err(e) = lock.release()
+                if let Some(held) = held
+                    && let Err(e) = held.lock.release()
                 {
                     Notices { raw: false }.say(&format!("could not remove the lock: {e}"));
                 }
@@ -807,46 +855,165 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         .map_err(|e| Failure::Other(format!("-C {e}")))?;
     let keys_on = raw.is_some();
     let notices = Notices { raw: keys_on };
-    if let Some((_, cleared)) = &lock {
-        match cleared {
-            Some(Cleared::DeadPid(pid)) => {
-                notices.say(&format!("removed a stale lock of process {pid}"))
-            }
-            Some(Cleared::Empty) => notices.say("removed an abandoned empty lock"),
-            None => {}
+    match cleared {
+        Some(Cleared::DeadPid(pid)) => {
+            notices.say(&format!("removed a stale lock of process {pid}"))
         }
+        Some(Cleared::Empty) => notices.say("removed an abandoned empty lock"),
+        None => {}
     }
     notices.say(&banner(&path, opts, &port, applied, low_latency, keys_on));
     if let Some(c) = &capture {
         notices.say(&format!("capturing to {}", c.path().display()));
     }
 
-    let reason = {
-        let pump_io = Pump {
-            stdin: readable(stdin.as_fd()).then_some(stdin.as_fd()),
-            stdout: stdout.as_fd(),
-            device: port.fd(),
-            signals: &signals,
-            prefix: keys_on.then_some((opts.prefix.key, opts.prefix_time)),
-            strip_color: !crate::ansi::device_color_enabled(
-                opts.color,
-                rustix::termios::isatty(stdout.as_fd()),
-                env,
-            ),
-        };
-        let stderr = io::stderr();
+    let stderr = io::stderr();
+    let stdin_fd = readable(stdin.as_fd()).then_some(stdin.as_fd());
+    // Piped input read but not yet written is lost when the device goes
+    // away, so going on after it comes back would leave a hole in the
+    // stream: a disconnect ends such a session, as it always did.
+    let piped = !keys_on && stdin_fd.is_some();
+    let prefix = keys_on.then_some((opts.prefix.key, opts.prefix_time));
+    let strip_color = !crate::ansi::device_color_enabled(
+        opts.color,
+        rustix::termios::isatty(stdout.as_fd()),
+        env,
+    );
+    let mut kept = commands::Kept::new(capture);
+    let mut port_tty = port.tty_name().to_string();
+    // Taken at the open: a descriptor revoked by a hangup cannot be asked
+    // (macOS fstat fails on it).
+    let mut node = NodeId::of(port.fd()).ok();
+    let mut port = port;
+    let mut first = true;
+    let mut keys = prefix.map(|(key, time)| KeyParser::new(key, time));
+    let (reason, port) = loop {
         let mut live = commands::Live::new(
             raw.as_ref(),
-            &port,
+            Some(&port),
             opts,
             stdout.as_fd(),
             stderr.as_fd(),
             &signals,
-            capture,
+            kept,
         );
-        let reason = pump(&pump_io, &mut live);
-        live.finish();
-        reason
+        if std::mem::take(&mut first) && opts.wrap {
+            live.set_wrap(true);
+        }
+        let pump_io = Pump {
+            stdin: stdin_fd,
+            stdout: stdout.as_fd(),
+            device: port.fd(),
+            signals: &signals,
+            prefix,
+            strip_color,
+        };
+        let reason = pump_with(&pump_io, &mut keys, &mut live);
+        // A pty opened by its own name does not come back: its number goes
+        // to the next terminal made.
+        // XCOMM_TEST_PTY_AS_DEVICE (test-only) treats a pty as a device
+        // that can come back, so tests can take the path of a real one.
+        let pty = reconnect::is_pty(&resolved) && env("XCOMM_TEST_PTY_AS_DEVICE").is_none();
+        if !matches!(reason, Ok(ExitReason::DeviceGone)) || piped || (pty && link.is_none()) {
+            live.finish();
+            break (reason, Some(port));
+        }
+        live.flush_capture();
+        kept = live.into_kept();
+        let settings = port.settings();
+        let (track, gone) = if pty || reconnect::udev_link(&stable) {
+            (Track::Link, link)
+        } else {
+            (Track::Node, node)
+        };
+        drop(port);
+        let mut live = commands::Live::new(
+            raw.as_ref(),
+            None,
+            opts,
+            stdout.as_fd(),
+            stderr.as_fd(),
+            &signals,
+            kept,
+        );
+        let notice = if keys_on {
+            format!(
+                "{} disconnected; waiting for it to come back ({} x quits)",
+                path.display(),
+                opts.prefix.key.display()
+            )
+        } else {
+            format!(
+                "{} disconnected; waiting for it to come back",
+                path.display()
+            )
+        };
+        // Waiting on a link (by-id, by-path, the user's own), the tty name
+        // may go to another device meanwhile: its lock goes too, and the
+        // name the device comes back under is locked then.
+        if link.is_some()
+            && let Some(h) = held.take()
+            && let Err(e) = h.lock.release()
+        {
+            live.say(&format!("could not remove the lock: {e}"));
+        }
+        let old_tty = port_tty.clone();
+        let mut watch = DeviceWatch::new(&stable, &resolved, gone, track);
+        // A node that stays (a hangup, not an unplug) is not waited for:
+        // that ends the session, as it always did.
+        let hung_up = node
+            .filter(|_| !pty)
+            .map(|id| (Instant::now() + HANGUP_GRACE, id));
+        let waited = wait_for_device(
+            &mut live,
+            &mut watch,
+            &stable,
+            &notice,
+            hung_up,
+            stdin_fd.filter(|_| keys_on),
+            &mut keys,
+            &signals,
+            &mut || reopen(&stable, &settings, opts, &mut held, env),
+        );
+        match waited {
+            Ok(Waited::Back(Reopened {
+                port: new,
+                applied,
+                notes,
+                resolved: new_resolved,
+                link: new_link,
+            })) => {
+                let mut msg = format!("{} reconnected", path.display());
+                if new.tty_name() != old_tty {
+                    msg.push_str(&format!(" as {}", new.tty_name()));
+                }
+                if let Applied::Different(actual) = applied {
+                    msg.push_str(&format!(
+                        " (requested {}; the driver applied {})",
+                        port::describe(&settings),
+                        port::describe(&actual)
+                    ));
+                }
+                live.say(&msg);
+                for note in notes.iter().chain(&live.restore_lines(&new)) {
+                    live.say(note);
+                }
+                kept = live.into_kept();
+                resolved = new_resolved;
+                link = new_link;
+                port_tty = new.tty_name().to_string();
+                node = NodeId::of(new.fd()).ok();
+                port = new;
+            }
+            Ok(Waited::Exit(exit)) => {
+                live.finish();
+                break (Ok(exit), None);
+            }
+            Err(e) => {
+                live.finish();
+                break (Err(e), None);
+            }
+        }
     };
     drop(raw);
     let notices = Notices { raw: false };
@@ -854,9 +1021,11 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     if let Ok(ExitReason::DeviceGone) = &reason {
         notices.say(&format!("{} disconnected", path.display()));
     }
+    // Closed before the lock goes: a program that takes the lock must find
+    // the port free.
     drop(port);
-    if let Some((lock, _)) = lock
-        && let Err(e) = lock.release()
+    if let Some(held) = held
+        && let Err(e) = held.lock.release()
     {
         notices.say(&format!("could not remove the lock: {e}"));
     }
@@ -887,21 +1056,299 @@ fn enter_raw(fd: BorrowedFd<'_>, signals: &SignalPipe) -> Result<Option<RawMode>
     }
 }
 
+enum LockFailure {
+    Busy(String),
+    Other(String),
+}
+
+/// Locks the device that `real` (a resolved path) names.
 fn take_lock(
-    path: &Path,
+    real: &Path,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<(UucpLock, Option<Cleared>), Failure> {
-    let real = std::fs::canonicalize(path)
-        .map_err(|e| Failure::Other(format!("cannot open {}: {e}", path.display())))?;
-    let name = lock::lock_name(&real)
-        .ok_or_else(|| Failure::Other(format!("cannot name a lock for {}", real.display())))?;
-    let dir = lock::default_lock_dir(env).map_err(|e| Failure::Other(e.to_string()))?;
-    lock::acquire(&dir, &name).map_err(|e| match e {
+) -> Result<(Held, Option<Cleared>), LockFailure> {
+    let name = lock::lock_name(real)
+        .ok_or_else(|| LockFailure::Other(format!("cannot name a lock for {}", real.display())))?;
+    let dir = lock::default_lock_dir(env).map_err(|e| LockFailure::Other(e.to_string()))?;
+    let (lock, cleared) = lock::acquire(&dir, &name).map_err(|e| match e {
         lock::LockError::Held { .. } | lock::LockError::Contended { .. } => {
-            Failure::Busy(e.to_string())
+            LockFailure::Busy(e.to_string())
         }
-        _ => Failure::Other(e.to_string()),
+        _ => LockFailure::Other(e.to_string()),
+    })?;
+    Ok((Held { lock, name }, cleared))
+}
+
+/// The device opened again.
+struct Reopened {
+    port: Port,
+    applied: Applied,
+    /// For the user.
+    notes: Vec<String>,
+    /// The resolved path and link identity, taken before the open.
+    resolved: PathBuf,
+    link: Option<NodeId>,
+}
+
+/// How the disconnected state ended.
+enum Waited {
+    /// The device is back.
+    Back(Reopened),
+    Exit(ExitReason),
+}
+
+enum ReopenError {
+    /// Another program holds the device or its lock; it may let go.
+    Busy(String),
+    /// Anything else. A node just made can fail for a moment (udev has not
+    /// given it its mode yet, the driver is still setting up), so it is
+    /// tried again for a while.
+    Failed(String),
+}
+
+/// Opens the device again with the settings it had. A device that comes
+/// back under another tty name is locked under that name, and the old lock
+/// released.
+fn reopen(
+    stable: &Path,
+    settings: &LineSettings,
+    opts: &TermOpts,
+    held: &mut Option<Held>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Reopened, ReopenError> {
+    let open_failed = |kind: io::ErrorKind, msg: String| match kind {
+        io::ErrorKind::ResourceBusy => ReopenError::Busy(msg),
+        _ => ReopenError::Failed(msg),
+    };
+    let mut notes = Vec::new();
+    let mut new_lock = None;
+    let link = through_link(stable);
+    let real = std::fs::canonicalize(stable)
+        .map_err(|e| open_failed(e.kind(), format!("cannot open {}: {e}", stable.display())))?;
+    if !opts.no_lock {
+        let name = lock::lock_name(&real);
+        if held.as_ref().map(|h| h.name.as_str()) != name.as_deref() {
+            let (lock, cleared) = take_lock(&real, env).map_err(|e| match e {
+                LockFailure::Busy(msg) => ReopenError::Busy(msg),
+                LockFailure::Other(msg) => ReopenError::Failed(msg),
+            })?;
+            match cleared {
+                Some(Cleared::DeadPid(pid)) => {
+                    notes.push(format!("removed a stale lock of process {pid}"))
+                }
+                Some(Cleared::Empty) => notes.push("removed an abandoned empty lock".to_string()),
+                None => {}
+            }
+            new_lock = Some(lock);
+        }
+    }
+    let (port, applied) = Port::open(stable, settings, !opts.no_init).map_err(|e| match &e {
+        port::PortError::Open { source, .. } => open_failed(source.kind(), e.to_string()),
+        _ => ReopenError::Failed(e.to_string()),
+    })?;
+    // The lock is for `real`: the link must not have moved on since.
+    let same = |port: &Port| -> io::Result<bool> {
+        Ok(rustix::fs::fstat(port.fd())?.st_rdev == rustix::fs::stat(&real)?.st_rdev)
+    };
+    if !same(&port).unwrap_or(false) || through_link(stable) != link {
+        return Err(ReopenError::Failed(format!(
+            "{} changed while being opened",
+            stable.display()
+        )));
+    }
+    if opts.low_latency
+        && let Err(e) = port.set_ftdi_latency_timer(1)
+    {
+        notes.push(format!("--low-latency: {e}"));
+    }
+    if let Err(e) = port.set_async_low_latency() {
+        notes.push(format!("ASYNC_LOW_LATENCY: {e}"));
+    }
+    if let Some(lock) = new_lock
+        && let Some(old) = held.replace(lock)
+        && let Err(e) = old.lock.release()
+    {
+        notes.push(format!("could not remove the lock: {e}"));
+    }
+    Ok(Reopened {
+        port,
+        applied,
+        notes,
+        resolved: real,
+        link,
     })
+}
+
+/// The disconnected state: waits for the device to come back, or for the
+/// session to end. Keys typed at a terminal are read: commands work, and
+/// what would go to the device is dropped with a bell.
+#[allow(clippy::too_many_arguments)]
+fn wait_for_device(
+    live: &mut commands::Live<'_>,
+    watch: &mut DeviceWatch,
+    path: &Path,
+    notice: &str,
+    mut hung_up: Option<(Instant, NodeId)>,
+    stdin: Option<BorrowedFd<'_>>,
+    keys: &mut Option<KeyParser>,
+    signals: &SignalPipe,
+    reopen: &mut dyn FnMut() -> Result<Reopened, ReopenError>,
+) -> Result<Waited, SessionError> {
+    let mut buf = [0u8; 256];
+    let signal_fd = signals.fd();
+    let mut look = true;
+    // The last failure told, so that retries do not repeat it.
+    let mut told: Option<String> = None;
+    let mut tell = |live: &commands::Live<'_>, msg: String| {
+        if told.as_ref() != Some(&msg) {
+            live.say(&format!("{msg}; still waiting"));
+            told = Some(msg);
+        }
+    };
+    // Told once the node has gone; a node that stays was hung up, which
+    // ends the session without a word of waiting.
+    if hung_up.is_none() {
+        live.say(notice);
+    }
+    loop {
+        if let Some((due, gone)) = hung_up {
+            if !NodeId::at(path).is_ok_and(|id| id.same_node(&gone)) {
+                hung_up = None;
+                live.say(notice);
+            } else if Instant::now() >= due {
+                return Ok(Waited::Exit(ExitReason::DeviceGone));
+            }
+        }
+        if look
+            && watch
+                .check()
+                .map_err(|e| SessionError(format!("watch: {e}")))?
+        {
+            match reopen() {
+                Ok(back) => return Ok(Waited::Back(back)),
+                Err(ReopenError::Failed(msg)) => {
+                    if !watch.retry() {
+                        tell(live, msg);
+                    }
+                }
+                Err(ReopenError::Busy(msg)) => {
+                    watch.retry_in(BUSY_RETRY);
+                    tell(live, msg);
+                }
+            }
+        }
+        let held_due = keys.as_ref().and_then(|k| k.deadline());
+        // Until the node is seen gone, it is looked at every HANGUP_TICK.
+        let hung_up_due = hung_up.map(|(t, _)| t.min(Instant::now() + HANGUP_TICK));
+        let due = [held_due, watch.deadline(), hung_up_due]
+            .into_iter()
+            .flatten()
+            .min();
+        let timeout = due.map(|due| {
+            rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
+                .unwrap_or(rustix::event::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                })
+        });
+        let (sig_ready, watch_ready, stdin_ready) = {
+            let (watch_slot, watch_events) = match watch.fd() {
+                Some(fd) => (fd, PollFlags::IN),
+                None => (signal_fd, PollFlags::empty()),
+            };
+            // Not while it may be a hangup: keys stay for whoever reads the
+            // terminal after the session.
+            let (stdin_slot, stdin_events) = match stdin {
+                Some(fd) if hung_up.is_none() => (fd, PollFlags::IN),
+                _ => (signal_fd, PollFlags::empty()),
+            };
+            let mut fds = [
+                PollFd::new(&signal_fd, PollFlags::IN),
+                PollFd::new(&watch_slot, watch_events),
+                PollFd::new(&stdin_slot, stdin_events),
+            ];
+            match poll(&mut fds, timeout.as_ref()) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(SessionError(format!("poll: {e}"))),
+            }
+            (
+                fds[0].revents(),
+                if watch_events.is_empty() {
+                    PollFlags::empty()
+                } else {
+                    fds[1].revents()
+                },
+                if stdin_events.is_empty() {
+                    PollFlags::empty()
+                } else {
+                    fds[2].revents()
+                },
+            )
+        };
+        look = watch_ready.contains(PollFlags::IN)
+            || watch.deadline().is_some_and(|d| Instant::now() >= d);
+
+        if sig_ready.contains(PollFlags::IN) {
+            let bits = signals.drain().map_err(|e| SessionError(e.to_string()))?;
+            match on_signals(bits, signals, live)? {
+                Signaled::Exit(exit) => return Ok(Waited::Exit(exit)),
+                Signaled::Resumed => continue,
+                Signaled::Nothing => {}
+            }
+        }
+        if let Some(k) = keys.as_mut().filter(|k| k.deadline().is_some()) {
+            let mut dropped = false;
+            k.on_deadline(Instant::now(), &mut |a| {
+                dropped |= matches!(a, KeyAction::Forward(_));
+            });
+            if dropped {
+                live.bell();
+            }
+        }
+        let (Some(fd), Some(k)) = (stdin, keys.as_mut()) else {
+            continue;
+        };
+        if !stdin_ready.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+            continue;
+        }
+        match rustix::io::read(fd, &mut buf) {
+            Ok(0) => return Ok(Waited::Exit(ExitReason::StdinClosed)),
+            Ok(n) => {
+                let mut rest = &buf[..n];
+                let mut dropped = false;
+                while !rest.is_empty() {
+                    let mut command = None;
+                    let used = k.feed(rest, Instant::now(), &mut |a| match a {
+                        KeyAction::Forward(_) => dropped = true,
+                        KeyAction::Command(c) => command = Some(c),
+                    });
+                    rest = &rest[used..];
+                    let Some(c) = command else {
+                        continue;
+                    };
+                    if std::mem::take(&mut dropped) {
+                        live.bell();
+                    }
+                    let mut io = CommandIo {
+                        stdin: fd,
+                        signals,
+                        typed: rest,
+                    };
+                    let outcome = live.command(c, &mut io)?;
+                    rest = io.typed;
+                    if let CommandOutcome::Exit(exit) = outcome {
+                        return Ok(Waited::Exit(exit));
+                    }
+                }
+                if dropped {
+                    live.bell();
+                }
+            }
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
+            Err(e) if gone(e) => return Ok(Waited::Exit(ExitReason::StdinClosed)),
+            Err(e) => return Err(SessionError(format!("read from terminal: {e}"))),
+        }
+    }
 }
 
 fn banner(

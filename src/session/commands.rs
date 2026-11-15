@@ -162,7 +162,8 @@ fn on_off(on: bool) -> &'static str {
 /// something does (`kill -CONT`).
 pub(super) struct Live<'a> {
     raw: Option<&'a RawMode>,
-    port: &'a Port,
+    /// None while the device is disconnected.
+    port: Option<&'a Port>,
     prefix: PrefixChoice,
     prefix_time: Duration,
     /// Help, status lines and prompts: stderr, like the other notices, so
@@ -177,22 +178,44 @@ pub(super) struct Live<'a> {
     /// Line wrap as xcomm last set it; terminals start with it on.
     wrap: bool,
     capture: Option<Capture>,
+    /// DTR and RTS as the user last set them; None where they did not.
+    lines: (Option<bool>, Option<bool>),
     /// The last prompt of this command ended on CR: an LF right after it is
     /// the rest of that Enter (a terminal sending CR LF), not an answer.
     cr_ended: bool,
 }
 
+/// What a [`Live`] hands to the next one when the device goes away or
+/// comes back.
+pub(super) struct Kept {
+    echo: bool,
+    wrap: bool,
+    capture: Option<Capture>,
+    lines: (Option<bool>, Option<bool>),
+}
+
+impl Kept {
+    pub(super) fn new(capture: Option<Capture>) -> Kept {
+        Kept {
+            echo: false,
+            wrap: true,
+            capture,
+            lines: (None, None),
+        }
+    }
+}
+
 impl<'a> Live<'a> {
     pub(super) fn new(
         raw: Option<&'a RawMode>,
-        port: &'a Port,
+        port: Option<&'a Port>,
         opts: &TermOpts,
         stdout: BorrowedFd<'a>,
         stderr: BorrowedFd<'a>,
         signals: &'a SignalPipe,
-        capture: Option<Capture>,
+        kept: Kept,
     ) -> Live<'a> {
-        let live = Live {
+        Live {
             raw,
             port,
             prefix: opts.prefix,
@@ -205,15 +228,21 @@ impl<'a> Live<'a> {
             },
             screen: rustix::termios::isatty(stdout).then_some(stdout),
             signals,
-            echo: false,
-            wrap: true,
-            capture,
+            echo: kept.echo,
+            wrap: kept.wrap,
+            capture: kept.capture,
+            lines: kept.lines,
             cr_ended: false,
-        };
-        if opts.wrap {
-            live.set_wrap(true);
         }
-        live
+    }
+
+    pub(super) fn into_kept(self) -> Kept {
+        Kept {
+            echo: self.echo,
+            wrap: self.wrap,
+            capture: self.capture,
+            lines: self.lines,
+        }
     }
 
     /// Writes out the capture, and puts back what commands changed on the
@@ -231,7 +260,7 @@ impl<'a> Live<'a> {
     }
 
     /// Writes out what the capture holds; an error stops it.
-    fn flush_capture(&mut self) {
+    pub(super) fn flush_capture(&mut self) {
         if let Some(Err(e)) = self.capture.as_mut().map(|c| c.flush()) {
             self.capture_failed(e);
         }
@@ -319,14 +348,14 @@ impl<'a> Live<'a> {
         self.write_to(self.ui, bytes);
     }
 
-    fn set_wrap(&self, on: bool) {
+    pub(super) fn set_wrap(&self, on: bool) {
         if let Some(fd) = self.screen {
             self.write_to(fd, if on { WRAP_ON } else { WRAP_OFF });
         }
     }
 
     /// A status line, on a line of its own after whatever the device sent.
-    fn say(&self, msg: &str) {
+    pub(super) fn say(&self, msg: &str) {
         self.write(format!("{}\r\nxcomm: {msg}\r\n", self.ui_cancel).as_bytes());
     }
 
@@ -346,8 +375,13 @@ impl<'a> Live<'a> {
         self.write(s.as_bytes());
     }
 
-    fn hang_up(&self, io: &CommandIo<'_>) {
-        match self.port.modem_lines() {
+    /// Keys that cannot reach the device: one bell.
+    pub(super) fn bell(&self) {
+        self.write(format!("{}\x07", self.ui_cancel).as_bytes());
+    }
+
+    fn hang_up(&mut self, port: &Port, io: &CommandIo<'_>) {
+        match port.modem_lines() {
             Ok(m) if !m.dtr => {
                 self.say("hang up: DTR is off already");
                 return;
@@ -358,7 +392,7 @@ impl<'a> Live<'a> {
                 return;
             }
         }
-        if let Err(e) = self.port.set_dtr(false) {
+        if let Err(e) = port.set_dtr(false) {
             self.say(&format!("hang up: {e}"));
             return;
         }
@@ -368,40 +402,79 @@ impl<'a> Live<'a> {
         let wait = rustix::event::Timespec::try_from(HANGUP).expect("500 ms fits");
         let started = Instant::now();
         let cut_short = !matches!(poll(&mut fds, Some(&wait)), Ok(0));
-        match self.port.set_dtr(true) {
+        match port.set_dtr(true) {
             Ok(()) if cut_short => self.say(&format!(
                 "hang up cut short by a signal: DTR dropped for {} ms",
                 started.elapsed().as_millis()
             )),
             Ok(()) => self.say("hung up (DTR dropped for 500 ms)"),
-            Err(e) => self.say(&format!("hang up: DTR is left off: {e}")),
+            Err(e) => {
+                self.lines.0 = Some(false);
+                self.say(&format!("hang up: DTR is left off: {e}"));
+            }
         }
     }
 
     /// Flips a modem line and reports what the driver reads back.
+    /// The line's state after, when the driver could be asked.
     fn toggle(
         &self,
+        port: &Port,
         name: &str,
         get: fn(&ModemLines) -> bool,
         set: fn(&Port, bool) -> io::Result<()>,
-    ) {
-        let result = self.port.modem_lines().and_then(|m| {
+    ) -> Option<bool> {
+        let result = port.modem_lines().and_then(|m| {
             let want = !get(&m);
-            set(self.port, want)?;
-            Ok((want, get(&self.port.modem_lines()?)))
+            set(port, want)?;
+            Ok((want, get(&port.modem_lines()?)))
         });
         match result {
-            Ok((want, now)) if want == now => self.say(&format!("{name} {}", on_off(now))),
-            Ok((_, now)) => self.say(&format!(
-                "{name} is still {}: the driver did not change it",
-                on_off(now)
-            )),
-            Err(e) => self.say(&format!("{name}: {e}")),
+            Ok((want, now)) if want == now => {
+                self.say(&format!("{name} {}", on_off(now)));
+                Some(now)
+            }
+            Ok((_, now)) => {
+                self.say(&format!(
+                    "{name} is still {}: the driver did not change it",
+                    on_off(now)
+                ));
+                Some(now)
+            }
+            Err(e) => {
+                self.say(&format!("{name}: {e}"));
+                None
+            }
         }
     }
 
-    fn change_baud(&mut self, io: &mut CommandIo<'_>) -> Result<CommandOutcome, SessionError> {
-        let current = self.port.settings();
+    /// Sets DTR and RTS on a port opened again as the user last set them.
+    pub(super) fn restore_lines(&self, port: &Port) -> Vec<String> {
+        let mut notes = Vec::new();
+        for (state, name, set) in [
+            (
+                self.lines.0,
+                "DTR",
+                Port::set_dtr as fn(&Port, bool) -> io::Result<()>,
+            ),
+            (self.lines.1, "RTS", Port::set_rts),
+        ] {
+            if let Some(on) = state {
+                match set(port, on) {
+                    Ok(()) => notes.push(format!("{name} {}, as it was", on_off(on))),
+                    Err(e) => notes.push(format!("{name}: {e}")),
+                }
+            }
+        }
+        notes
+    }
+
+    fn change_baud(
+        &mut self,
+        port: &Port,
+        io: &mut CommandIo<'_>,
+    ) -> Result<CommandOutcome, SessionError> {
+        let current = port.settings();
         let line = match self.prompt(&format!("baud [{}]: ", current.baud), BAUD_MAX, false, io)? {
             Prompt::Line(line) => String::from_utf8_lossy(&line).into_owned(),
             Prompt::Cancelled => return Ok(CommandOutcome::Continue),
@@ -419,7 +492,7 @@ impl<'a> Live<'a> {
             return Ok(CommandOutcome::Continue);
         };
         let wanted = LineSettings { baud, ..current };
-        match self.port.configure(&wanted) {
+        match port.configure(&wanted) {
             Ok(Applied::Exact) => self.say_after_prompt(&port::describe(&wanted)),
             Ok(Applied::Different(actual)) => self.say_after_prompt(&format!(
                 "requested {}; the driver applied {}",
@@ -437,6 +510,7 @@ impl<'a> Live<'a> {
     /// Ctrl-C, which abort the transfer.
     fn transfer(
         &mut self,
+        port: &Port,
         dir: Direction,
         io: &mut CommandIo<'_>,
     ) -> Result<CommandOutcome, SessionError> {
@@ -478,7 +552,7 @@ impl<'a> Live<'a> {
         }
         // Before the program starts: its first line comes at once.
         self.process_output(true);
-        let mut transfer = match Transfer::start(self.port, proto, dir, &files, Path::new(".")) {
+        let mut transfer = match Transfer::start(port, proto, dir, &files, Path::new(".")) {
             Ok(t) => t,
             Err(e) => {
                 self.process_output(false);
@@ -503,8 +577,8 @@ impl<'a> Live<'a> {
         self.process_output(false);
         // lrzsz switches the port's modes while it runs; one killed cannot
         // put them back. Before the result, which means it is all over.
-        let settings = self.port.settings();
-        if let Err(e) = self.port.configure(&settings) {
+        let settings = port.settings();
+        if let Err(e) = port.configure(&settings) {
             self.say(&format!("after the transfer: {e}"));
         }
         match ended? {
@@ -914,8 +988,8 @@ impl Control for Live<'_> {
         if key == ESC {
             return Ok(CommandOutcome::Continue);
         }
-        let Some(&(_, cmd, _)) = COMMANDS.iter().find(|(k, ..)| *k == key) else {
-            self.write(format!("{}\x07", self.ui_cancel).as_bytes());
+        let Some(&(_, cmd, what)) = COMMANDS.iter().find(|(k, ..)| *k == key) else {
+            self.bell();
             return Ok(CommandOutcome::Continue);
         };
         // A command can take a while (a prompt, a break): what was captured
@@ -924,32 +998,41 @@ impl Control for Live<'_> {
         if !matches!(cmd, Cmd::Capture) {
             self.flush_capture();
         }
-        match cmd {
-            Cmd::Help => self.help(),
-            Cmd::Quit => return Ok(CommandOutcome::Exit(ExitReason::Quit)),
-            Cmd::Break => match self.port.send_break(BREAK_MS) {
-                Ok(()) => self.say("break sent"),
-                Err(e) => self.say(&e.to_string()),
-            },
-            Cmd::HangUp => self.hang_up(io),
-            Cmd::Dtr => self.toggle("DTR", |m| m.dtr, Port::set_dtr),
-            Cmd::Rts => self.toggle("RTS", |m| m.rts, Port::set_rts),
-            Cmd::Baud => return self.change_baud(io),
-            Cmd::Echo => {
+        match (cmd, self.port) {
+            (Cmd::Help, _) => self.help(),
+            (Cmd::Quit, _) => return Ok(CommandOutcome::Exit(ExitReason::Quit)),
+            (Cmd::Echo, _) => {
                 self.echo = !self.echo;
                 self.say(&format!("local echo {}", on_off(self.echo)));
             }
-            Cmd::Capture => return self.toggle_capture(io),
-            Cmd::Send => return self.transfer(Direction::Send, io),
-            Cmd::Receive => return self.transfer(Direction::Receive, io),
-            Cmd::Wrap if self.screen.is_none() => {
+            (Cmd::Capture, _) => return self.toggle_capture(io),
+            (Cmd::Wrap, _) if self.screen.is_none() => {
                 self.say("line wrap: the output is not a terminal");
             }
-            Cmd::Wrap => {
+            (Cmd::Wrap, _) => {
                 self.wrap = !self.wrap;
                 self.set_wrap(self.wrap);
                 self.say(&format!("line wrap {}", on_off(self.wrap)));
             }
+            (_, None) => self.say(&format!("{what}: the device is disconnected")),
+            (Cmd::Break, Some(port)) => match port.send_break(BREAK_MS) {
+                Ok(()) => self.say("break sent"),
+                Err(e) => self.say(&e.to_string()),
+            },
+            (Cmd::HangUp, Some(port)) => self.hang_up(port, io),
+            (Cmd::Dtr, Some(port)) => {
+                if let Some(on) = self.toggle(port, "DTR", |m| m.dtr, Port::set_dtr) {
+                    self.lines.0 = Some(on);
+                }
+            }
+            (Cmd::Rts, Some(port)) => {
+                if let Some(on) = self.toggle(port, "RTS", |m| m.rts, Port::set_rts) {
+                    self.lines.1 = Some(on);
+                }
+            }
+            (Cmd::Baud, Some(port)) => return self.change_baud(port, io),
+            (Cmd::Send, Some(port)) => return self.transfer(port, Direction::Send, io),
+            (Cmd::Receive, Some(port)) => return self.transfer(port, Direction::Receive, io),
         }
         Ok(CommandOutcome::Continue)
     }
