@@ -551,3 +551,33 @@ fn help_is_an_option_like_the_others() {
         Ok(Command::Help(..))
     ));
 }
+
+#[test]
+fn ring_size_takes_bytes_with_a_unit() {
+    assert_eq!(term(&["x"], &[]).ring_size, 1 << 20);
+    for (v, n) in [
+        ("4096", 4096),
+        ("4k", 4096),
+        ("64K", 64 << 10),
+        ("2m", 2 << 20),
+        ("1G", 1 << 30),
+    ] {
+        assert_eq!(term(&["--ring-size", v, "x"], &[]).ring_size, n, "{v}");
+    }
+    for v in [
+        "",
+        "4095",
+        "2g",
+        "1.5m",
+        "-1",
+        "k",
+        "4 k",
+        "4kb",
+        "99999999999999999999",
+    ] {
+        let e = err(&["--ring-size", v, "x"], &[]);
+        assert!(e.contains("--ring-size"), "{v}: {e}");
+    }
+    let e = err(&["--ring-size", "4k", "--ring-size", "8k", "x"], &[]);
+    assert!(e.contains("more than once"), "{e}");
+}

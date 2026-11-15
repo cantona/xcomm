@@ -243,7 +243,14 @@ pub struct TermOpts {
     pub color: ColorMode,
     /// `-C`: capture device output to this file from the start.
     pub capture: Option<PathBuf>,
+    /// `--ring-size`: how much device output is kept, in bytes.
+    pub ring_size: usize,
 }
+
+/// `--ring-size` when not given.
+pub const DEFAULT_RING_SIZE: usize = 1 << 20;
+const RING_MIN: u64 = 4 << 10;
+const RING_MAX: u64 = 1 << 30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -302,6 +309,9 @@ Display:
   -c on|off                  the same as --color always|never
   -w                         turn line wrap on
   -C <file>                  append device output to <file>
+  --ring-size <bytes>        device output kept in memory for the control
+                             socket (4k to 1g, default 1m; k, m and g are
+                             KiB, MiB and GiB)
 
 Keys:
   --prefix <key>             the command prefix: ctrl-<letter> (not h, i,
@@ -395,6 +405,29 @@ fn parse_baud(value: &str) -> Result<u32, CliError> {
     }
 }
 
+/// Bytes, with an optional k, m or g (KiB, MiB, GiB).
+fn parse_ring_size(value: &str) -> Result<usize, CliError> {
+    let (number, unit) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1u64 << 10),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1 << 20),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1 << 30),
+        _ => (value, 1),
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .filter(|_| digits(number))
+        .and_then(|n| n.checked_mul(unit))
+        .filter(|n| (RING_MIN..=RING_MAX).contains(n))
+        .map(|n| n as usize)
+        .ok_or_else(|| {
+            CliError(format!(
+                "invalid value '{value}' for --ring-size: expected 4k to 1g (bytes, \
+                 with an optional k, m or g)"
+            ))
+        })
+}
+
 fn parse_prefix_time(value: &str) -> Result<Duration, CliError> {
     match value
         .parse::<u64>()
@@ -432,6 +465,7 @@ pub fn parse(
     let mut wrap = false;
     let mut color: Option<ColorMode> = None;
     let mut capture: Option<PathBuf> = None;
+    let mut ring_size: Option<usize> = None;
     let mut show_prefix = false;
     let mut version = false;
     let mut help = false;
@@ -517,6 +551,11 @@ pub fn parse(
             Short('o') => no_init = true,
             Long("no-lock") => no_lock = true,
             Long("low-latency") => low_latency = true,
+            Long("ring-size") => set_once(
+                &mut ring_size,
+                parse_ring_size(&text(p.value()?, "--ring-size")?)?,
+                "--ring-size",
+            )?,
             Short('w') => wrap = true,
             Short('C') => {
                 let v = p.value()?;
@@ -629,5 +668,6 @@ pub fn parse(
         wrap,
         color: color.unwrap_or(ColorMode::Auto),
         capture,
+        ring_size: ring_size.unwrap_or(DEFAULT_RING_SIZE),
     }))
 }

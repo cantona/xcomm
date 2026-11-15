@@ -440,3 +440,100 @@ fn a_sigtstp_after_the_continue_stops_again() {
     assert_eq!(reason, ExitReason::Signal(libc::SIGTERM));
     assert_eq!((ctl.stops, ctl.resumes), (2, 2));
 }
+
+/// Keeps device output in a ring and stops once `want` bytes are in.
+struct Ringed {
+    ring: xcomm::ring::Ring,
+    want: u64,
+    started: Instant,
+}
+
+impl Control for Ringed {
+    fn stop(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn tick(&mut self) -> ControlFlow<()> {
+        if self.ring.end() >= self.want || self.started.elapsed() > Duration::from_secs(5) {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+    fn ring(&mut self) -> Option<&mut xcomm::ring::Ring> {
+        Some(&mut self.ring)
+    }
+}
+
+#[test]
+fn the_ring_gets_device_bytes_as_read_whatever_is_shown() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
+    let dev = support::pty();
+    let device = raw_device(&dev);
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    let sent = b"\x1b[31mred\x1b[0m plain";
+    support::write_all(dev.master.as_fd(), sent);
+    let mut ctl = Ringed {
+        ring: xcomm::ring::Ring::new(4096),
+        want: sent.len() as u64,
+        started: Instant::now(),
+    };
+    let reason = pump(
+        &Pump {
+            stdin: None,
+            stdout: out_w.as_fd(),
+            device: device.as_fd(),
+            signals: &signals,
+            prefix: None,
+            strip_color: true,
+        },
+        &mut ctl,
+    )
+    .unwrap();
+    assert_eq!(reason, ExitReason::Requested);
+    let mut kept = Vec::new();
+    assert_eq!(
+        ctl.ring.read(0, usize::MAX, &mut kept),
+        Ok(sent.len() as u64)
+    );
+    assert_eq!(kept, sent);
+    drop(out_w);
+    let mut shown = Vec::new();
+    std::io::Read::read_to_end(&mut &out_r, &mut shown).unwrap();
+    // A sequence of colors only is dropped whole.
+    assert_eq!(shown, b"red\x1b[0m plain");
+}
+
+#[test]
+fn the_ring_gets_bytes_whose_terminal_write_ended_the_session() {
+    // The pipe's reader has left: the write ends the session (EPIPE), and
+    // the bytes read still count, as the capture has them.
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
+    let dev = support::pty();
+    let device = raw_device(&dev);
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    drop(out_r);
+    let sent = b"read but never shown";
+    support::write_all(dev.master.as_fd(), sent);
+    let mut ctl = Ringed {
+        ring: xcomm::ring::Ring::new(4096),
+        want: u64::MAX,
+        started: Instant::now(),
+    };
+    let reason = pump(
+        &Pump {
+            stdin: None,
+            stdout: out_w.as_fd(),
+            device: device.as_fd(),
+            signals: &signals,
+            prefix: None,
+            strip_color: false,
+        },
+        &mut ctl,
+    )
+    .unwrap();
+    assert_eq!(reason, ExitReason::TerminalGone);
+    let mut kept = Vec::new();
+    ctl.ring.read(0, usize::MAX, &mut kept).unwrap();
+    assert_eq!(kept, sent);
+}

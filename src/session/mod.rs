@@ -104,6 +104,10 @@ pub trait Control {
     }
     /// A capture write failed: stop capturing, and say so.
     fn capture_failed(&mut self, _error: io::Error) {}
+    /// The ring device output is kept in, by offset.
+    fn ring(&mut self) -> Option<&mut crate::ring::Ring> {
+        None
+    }
 }
 
 /// The file descriptors the loop moves bytes between.
@@ -554,7 +558,13 @@ fn pump_with(
                             &filtered
                         }
                     };
-                    match write_out(p.stdout, shown, p, ctl)? {
+                    let shown = write_out(p.stdout, shown, p, ctl);
+                    // After the terminal has them, whatever the write did,
+                    // as the capture has them: raw, as read.
+                    if let Some(ring) = ctl.ring() {
+                        ring.push(&buf[..n]);
+                    }
+                    match shown? {
                         Signaled::Exit(exit) => return Ok(exit),
                         Signaled::Resumed => continue,
                         Signaled::Nothing => {}
@@ -786,6 +796,9 @@ struct Held {
 /// Runs an interactive session on the process's own stdin and stdout.
 pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<ExitReason, Failure> {
     let path = device_path(&opts.device);
+    // First: nothing to undo yet if the memory cannot be had.
+    let ring = crate::ring::Ring::try_new(opts.ring_size)
+        .map_err(|e| Failure::Other(format!("--ring-size {}: {e}", opts.ring_size)))?;
     // Before the lock: a SIGINT or SIGHUP while taking it must not kill the
     // process with lock files half made.
     let signals =
@@ -879,7 +892,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         rustix::termios::isatty(stdout.as_fd()),
         env,
     );
-    let mut kept = commands::Kept::new(capture);
+    let mut kept = commands::Kept::new(capture, ring);
     let mut port_tty = port.tty_name().to_string();
     // Taken at the open: a descriptor revoked by a hangup cannot be asked
     // (macOS fstat fails on it).

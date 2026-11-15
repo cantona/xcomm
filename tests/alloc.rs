@@ -41,6 +41,7 @@ struct Count {
     end: u64,
     echo: bool,
     capture: Option<Capture>,
+    ring: xcomm::ring::Ring,
 }
 
 impl Control for Count {
@@ -66,6 +67,9 @@ impl Control for Count {
     }
     fn capture_failed(&mut self, e: std::io::Error) {
         panic!("capture failed: {e}");
+    }
+    fn ring(&mut self) -> Option<&mut xcomm::ring::Ring> {
+        Some(&mut self.ring)
     }
 }
 
@@ -157,6 +161,8 @@ fn run(
         end: 0,
         echo,
         capture: colored.map(|_| Capture::start(std::path::Path::new("/dev/null")).unwrap()),
+        // Small, so it wraps many times while counted.
+        ring: xcomm::ring::Ring::new(4093),
     };
     let reason = {
         let p = Pump {
@@ -172,6 +178,7 @@ fn run(
     assert_eq!(reason, ExitReason::Requested);
     let warm = count.warm.unwrap();
     assert_eq!(count.end - warm, 0, "allocations in steady state");
+    assert!(count.ring.end() > 4093, "the ring did not wrap");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(out_w);
     drop(in_r);

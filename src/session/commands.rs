@@ -15,6 +15,7 @@ use crate::cli::{LineSettings, PrefixChoice, TermOpts};
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{self, EscKey, HELD_MAX, KeyAction, KeyParser};
 use crate::port::{self, Applied, ModemLines, Port};
+use crate::ring::Ring;
 use crate::xfer::{Direction, Proto, Transfer, XferError};
 
 const ESC: u8 = 0x1b;
@@ -178,6 +179,8 @@ pub(super) struct Live<'a> {
     /// Line wrap as xcomm last set it; terminals start with it on.
     wrap: bool,
     capture: Option<Capture>,
+    /// Device output by offset; it outlives a disconnect, so offsets go on.
+    ring: Ring,
     /// DTR and RTS as the user last set them; None where they did not.
     lines: (Option<bool>, Option<bool>),
     /// The last prompt of this command ended on CR: an LF right after it is
@@ -191,15 +194,17 @@ pub(super) struct Kept {
     echo: bool,
     wrap: bool,
     capture: Option<Capture>,
+    ring: Ring,
     lines: (Option<bool>, Option<bool>),
 }
 
 impl Kept {
-    pub(super) fn new(capture: Option<Capture>) -> Kept {
+    pub(super) fn new(capture: Option<Capture>, ring: Ring) -> Kept {
         Kept {
             echo: false,
             wrap: true,
             capture,
+            ring,
             lines: (None, None),
         }
     }
@@ -231,6 +236,7 @@ impl<'a> Live<'a> {
             echo: kept.echo,
             wrap: kept.wrap,
             capture: kept.capture,
+            ring: kept.ring,
             lines: kept.lines,
             cr_ended: false,
         }
@@ -241,6 +247,7 @@ impl<'a> Live<'a> {
             echo: self.echo,
             wrap: self.wrap,
             capture: self.capture,
+            ring: self.ring,
             lines: self.lines,
         }
     }
@@ -1043,6 +1050,10 @@ impl Control for Live<'_> {
 
     fn capture(&mut self) -> Option<&mut Capture> {
         self.capture.as_mut()
+    }
+
+    fn ring(&mut self) -> Option<&mut Ring> {
+        Some(&mut self.ring)
     }
 
     fn capture_failed(&mut self, error: io::Error) {
