@@ -107,14 +107,36 @@ pub trait Control {
     /// Device bytes as read (after the terminal has them): the ring and
     /// the control socket's subscribers take them.
     fn device_output(&mut self, _bytes: &[u8]) {}
+    /// Whether queued bytes may be written to the device now: not into a
+    /// client's break, nor while its action waits for the driver to send
+    /// what came before it.
+    fn may_write(&self) -> bool {
+        true
+    }
+    /// Whether keys just typed may be written in the pass that read them,
+    /// rather than at the next POLLOUT: not while a client's break, pulse
+    /// or action is in hand, which orders itself against the queue when
+    /// the loop gets to it.
+    fn keys_go_at_once(&self) -> bool {
+        self.may_write()
+    }
     /// Appends the control socket's descriptors to poll, and returns when
     /// it wants a pass with no event.
     fn ctl_fds(&self, _out: &mut Vec<libc::pollfd>) -> Option<Instant> {
         None
     }
     /// Serves the control socket: `ready` is what `ctl_fds` appended,
-    /// after poll; `queue` takes bytes clients send to the device.
-    fn ctl_serve(&mut self, _ready: &[libc::pollfd], _queue: &mut OutQueue) {}
+    /// after poll; `queue` takes bytes clients send to the device. A
+    /// client's file transfer runs from here, reading `stdin` for the keys
+    /// that abort it, and may end the session.
+    fn ctl_serve(
+        &mut self,
+        _ready: &[libc::pollfd],
+        _queue: &mut OutQueue,
+        _stdin: Option<BorrowedFd<'_>>,
+    ) -> Result<CommandOutcome, SessionError> {
+        Ok(CommandOutcome::Continue)
+    }
 }
 
 /// Entries for poll(2) are kept raw: the loops add the control socket's
@@ -192,6 +214,8 @@ const HANGUP_TICK: Duration = Duration::from_millis(20);
 const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 const BUF_SIZE: usize = 64 * 1024;
+/// What the output queue holds for the device at most.
+pub const QUEUE_SIZE: usize = BUF_SIZE;
 
 const TERMINATE: [i32; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
@@ -491,7 +515,7 @@ fn pump_with(
             told_dropping = false;
         }
         let want_stdin = stdin_open && (!full || stalled);
-        let device_events = if queue.is_empty() {
+        let device_events = if queue.is_empty() || !ctl.may_write() {
             PollFlags::IN
         } else {
             PollFlags::IN | PollFlags::OUT
@@ -709,16 +733,24 @@ fn pump_with(
         // Keys go out now, not after another poll says the device can take
         // them: that pass is most of a keystroke's latency. Keyboard input
         // only; piped input waits for poll as before. A device that cannot
-        // take them says EAGAIN, and poll takes over.
+        // take them says EAGAIN, and poll takes over. With a client's action
+        // in hand they wait as before: it has to see them in the queue to
+        // keep its place before them.
         if keys.is_some()
             && stdin_ready.intersects(PollFlags::IN)
             && !queue.is_empty()
+            && ctl.keys_go_at_once()
             && let Some(exit) = write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
         {
             return Ok(exit);
         }
         // Last: what clients send queues behind the keys typed meanwhile.
-        ctl.ctl_serve(&polled[3..], &mut queue);
+        // Only a keyboard: piped input is the device's, not keys to read.
+        let keyboard = stdin_fd.filter(|_| stdin_open && keys.is_some());
+        match ctl.ctl_serve(&polled[3..], &mut queue, keyboard)? {
+            CommandOutcome::Continue => {}
+            CommandOutcome::Exit(exit) => return Ok(exit),
+        }
         // End of input (not the absence of input) ends the session once
         // everything read has reached the device (`cat file | xcomm dev` must not lose the tail). The
         // loop keeps writing meanwhile; a signal still ends it at any time.

@@ -10,10 +10,15 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, poll};
 
 use super::outq::OutQueue;
-use super::{CommandIo, CommandOutcome, Control, ExitReason, SessionError, Signaled, on_signals};
+use super::{
+    CommandIo, CommandOutcome, Control, ExitReason, STALL, SessionError, Signaled, on_signals,
+};
 use crate::capture::Capture;
 use crate::cli::{LineSettings, PrefixChoice, TermOpts};
-use crate::ctl::{self, proto, server::CtlServer};
+use crate::ctl::{
+    self, proto,
+    server::{Action, CtlServer},
+};
 use crate::hosttty::{RawMode, SignalPipe};
 use crate::keys::{self, EscKey, HELD_MAX, KeyAction, KeyParser};
 use crate::port::{self, Applied, ModemLines, Port};
@@ -155,6 +160,19 @@ fn has_ctrl_c(bytes: &[u8]) -> bool {
         })
 }
 
+/// Reads one modem line, and sets it.
+type LineGet = fn(&ModemLines) -> bool;
+type LineSet = fn(&Port, bool) -> io::Result<()>;
+
+/// Why the device cannot be acted on, for reply code `code`.
+fn why_not(code: u8) -> &'static str {
+    if code == ctl::code::BUSY {
+        "a file transfer has the port"
+    } else {
+        "the device is disconnected"
+    }
+}
+
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
@@ -188,6 +206,10 @@ pub(super) struct Live<'a> {
     names: Names,
     /// A file transfer has the port.
     transferring: bool,
+    /// A client's break or pulse under way.
+    hold: Option<Hold>,
+    /// A client's action waiting for what was queued before it.
+    action_wait: Option<ActionWait>,
     /// DTR and RTS as the user last set them; None where they did not.
     lines: (Option<bool>, Option<bool>),
     /// The last prompt of this command ended on CR: an LF right after it is
@@ -237,6 +259,77 @@ pub(super) struct Names {
     pub(super) herdr_pane: Option<String>,
 }
 
+/// A break or a pulse a client asked for: the session goes on meanwhile.
+struct Hold {
+    id: u64,
+    started: Instant,
+    until: Instant,
+    kind: HoldKind,
+}
+
+enum HoldKind {
+    Break,
+    /// The line is at the other state; `back` is the one to restore.
+    Pulse {
+        line: proto::ModemLine,
+        back: bool,
+    },
+}
+
+/// Keys are written in the pass that read them only with no client break,
+/// pulse or action in hand: one in hand orders itself against the queue
+/// (`line_ready`), and needs to see the keys there to keep its place.
+fn keys_go_at_once(hold: Option<&Hold>, action: Option<&ActionWait>) -> bool {
+    hold.is_none() && action.is_none()
+}
+
+/// An action waits for the bytes queued before it to go out, until the
+/// line has taken nothing for STALL (a line held off would otherwise keep
+/// the commands that free it from running). Bytes queued after it do not
+/// count.
+struct ActionWait {
+    /// The client whose action it is.
+    id: u64,
+    /// Since when nothing went out.
+    since: Instant,
+    phase: WaitPhase,
+}
+
+enum WaitPhase {
+    /// The queue still holds some: out once `written` reaches `until`.
+    Queue { until: u64, written: u64 },
+    /// The driver holds what is left; nothing more is written meanwhile,
+    /// and no event says when it is out. `pending` as last seen.
+    Driver { pending: usize },
+}
+
+/// How often the driver's queue is looked at while an action waits on it.
+const DRIVER_CHECK: Duration = Duration::from_millis(10);
+
+/// The getter and setter of a modem line.
+fn line_ops(line: proto::ModemLine) -> (LineGet, LineSet) {
+    match line {
+        proto::ModemLine::Dtr => (|m| m.dtr, Port::set_dtr),
+        proto::ModemLine::Rts => (|m| m.rts, Port::set_rts),
+    }
+}
+
+/// A transfer to run, and who asked for it.
+struct TransferRun<'r> {
+    proto: Proto,
+    dir: Direction,
+    files: &'r [PathBuf],
+    cwd: &'r Path,
+    /// The keyboard, read for the keys that abort it; None without one.
+    stdin: Option<BorrowedFd<'r>>,
+    /// Keys typed after the command key, not handled yet.
+    typed: &'r [u8],
+    /// The control client that asked for it.
+    requester: Option<u64>,
+    /// Started from a prompt (the line it said goes after it).
+    after_prompt: bool,
+}
+
 /// What the control socket sees of the session while it serves it.
 struct View<'v> {
     port: Option<&'v Port>,
@@ -250,34 +343,7 @@ struct View<'v> {
 
 impl ctl::server::Session for View<'_> {
     fn status(&self) -> proto::Status {
-        let settings = self.port.map(|p| {
-            let s = p.settings();
-            proto::SettingsView {
-                baud: s.baud,
-                data_bits: match s.data_bits {
-                    crate::cli::DataBits::Five => 5,
-                    crate::cli::DataBits::Six => 6,
-                    crate::cli::DataBits::Seven => 7,
-                    crate::cli::DataBits::Eight => 8,
-                },
-                parity: match s.parity {
-                    crate::cli::Parity::None => "none",
-                    crate::cli::Parity::Even => "even",
-                    crate::cli::Parity::Odd => "odd",
-                }
-                .into(),
-                stop_bits: match s.stop_bits {
-                    crate::cli::StopBits::One => 1,
-                    crate::cli::StopBits::Two => 2,
-                },
-                flow: match s.flow {
-                    crate::cli::Flow::None => "none",
-                    crate::cli::Flow::RtsCts => "rts",
-                    crate::cli::Flow::XonXoff => "xon",
-                }
-                .into(),
-            }
-        });
+        let settings = self.port.map(|p| proto::SettingsView::of(&p.settings()));
         let modem = self
             .port
             .and_then(|p| p.modem_lines().ok())
@@ -320,18 +386,24 @@ impl ctl::server::Session for View<'_> {
                 debug_assert!(queued, "bounded by the free space");
                 Ok(n)
             }
-            Err(code) if *code == ctl::code::BUSY => {
-                Err((*code, "a file transfer has the port".into()))
-            }
-            Err(code) => Err((*code, "the device is disconnected".into())),
+            Err(code) => Err((*code, why_not(*code).into())),
         }
     }
 }
 
 impl<'a> Live<'a> {
-    fn serve(&mut self, ready: &[libc::pollfd], queue: Result<&mut OutQueue, u8>) {
+    /// Serves the clients, then runs what they asked of the session: in
+    /// the session loop (`queue` given) once the bytes queued before it are
+    /// written; else (`queue` the code why not) only a capture, the rest
+    /// answered with that code.
+    fn serve(
+        &mut self,
+        ready: &[libc::pollfd],
+        mut queue: Result<&mut OutQueue, u8>,
+        stdin: Option<BorrowedFd<'_>>,
+    ) -> Result<CommandOutcome, SessionError> {
         let Some(server) = &mut self.server else {
-            return;
+            return Ok(CommandOutcome::Continue);
         };
         let mut view = View {
             port: self.port,
@@ -339,9 +411,364 @@ impl<'a> Live<'a> {
             capture: self.capture.as_ref(),
             names: &self.names,
             transferring: self.transferring,
-            queue,
+            queue: match &mut queue {
+                Ok(q) => Ok(&mut **q),
+                Err(code) => Err(*code),
+            },
         };
         server.serve(ready, &mut view);
+        if self
+            .hold
+            .as_ref()
+            .is_some_and(|h| Instant::now() >= h.until)
+        {
+            self.end_hold(None);
+        }
+        loop {
+            if self.hold.is_some() {
+                return Ok(CommandOutcome::Continue);
+            }
+            let Some((wait_id, action)) = self.server.as_mut().and_then(|s| s.pending_action())
+            else {
+                self.action_wait = None;
+                return Ok(CommandOutcome::Continue);
+            };
+            let on_line = !matches!(action, Action::CaptureStart(_) | Action::CaptureStop);
+            // A wait is the action's it began for, not another client's.
+            if self.action_wait.as_ref().is_some_and(|w| w.id != wait_id) {
+                self.action_wait = None;
+            }
+            if on_line
+                && let (Ok(q), Some(port)) = (&queue, self.port)
+                && !self.line_ready(wait_id, q, port)
+            {
+                return Ok(CommandOutcome::Continue);
+            }
+            self.action_wait = None;
+            let Some((id, action)) = self.server.as_mut().and_then(|s| s.next_action()) else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let result = match (action, &queue, self.port) {
+                (Action::CaptureStart(path), ..) => self.ctl_capture_start(&path),
+                (Action::CaptureStop, ..) => self.ctl_capture_stop(),
+                (_, Err(code), _) => Err((*code, why_not(*code).into())),
+                (_, Ok(_), None) => Err((
+                    ctl::code::DISCONNECTED,
+                    why_not(ctl::code::DISCONNECTED).into(),
+                )),
+                (Action::Break { ms }, Ok(_), Some(port)) => match port.set_break(true) {
+                    Ok(()) => {
+                        self.start_hold(id, ms, HoldKind::Break);
+                        continue;
+                    }
+                    Err(e) => Err((ctl::code::FAILED, e.to_string())),
+                },
+                (Action::Modem { line, op, ms }, Ok(_), Some(port)) => {
+                    match self.ctl_modem(port, line, op) {
+                        Ok(Some(back)) => {
+                            self.start_hold(id, ms, HoldKind::Pulse { line, back });
+                            continue;
+                        }
+                        Ok(None) => self.modem_reply(port, line),
+                        Err(e) => Err(e),
+                    }
+                }
+                (Action::Set(patch), Ok(_), Some(port)) => self.ctl_set(port, &patch),
+                (
+                    Action::Xfer {
+                        dir,
+                        proto,
+                        files,
+                        cwd,
+                    },
+                    Ok(_),
+                    Some(port),
+                ) => {
+                    self.flush_capture();
+                    let run = TransferRun {
+                        proto: match proto {
+                            proto::XferProto::Zmodem => Proto::Zmodem,
+                            proto::XferProto::Ymodem => Proto::Ymodem,
+                            proto::XferProto::Xmodem => Proto::Xmodem,
+                        },
+                        dir: match dir {
+                            proto::XferDir::Send => Direction::Send,
+                            proto::XferDir::Recv => Direction::Receive,
+                        },
+                        files: &files,
+                        cwd: &cwd,
+                        stdin,
+                        typed: &[],
+                        requester: Some(id),
+                        after_prompt: false,
+                    };
+                    match self.run_transfer(port, run)? {
+                        Ok((true, line)) => Ok(serde_json::json!({ "result": line })),
+                        Ok((false, line)) => Err((ctl::code::FAILED, line)),
+                        Err(exit) => {
+                            if let Some(s) = self.server.as_mut() {
+                                s.finish_action(
+                                    id,
+                                    Err((ctl::code::FAILED, "the session is ending".into())),
+                                );
+                            }
+                            return Ok(CommandOutcome::Exit(exit));
+                        }
+                    }
+                }
+            };
+            if let Some(s) = self.server.as_mut() {
+                s.finish_action(id, result);
+            }
+        }
+    }
+
+    fn ctl_capture_start(&mut self, path: &Path) -> Result<serde_json::Value, (u8, String)> {
+        if let Some(c) = &self.capture {
+            return Err((
+                ctl::code::FAILED,
+                format!("capturing to {} already", c.path().display()),
+            ));
+        }
+        match Capture::start(path) {
+            Ok(c) => {
+                self.say(&format!(
+                    "capturing to {} for a control client",
+                    path.display()
+                ));
+                self.capture = Some(c);
+                Ok(serde_json::json!({ "capture": path.display().to_string() }))
+            }
+            Err(e) => Err((ctl::code::FAILED, format!("capture: {e}"))),
+        }
+    }
+
+    fn ctl_capture_stop(&mut self) -> Result<serde_json::Value, (u8, String)> {
+        let Some(c) = self.capture.take() else {
+            return Err((ctl::code::FAILED, "no capture is running".into()));
+        };
+        let (path, total) = (c.path().display().to_string(), c.total());
+        match c.close() {
+            Ok(()) => {
+                self.say(&format!(
+                    "capture closed for a control client: {path} ({total} bytes)"
+                ));
+                Ok(serde_json::json!({ "path": path, "bytes": total }))
+            }
+            Err(e) => {
+                self.say(&format!("capture stopped: {path}: {e}"));
+                Err((ctl::code::FAILED, format!("capture {path}: {e}")))
+            }
+        }
+    }
+
+    /// Puts a modem line where `op` says. For a pulse, gives the state to
+    /// put back when the hold ends.
+    fn ctl_modem(
+        &mut self,
+        port: &Port,
+        line: proto::ModemLine,
+        op: proto::ModemOp,
+    ) -> Result<Option<bool>, (u8, String)> {
+        let (get, set) = line_ops(line);
+        let name = line.name();
+        let failed = |e: io::Error| (ctl::code::FAILED, format!("{name}: {e}"));
+        let now = get(&port.modem_lines().map_err(failed)?);
+        let want = match op {
+            proto::ModemOp::On => true,
+            proto::ModemOp::Off => false,
+            proto::ModemOp::Toggle | proto::ModemOp::Pulse => !now,
+        };
+        set(port, want).map_err(failed)?;
+        let after = get(&port.modem_lines().map_err(failed)?);
+        if after != want {
+            return Err((
+                ctl::code::FAILED,
+                format!("{name} is {}: the driver did not change it", on_off(after)),
+            ));
+        }
+        if op == proto::ModemOp::Pulse {
+            return Ok(Some(now));
+        }
+        self.say(&format!("{name} {} for a control client", on_off(after)));
+        Ok(None)
+    }
+
+    /// The reply for a modem line now, recording it for a reconnect.
+    fn modem_reply(
+        &mut self,
+        port: &Port,
+        line: proto::ModemLine,
+    ) -> Result<serde_json::Value, (u8, String)> {
+        let (get, _) = line_ops(line);
+        let on = port
+            .modem_lines()
+            .map(|m| get(&m))
+            .map_err(|e| (ctl::code::FAILED, format!("{}: {e}", line.name())))?;
+        match line {
+            proto::ModemLine::Dtr => self.lines.0 = Some(on),
+            proto::ModemLine::Rts => self.lines.1 = Some(on),
+        }
+        Ok(serde_json::json!({ "line": line.name(), "on": on }))
+    }
+
+    /// Whether the bytes queued before a client's action are out: those in
+    /// the queue then are written, the driver has sent its buffer (writes
+    /// pause for that) and, with no flow control to hold it up, the
+    /// adapter its own (tcdrain). Or the line has taken nothing for STALL.
+    fn line_ready(&mut self, id: u64, queue: &OutQueue, port: &Port) -> bool {
+        let now = Instant::now();
+        let wait = self.action_wait.get_or_insert(ActionWait {
+            id,
+            since: now,
+            phase: WaitPhase::Queue {
+                until: queue.written() + queue.len() as u64,
+                written: queue.written(),
+            },
+        });
+        if let WaitPhase::Queue { until, written } = wait.phase {
+            if queue.written() < until {
+                if queue.written() > written {
+                    wait.since = now;
+                    wait.phase = WaitPhase::Queue {
+                        until,
+                        written: queue.written(),
+                    };
+                }
+                return now.duration_since(wait.since) >= STALL;
+            }
+            wait.since = now;
+            wait.phase = WaitPhase::Driver {
+                pending: usize::MAX,
+            };
+        }
+        let pending = port.output_pending().unwrap_or(0);
+        if pending == 0 {
+            if port.settings().flow == crate::cli::Flow::None {
+                // What the adapter holds: a few hundred bytes at most, at
+                // the line's rate. EINTR leaves it to the loop's signal.
+                let _ = rustix::termios::tcdrain(port.fd());
+            }
+            return true;
+        }
+        if let WaitPhase::Driver { pending: last } = &mut wait.phase {
+            if pending < *last {
+                wait.since = now;
+            }
+            *last = pending;
+        }
+        now.duration_since(wait.since) >= STALL
+    }
+
+    /// Lets a break or pulse a client started run to its end before a key
+    /// command takes the line (or opens a prompt, which serves no client).
+    /// A signal cuts the wait short; the reply then says how long it was.
+    fn finish_hold(&mut self) {
+        let Some(until) = self.hold.as_ref().map(|h| h.until) else {
+            return;
+        };
+        let left = until.saturating_duration_since(Instant::now());
+        if !left.is_zero() {
+            let signal_fd = self.signals.fd();
+            let mut fds = [PollFd::new(&signal_fd, PollFlags::IN)];
+            let wait = rustix::event::Timespec::try_from(left).expect("at most HOLD_MAX");
+            let _ = poll(&mut fds, Some(&wait));
+        }
+        self.end_hold(None);
+    }
+
+    fn start_hold(&mut self, id: u64, ms: u32, kind: HoldKind) {
+        let started = Instant::now();
+        self.hold = Some(Hold {
+            id,
+            started,
+            until: started + Duration::from_millis(ms.into()),
+            kind,
+        });
+    }
+
+    /// Ends the break or pulse under way and answers its client: with the
+    /// result, or with `cut` when the session or the device is going.
+    fn end_hold(&mut self, cut: Option<(u8, String)>) {
+        let Some(hold) = self.hold.take() else {
+            return;
+        };
+        // As held: a prompt or the session's stopping may have made it
+        // longer, a signal shorter.
+        let ms = u64::try_from(hold.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let result = match (self.port, hold.kind) {
+            (None, _) => Err((
+                ctl::code::DISCONNECTED,
+                why_not(ctl::code::DISCONNECTED).into(),
+            )),
+            (Some(port), HoldKind::Break) => match port.set_break(false) {
+                Ok(()) => {
+                    self.say(&format!("break sent ({ms} ms) for a control client"));
+                    Ok(serde_json::json!({ "ms": ms }))
+                }
+                Err(e) => {
+                    self.say(&e.to_string());
+                    Err((ctl::code::FAILED, e.to_string()))
+                }
+            },
+            (Some(port), HoldKind::Pulse { line, back }) => {
+                let (_, set) = line_ops(line);
+                let name = line.name();
+                match set(port, back) {
+                    Ok(()) => {
+                        self.say(&format!(
+                            "{name} pulsed {} for {ms} ms for a control client",
+                            on_off(!back)
+                        ));
+                        self.modem_reply(port, line)
+                    }
+                    Err(e) => {
+                        let msg = format!("{name} is left {}: {e}", on_off(!back));
+                        self.say(&msg);
+                        Err((ctl::code::FAILED, msg))
+                    }
+                }
+            }
+        };
+        let result = match cut {
+            Some(why) => Err(why),
+            None => result,
+        };
+        if let Some(s) = self.server.as_mut() {
+            s.finish_action(hold.id, result);
+        }
+    }
+
+    fn ctl_set(
+        &mut self,
+        port: &Port,
+        patch: &proto::SettingsPatch,
+    ) -> Result<serde_json::Value, (u8, String)> {
+        let wanted = patch
+            .apply(port.settings())
+            .map_err(|e| (ctl::code::USAGE, e))?;
+        let applied = match port.configure(&wanted) {
+            Ok(Applied::Exact) => wanted,
+            Ok(Applied::Different(actual)) => actual,
+            Err(e) => return Err((ctl::code::FAILED, e.to_string())),
+        };
+        let exact = applied == wanted;
+        if exact {
+            self.say(&format!(
+                "{} for a control client",
+                port::describe(&applied)
+            ));
+        } else {
+            self.say(&format!(
+                "requested {} for a control client; the driver applied {}",
+                port::describe(&wanted),
+                port::describe(&applied)
+            ));
+        }
+        Ok(serde_json::json!({
+            "settings": proto::SettingsView::of(&applied),
+            "exact": exact,
+        }))
     }
 
     /// The device came back as `tty`: the socket follows its name.
@@ -355,7 +782,8 @@ impl<'a> Live<'a> {
     /// Serves the control socket while nothing can go to the device:
     /// `why` is the code a send gets.
     pub(super) fn serve_ctl(&mut self, ready: &[libc::pollfd], why: u8) {
-        self.serve(ready, Err(why));
+        // With no queue no transfer runs, the one thing that can end it.
+        let _ = self.serve(ready, Err(why), None);
     }
 
     pub(super) fn new(
@@ -388,11 +816,17 @@ impl<'a> Live<'a> {
             names: kept.names,
             transferring: false,
             lines: kept.lines,
+            hold: None,
+            action_wait: None,
             cr_ended: false,
         }
     }
 
-    pub(super) fn into_kept(self) -> Kept {
+    pub(super) fn into_kept(mut self) -> Kept {
+        self.end_hold(Some((
+            ctl::code::DISCONNECTED,
+            "the device went away during it".into(),
+        )));
         Kept {
             echo: self.echo,
             wrap: self.wrap,
@@ -407,6 +841,7 @@ impl<'a> Live<'a> {
     /// Writes out the capture, and puts back what commands changed on the
     /// terminal.
     pub(super) fn finish(&mut self) {
+        self.end_hold(Some((ctl::code::FAILED, "the session is ending".into())));
         if let Some(c) = self.capture.take() {
             let path = c.path().to_path_buf();
             if let Err(e) = c.close() {
@@ -521,6 +956,14 @@ impl<'a> Live<'a> {
     /// A status line after a prompt, which already ended its line.
     fn say_after_prompt(&self, msg: &str) {
         self.write(format!("xcomm: {msg}\r\n").as_bytes());
+    }
+
+    fn say_maybe_after_prompt(&self, after_prompt: bool, msg: &str) {
+        if after_prompt {
+            self.say_after_prompt(msg);
+        } else {
+            self.say(msg);
+        }
     }
 
     fn help(&self) {
@@ -709,14 +1152,40 @@ impl<'a> Live<'a> {
                 Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
             }
         }
+        let typed = std::mem::take(&mut io.typed);
+        let run = TransferRun {
+            proto,
+            dir,
+            files: &files,
+            cwd: Path::new("."),
+            stdin: Some(io.stdin),
+            typed,
+            requester: None,
+            after_prompt: true,
+        };
+        match self.run_transfer(port, run)? {
+            Ok(_) => Ok(CommandOutcome::Continue),
+            Err(exit) => Ok(CommandOutcome::Exit(exit)),
+        }
+    }
+
+    /// Runs lrzsz on the port until it ends, as the session's command or
+    /// for a client. Gives whether it succeeded and the line saying how it
+    /// went (said on the terminal too), or why the session ends.
+    fn run_transfer(
+        &mut self,
+        port: &Port,
+        run: TransferRun<'_>,
+    ) -> Result<Result<(bool, String), ExitReason>, SessionError> {
         // Before the program starts: its first line comes at once.
         self.process_output(true);
-        let mut transfer = match Transfer::start(port, proto, dir, &files, Path::new(".")) {
+        let mut transfer = match Transfer::start(port, run.proto, run.dir, run.files, run.cwd) {
             Ok(t) => t,
             Err(e) => {
                 self.process_output(false);
-                self.say_after_prompt(&format!("transfer failed: {e}"));
-                return Ok(CommandOutcome::Continue);
+                let line = format!("transfer failed: {e}");
+                self.say_maybe_after_prompt(run.after_prompt, &line);
+                return Ok(Ok((false, line)));
             }
         };
         let key = self.prefix.key.display();
@@ -728,9 +1197,17 @@ impl<'a> Live<'a> {
         } else {
             format!("{key} x or Ctrl-C aborts")
         };
-        self.say_after_prompt(&format!("transfer started: {} ({how})", transfer.program()));
+        let by = if run.requester.is_some() {
+            " for a control client"
+        } else {
+            ""
+        };
+        self.say_maybe_after_prompt(
+            run.after_prompt,
+            &format!("transfer started{by}: {} ({how})", transfer.program()),
+        );
         self.transferring = true;
-        let ended = self.wait_transfer(&mut transfer, io);
+        let ended = self.wait_transfer(&mut transfer, run.stdin, run.typed, run.requester);
         self.transferring = false;
         if let Err(e) = transfer.release() {
             self.say(&format!("after the transfer: port: {e}"));
@@ -742,13 +1219,11 @@ impl<'a> Live<'a> {
         if let Err(e) = port.configure(&settings) {
             self.say(&format!("after the transfer: {e}"));
         }
-        match ended? {
-            Ok(result) => {
-                self.say(&result);
-                Ok(CommandOutcome::Continue)
-            }
-            Err(exit) => Ok(CommandOutcome::Exit(exit)),
+        let ended = ended?;
+        if let Ok((_, line)) = &ended {
+            self.say(line);
         }
+        Ok(ended)
     }
 
     /// lrzsz ends its progress lines with LF only.
@@ -763,25 +1238,37 @@ impl<'a> Live<'a> {
     fn wait_transfer(
         &mut self,
         transfer: &mut Transfer<'_>,
-        io: &mut CommandIo<'_>,
-    ) -> Result<Result<String, ExitReason>, SessionError> {
+        stdin: Option<BorrowedFd<'_>>,
+        typed: &[u8],
+        requester: Option<u64>,
+    ) -> Result<Result<(bool, String), ExitReason>, SessionError> {
         let mut keys = KeyParser::new(self.prefix.key, self.prefix_time);
         // Keys typed after the command key are dropped too, unless they abort.
-        let mut typed = std::mem::take(&mut io.typed);
-        let mut stdin_open = true;
+        let mut typed = typed;
+        let mut stdin_open = stdin.is_some();
         let mut aborted: Option<Instant> = None;
-        let signal_fd = io.signals.fd();
+        let signals = self.signals;
+        let signal_fd = signals.fd();
         let mut buf = [0u8; 256];
         let mut polled: Vec<libc::pollfd> = Vec::with_capacity(super::POLL_ROOM);
         loop {
             match transfer.try_finish() {
                 // Done before the abort took effect: done.
-                Ok(Some(_)) => return Ok(Ok(format!("transfer done: {}", transfer.program()))),
-                Err(XferError::Failed { .. }) if aborted.is_some() => {
-                    return Ok(Ok("transfer aborted".into()));
+                Ok(Some(_)) => {
+                    return Ok(Ok((true, format!("transfer done: {}", transfer.program()))));
                 }
-                Err(e) => return Ok(Ok(format!("transfer failed: {e}"))),
+                Err(XferError::Failed { .. }) if aborted.is_some() => {
+                    return Ok(Ok((false, "transfer aborted".into())));
+                }
+                Err(e) => return Ok(Ok((false, format!("transfer failed: {e}")))),
                 Ok(None) => {}
+            }
+            // The client that asked for it closed its end: not wanted now.
+            if aborted.is_none()
+                && let Some(id) = requester
+                && self.server.as_ref().is_none_or(|s| s.abandoned(id))
+            {
+                aborted = start_abort(transfer);
             }
             if aborted.is_some_and(|t| t.elapsed() >= ABORT_GRACE) {
                 transfer.kill();
@@ -810,10 +1297,9 @@ impl<'a> Live<'a> {
             .into_iter()
             .flatten()
             .min();
-            let (stdin_slot, stdin_events) = if stdin_open {
-                (io.stdin, PollFlags::IN)
-            } else {
-                (signal_fd, PollFlags::empty())
+            let (stdin_slot, stdin_events) = match stdin {
+                Some(fd) if stdin_open => (fd, PollFlags::IN),
+                _ => (signal_fd, PollFlags::empty()),
             };
             polled.clear();
             polled.push(super::entry(signal_fd, PollFlags::IN));
@@ -836,11 +1322,8 @@ impl<'a> Live<'a> {
             });
             if super::revents(&polled[0]).contains(PollFlags::IN) {
                 // SIGCHLD only wakes the loop; try_finish looks.
-                let bits = io
-                    .signals
-                    .drain()
-                    .map_err(|e| SessionError(e.to_string()))?;
-                let signaled = on_signals(bits, io.signals, self)?;
+                let bits = signals.drain().map_err(|e| SessionError(e.to_string()))?;
+                let signaled = on_signals(bits, signals, self)?;
                 if let Signaled::Resumed = signaled {
                     // Raw mode came back as it was entered. Readiness seen
                     // before the stop is stale (the shell may have read the
@@ -861,11 +1344,11 @@ impl<'a> Live<'a> {
                     return Ok(Err(exit));
                 }
             }
-            if stdin_open
+            if let Some(fd) = stdin.filter(|_| stdin_open)
                 && super::revents(&polled[1])
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             {
-                match rustix::io::read(io.stdin, &mut buf) {
+                match rustix::io::read(fd, &mut buf) {
                     Ok(0) => stdin_open = false,
                     Ok(n) => {
                         let mut rest = &buf[..n];
@@ -1154,6 +1637,9 @@ impl Control for Live<'_> {
             self.bell();
             return Ok(CommandOutcome::Continue);
         };
+        // A client's break or pulse ends first: a prompt serves no client,
+        // and a key acting on the line would be undone at its end.
+        self.finish_hold();
         // A command can take a while (a prompt, a break): what was captured
         // goes to the file first. Stopping the capture does that itself, and
         // a failed flush here would turn that stop into a start.
@@ -1214,14 +1700,53 @@ impl Control for Live<'_> {
         }
     }
 
-    fn ctl_fds(&self, out: &mut Vec<libc::pollfd>) -> Option<Instant> {
-        self.server
-            .as_ref()
-            .and_then(|server| server.poll_fds(self.ring.end(), out))
+    fn may_write(&self) -> bool {
+        let breaking = matches!(
+            &self.hold,
+            Some(Hold {
+                kind: HoldKind::Break,
+                ..
+            })
+        );
+        let draining = matches!(
+            &self.action_wait,
+            Some(ActionWait {
+                phase: WaitPhase::Driver { .. },
+                ..
+            })
+        );
+        !breaking && !draining
     }
 
-    fn ctl_serve(&mut self, ready: &[libc::pollfd], queue: &mut OutQueue) {
-        self.serve(ready, Ok(queue));
+    fn keys_go_at_once(&self) -> bool {
+        keys_go_at_once(self.hold.as_ref(), self.action_wait.as_ref())
+    }
+
+    fn ctl_fds(&self, out: &mut Vec<libc::pollfd>) -> Option<Instant> {
+        let server_due = self
+            .server
+            .as_ref()
+            .and_then(|server| server.poll_fds(self.ring.end(), out));
+        let wait_due = self.action_wait.as_ref().map(|w| {
+            let stalled = w.since + STALL;
+            match w.phase {
+                WaitPhase::Queue { .. } => stalled,
+                WaitPhase::Driver { .. } => stalled.min(Instant::now() + DRIVER_CHECK),
+            }
+        });
+        [server_due, self.hold.as_ref().map(|h| h.until), wait_due]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn ctl_serve(
+        &mut self,
+        ready: &[libc::pollfd],
+        queue: &mut OutQueue,
+        stdin: Option<BorrowedFd<'_>>,
+    ) -> Result<CommandOutcome, SessionError> {
+        self.serve(ready, Ok(queue), stdin)
     }
 
     fn capture_failed(&mut self, error: io::Error) {
@@ -1236,5 +1761,42 @@ impl Control for Live<'_> {
             super::STALL.as_secs(),
             self.prefix.key.display()
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_wait_while_a_client_break_pulse_or_action_is_in_hand() {
+        let now = Instant::now();
+        let hold = |kind| Hold {
+            id: 1,
+            started: now,
+            until: now,
+            kind,
+        };
+        let wait = |phase| ActionWait {
+            id: 1,
+            since: now,
+            phase,
+        };
+        assert!(keys_go_at_once(None, None));
+        assert!(!keys_go_at_once(Some(&hold(HoldKind::Break)), None));
+        let pulse = hold(HoldKind::Pulse {
+            line: proto::ModemLine::Dtr,
+            back: true,
+        });
+        assert!(!keys_go_at_once(Some(&pulse), None));
+        // Still in the queue: may_write() is true here, and this is where
+        // a key written at once would pass the action.
+        let queued = wait(WaitPhase::Queue {
+            until: 10,
+            written: 4,
+        });
+        assert!(!keys_go_at_once(None, Some(&queued)));
+        let driver = wait(WaitPhase::Driver { pending: 3 });
+        assert!(!keys_go_at_once(None, Some(&driver)));
     }
 }

@@ -667,6 +667,91 @@ fn ctl_commands_parse() {
 }
 
 #[test]
+fn ctl_line_commands_parse() {
+    use xcomm::ctl::proto::{ModemLine, ModemOp, SettingsPatch, XferDir, XferProto};
+    assert_eq!(ctl(&["d", "break"]).cmd, CtlCmd::Break { ms: 250 });
+    assert_eq!(ctl(&["d", "break", "1000"]).cmd, CtlCmd::Break { ms: 1000 });
+    assert_eq!(
+        ctl(&["d", "dtr", "off"]).cmd,
+        CtlCmd::Modem {
+            line: ModemLine::Dtr,
+            op: ModemOp::Off,
+            ms: 500
+        }
+    );
+    assert_eq!(
+        ctl(&["d", "rts", "pulse", "50"]).cmd,
+        CtlCmd::Modem {
+            line: ModemLine::Rts,
+            op: ModemOp::Pulse,
+            ms: 50
+        }
+    );
+    assert_eq!(
+        ctl(&["d", "set", "baud=9600", "parity=odd", "flow=rts"]).cmd,
+        CtlCmd::Set {
+            patch: SettingsPatch {
+                baud: Some(9600),
+                parity: Some("odd".into()),
+                flow: Some("rts".into()),
+                ..SettingsPatch::default()
+            }
+        }
+    );
+    assert_eq!(
+        ctl(&["d", "capture", "start", "c.txt"]).cmd,
+        CtlCmd::CaptureStart("c.txt".into())
+    );
+    assert_eq!(ctl(&["d", "capture", "stop"]).cmd, CtlCmd::CaptureStop);
+    assert_eq!(
+        ctl(&["d", "xfer", "send", "ymodem", "a", "b"]).cmd,
+        CtlCmd::Xfer {
+            dir: XferDir::Send,
+            proto: XferProto::Ymodem,
+            files: vec!["a".into(), "b".into()]
+        }
+    );
+    assert_eq!(
+        ctl(&["d", "xfer", "recv", "zmodem"]).cmd,
+        CtlCmd::Xfer {
+            dir: XferDir::Recv,
+            proto: XferProto::Zmodem,
+            files: vec![]
+        }
+    );
+}
+
+#[test]
+fn ctl_line_command_errors() {
+    for (v, want) in [
+        (&["d", "break", "0"][..], "1 to 5000"),
+        (&["d", "break", "5001"], "1 to 5000"),
+        (&["d", "break", "1", "2"], "unexpected argument '2'"),
+        (&["d", "dtr"], "on, off, toggle or pulse"),
+        (&["d", "dtr", "up"], "expected one of"),
+        (&["d", "dtr", "on", "5"], "unexpected argument '5'"),
+        (&["d", "rts", "pulse", "x"], "pulse length"),
+        (&["d", "set"], "ctl set needs"),
+        (&["d", "set", "baud"], "not <name>=<value>"),
+        (&["d", "set", "baud=0"], "baud rate"),
+        (&["d", "set", "databits=9"], "databits="),
+        (&["d", "set", "baud=1", "baud=2"], "more than once"),
+        (&["d", "set", "speed=1"], "unknown setting"),
+        (&["d", "capture"], "start <file> or stop"),
+        (&["d", "capture", "start"], "needs a file"),
+        (&["d", "capture", "stop", "x"], "unexpected argument 'x'"),
+        (&["d", "xfer", "send"], "send|recv"),
+        (&["d", "xfer", "send", "zmodem"], "needs a file"),
+        (&["d", "xfer", "recv", "xmodem"], "one file name"),
+        (&["d", "xfer", "recv", "ymodem", "f"], "give none"),
+        (&["d", "xfer", "put", "zmodem", "f"], "expected one of"),
+    ] {
+        let e = ctl_err(v);
+        assert!(e.contains(want), "{v:?}: {e}");
+    }
+}
+
+#[test]
 fn ctl_usage_errors() {
     for (v, want) in [
         (&[][..], "usage: xcomm ctl"),

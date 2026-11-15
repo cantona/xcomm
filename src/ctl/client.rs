@@ -79,7 +79,7 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                 let wire = rate.map_or(Duration::ZERO, |(bits, per_sec)| {
                     Duration::from_secs_f64(2.0 * (chunk.len() as f64) * bits / per_sec)
                 });
-                conn.timeout = REPLY_TIMEOUT + wire;
+                conn.timeout = Some(REPLY_TIMEOUT + wire);
                 let reply = conn
                     .request(&Request::Send {
                         data_b64: proto::base64_encode(chunk),
@@ -134,8 +134,122 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                 eprintln!("next={}", reply["next"]);
             }
         }
+        CtlCmd::Break { ms } => {
+            conn.timeout = action_timeout(&mut conn, *ms)?;
+            let reply = conn.request(&Request::Break { ms: *ms })?;
+            if args.json {
+                print_json(&reply)?;
+            }
+        }
+        CtlCmd::Modem { line, op, ms } => {
+            let hold = if *op == proto::ModemOp::Pulse { *ms } else { 0 };
+            conn.timeout = action_timeout(&mut conn, hold)?;
+            let reply = conn.request(&Request::Modem {
+                line: *line,
+                op: *op,
+                ms: *ms,
+            })?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                let on = if reply["on"] == true { "on" } else { "off" };
+                print_out(format!("{} {on}\n", line.name()).as_bytes())?;
+            }
+        }
+        CtlCmd::Set { patch } => {
+            conn.timeout = action_timeout(&mut conn, 0)?;
+            let reply = conn.request(&Request::Set {
+                patch: patch.clone(),
+            })?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                if reply["exact"] != true {
+                    crate::out::report("the driver did not apply exactly what was asked");
+                }
+                print_out(format!("{}\n", settings_text(&reply["settings"])).as_bytes())?;
+            }
+        }
+        CtlCmd::CaptureStart(file) => {
+            let path = absolute(file)?;
+            conn.timeout = action_timeout(&mut conn, 0)?;
+            let reply = conn.request(&Request::CaptureStart {
+                path: path_text(&path)?,
+            })?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                print_out(format!("{}\n", path.display()).as_bytes())?;
+            }
+        }
+        CtlCmd::CaptureStop => {
+            conn.timeout = action_timeout(&mut conn, 0)?;
+            let reply = conn.request(&Request::CaptureStop)?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                print_out(
+                    format!(
+                        "{} ({} bytes)\n",
+                        reply["path"].as_str().unwrap_or("?"),
+                        reply["bytes"]
+                    )
+                    .as_bytes(),
+                )?;
+            }
+        }
+        CtlCmd::Xfer { dir, proto, files } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| (code::FAILED, format!("current directory: {e}")))?;
+            let files = files
+                .iter()
+                .map(|f| absolute(f).and_then(|p| path_text(&p)))
+                .collect::<Result<Vec<_>, _>>()?;
+            // As long as it takes; Ctrl-C here closes the connection, which
+            // aborts it.
+            conn.timeout = None;
+            let reply = conn.request(&Request::Xfer {
+                dir: *dir,
+                proto: *proto,
+                files,
+                cwd: path_text(&cwd)?,
+            })?;
+            if args.json {
+                print_json(&reply)?;
+            } else {
+                print_out(format!("{}\n", reply["result"].as_str().unwrap_or("done")).as_bytes())?;
+            }
+        }
     }
     Ok(code::OK)
+}
+
+/// How long an action's reply may take: it waits for what the session
+/// has queued for the device (its queue at the line's rate, twice for the
+/// driver's buffer and slack, or STALL if the line takes nothing), then
+/// holds the line for `hold_ms`.
+fn action_timeout(conn: &mut Conn, hold_ms: u32) -> Result<Option<Duration>, Failed> {
+    let queued = bits_per_second(&conn.request(&Request::Status)?).map_or(
+        Duration::ZERO,
+        |(bits, per_sec)| {
+            Duration::from_secs_f64(2.0 * crate::session::QUEUE_SIZE as f64 * bits / per_sec)
+        },
+    );
+    Ok(Some(
+        REPLY_TIMEOUT + queued + Duration::from_millis(hold_ms.into()),
+    ))
+}
+
+/// `file` from this client's directory: the session's is another.
+fn absolute(file: &Path) -> Result<std::path::PathBuf, Failed> {
+    std::path::absolute(file).map_err(|e| (code::FAILED, format!("{}: {e}", file.display())))
+}
+
+/// JSON carries text: a name that is not UTF-8 cannot be sent.
+fn path_text(path: &Path) -> Result<String, Failed> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| (code::USAGE, format!("{}: not valid UTF-8", path.display())))
 }
 
 /// Bits a character takes on the line, and the line's bits per second,
@@ -187,8 +301,8 @@ impl Dirs {
 struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
-    /// For the next reply.
-    timeout: Duration,
+    /// For the next reply; None waits as long as it takes.
+    timeout: Option<Duration>,
 }
 
 impl Conn {
@@ -212,7 +326,7 @@ impl Conn {
         for sock in &socks {
             match UnixStream::connect(sock) {
                 Ok(stream) => {
-                    return Conn::new(stream, REPLY_TIMEOUT)
+                    return Conn::new(stream, Some(REPLY_TIMEOUT))
                         .map_err(|e| (code::FAILED, e.to_string()));
                 }
                 // None there, or one a killed session left: look on.
@@ -232,7 +346,7 @@ impl Conn {
         Err(failed.unwrap_or_else(|| dirs.none(device)))
     }
 
-    fn new(stream: UnixStream, timeout: Duration) -> std::io::Result<Conn> {
+    fn new(stream: UnixStream, timeout: Option<Duration>) -> std::io::Result<Conn> {
         let writer = stream.try_clone()?;
         Ok(Conn {
             reader: BufReader::new(stream),
@@ -244,14 +358,21 @@ impl Conn {
     /// Sends `request` and returns the reply's fields; a failed reply is
     /// an error with its code.
     fn request(&mut self, request: &Request) -> Result<serde_json::Value, Failed> {
-        let mut line = serde_json::to_vec(request).expect("a request serializes");
+        // The session does not run it once this client has given up.
+        let envelope = proto::Envelope {
+            request: request.clone(),
+            deadline_ms: self.timeout.map(|t| {
+                proto::now_ms().saturating_add(u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+            }),
+        };
+        let mut line = serde_json::to_vec(&envelope).expect("a request serializes");
         line.push(b'\n');
         self.writer
             .write_all(&line)
             .map_err(|e| (code::FAILED, format!("sending to the session: {e}")))?;
         self.reader
             .get_ref()
-            .set_read_timeout(Some(self.timeout))
+            .set_read_timeout(self.timeout)
             .map_err(|e| (code::FAILED, e.to_string()))?;
         read_reply(&mut self.reader, self.timeout)
     }
@@ -288,11 +409,14 @@ fn socket_files(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
 /// there (gone, refusing, not answering).
 fn status_of(sock: &Path) -> Option<serde_json::Value> {
     let stream = UnixStream::connect(sock).ok()?;
-    let mut conn = Conn::new(stream, Duration::from_secs(2)).ok()?;
+    let mut conn = Conn::new(stream, Some(Duration::from_secs(2))).ok()?;
     conn.request(&Request::Status).ok()
 }
 
-fn read_reply(reader: &mut impl BufRead, timeout: Duration) -> Result<serde_json::Value, Failed> {
+fn read_reply(
+    reader: &mut impl BufRead,
+    timeout: Option<Duration>,
+) -> Result<serde_json::Value, Failed> {
     let mut line = Vec::new();
     match reader.read_until(b'\n', &mut line) {
         Ok(0) => {
@@ -310,7 +434,10 @@ fn read_reply(reader: &mut impl BufRead, timeout: Duration) -> Result<serde_json
         {
             return Err((
                 code::FAILED,
-                format!("no reply from the session in {} s", timeout.as_secs()),
+                format!(
+                    "no reply from the session in {} s",
+                    timeout.unwrap_or_default().as_secs()
+                ),
             ));
         }
         Err(e) => return Err((code::FAILED, format!("reading the reply: {e}"))),
@@ -345,17 +472,7 @@ fn print_status(v: &serde_json::Value) -> Result<(), Failed> {
         serde_json::Value::Null => "-".into(),
         other => other.to_string(),
     };
-    let settings = match &v["settings"] {
-        serde_json::Value::Object(s) => format!(
-            "{} {}{}{} flow {}",
-            s["baud"],
-            s["data_bits"],
-            s["parity"].as_str().map_or("?", |p| &p[..1]).to_uppercase(),
-            s["stop_bits"],
-            s["flow"].as_str().unwrap_or("?")
-        ),
-        _ => "-".into(),
-    };
+    let settings = settings_text(&v["settings"]);
     let modem = match &v["modem"] {
         serde_json::Value::Object(m) => ["dtr", "rts", "cts", "dsr", "dcd", "ri"]
             .iter()
@@ -381,6 +498,21 @@ fn print_status(v: &serde_json::Value) -> Result<(), Failed> {
         text("pid"),
     );
     print_out(out.as_bytes())
+}
+
+/// `115200 8N1 flow none`, or `-` for none.
+fn settings_text(s: &serde_json::Value) -> String {
+    match s {
+        serde_json::Value::Object(s) => format!(
+            "{} {}{}{} flow {}",
+            s["baud"],
+            s["data_bits"],
+            s["parity"].as_str().map_or("?", |p| &p[..1]).to_uppercase(),
+            s["stop_bits"],
+            s["flow"].as_str().unwrap_or("?")
+        ),
+        _ => "-".into(),
+    }
 }
 
 /// Every session that answers on a socket in `dirs`.

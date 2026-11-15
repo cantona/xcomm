@@ -628,6 +628,52 @@ impl Port {
         Ok(queued)
     }
 
+    /// Bytes written to the port that the driver has not sent yet (what
+    /// the adapter itself still holds is not counted).
+    pub fn output_pending(&self) -> io::Result<usize> {
+        Ok(self.output_queued()?.max(0) as usize)
+    }
+
+    /// Starts or ends a break, for a caller that times it without
+    /// blocking. Output flow control is off for the break, as in
+    /// [`send_break`](Self::send_break), and back on after it.
+    pub fn set_break(&self, on: bool) -> io::Result<()> {
+        let flow = self.settings.get().flow;
+        if on {
+            if flow != Flow::None {
+                let mut free = tcgetattr(&self.fd)?;
+                free.control_modes.remove(ControlModes::CRTSCTS);
+                free.input_modes.remove(InputModes::IXON);
+                self.write_termios(&mut free)?;
+            }
+            return ioctl_none(self.fd(), libc::TIOCSBRK as libc::c_ulong)
+                .map_err(|e| io::Error::new(e.kind(), format!("break not sent: {e}")));
+        }
+        let cleared = ioctl_none(self.fd(), libc::TIOCCBRK as libc::c_ulong);
+        let restored = if flow == Flow::None {
+            Ok(())
+        } else {
+            tcgetattr(&self.fd)
+                .map_err(io::Error::from)
+                .and_then(|mut t| {
+                    match flow {
+                        Flow::RtsCts => t.control_modes.insert(ControlModes::CRTSCTS),
+                        Flow::XonXoff => t.input_modes.insert(InputModes::IXON),
+                        Flow::None => {}
+                    }
+                    self.write_termios(&mut t)
+                })
+        };
+        match (cleared, restored) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), _) => Err(io::Error::new(e.kind(), format!("break not ended: {e}"))),
+            (Ok(()), Err(r)) => Err(io::Error::new(
+                r.kind(),
+                format!("flow control could not be restored: {r}"),
+            )),
+        }
+    }
+
     /// Asks the driver to deliver input without batching delay.
     #[cfg(target_os = "linux")]
     pub fn set_async_low_latency(&self) -> io::Result<LowLatency> {

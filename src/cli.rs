@@ -281,6 +281,24 @@ pub enum CtlCmd {
         from_oldest: bool,
         color: ColorMode,
     },
+    Break {
+        ms: u32,
+    },
+    Modem {
+        line: crate::ctl::proto::ModemLine,
+        op: crate::ctl::proto::ModemOp,
+        ms: u32,
+    },
+    Set {
+        patch: crate::ctl::proto::SettingsPatch,
+    },
+    CaptureStart(PathBuf),
+    CaptureStop,
+    Xfer {
+        dir: crate::ctl::proto::XferDir,
+        proto: crate::ctl::proto::XferProto,
+        files: Vec<PathBuf>,
+    },
 }
 
 /// `xcomm ctl [--json] <device> <command> ...` or `xcomm ctl sessions`.
@@ -373,6 +391,18 @@ Control socket (for scripts and agents, from another terminal):
                              --since <offset> or --last <bytes>,
                              --max-bytes <n>, --from-oldest; the next offset
                              goes to stderr as next=<offset>
+  xcomm ctl <device> break [ms]
+                             send a break (default 250 ms, at most 5000)
+  xcomm ctl <device> dtr|rts on|off|toggle|pulse [ms]
+                             set a modem line; pulse holds the other state
+                             for ms (default 500), then puts it back
+  xcomm ctl <device> set <name>=<value>...
+                             change line settings: baud, databits, parity,
+                             stopbits, flow (values as for the options)
+  xcomm ctl <device> capture start <file> | capture stop
+  xcomm ctl <device> xfer send|recv zmodem|ymodem|xmodem [<file>...]
+                             run lrzsz on the session's port; the reply comes
+                             when it ends, and Ctrl-C aborts it
   xcomm ctl sessions         the running sessions
   --json                     the reply as JSON
 
@@ -527,8 +557,8 @@ fn parse_hex(value: &str) -> Result<Vec<u8>, CliError> {
         .collect()
 }
 
-pub const CTL_USAGE: &str =
-    "usage: xcomm ctl [--json] <device> status|send|read ..., or xcomm ctl [--json] sessions";
+pub const CTL_USAGE: &str = "usage: xcomm ctl [--json] <device> \
+     status|send|read|break|dtr|rts|set|capture|xfer ..., or xcomm ctl [--json] sessions";
 
 fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     let mut p = lexopt::Parser::from_args(args.iter().cloned());
@@ -681,6 +711,103 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
                 color: color.unwrap_or(ColorMode::Auto),
             }
         }
+        "break" => {
+            extra(1)?;
+            let ms = match rest.first() {
+                Some(v) => parse_hold(v, "break")?,
+                None => crate::ctl::proto::BREAK_MS,
+            };
+            CtlCmd::Break { ms }
+        }
+        "dtr" | "rts" => {
+            use crate::ctl::proto::{ModemLine, ModemOp};
+            let line = if cmd == "dtr" {
+                ModemLine::Dtr
+            } else {
+                ModemLine::Rts
+            };
+            let Some(op) = rest.first() else {
+                return Err(CliError(format!(
+                    "ctl {cmd} needs on, off, toggle or pulse"
+                )));
+            };
+            let op = choose(
+                op,
+                &format!("ctl {cmd}"),
+                &[
+                    ("on", ModemOp::On),
+                    ("off", ModemOp::Off),
+                    ("toggle", ModemOp::Toggle),
+                    ("pulse", ModemOp::Pulse),
+                ],
+            )?;
+            let ms = match (op, rest.get(1)) {
+                (ModemOp::Pulse, Some(v)) => {
+                    extra(2)?;
+                    parse_hold(v, "pulse")?
+                }
+                _ => {
+                    extra(1)?;
+                    crate::ctl::proto::PULSE_MS
+                }
+            };
+            CtlCmd::Modem { line, op, ms }
+        }
+        "set" => CtlCmd::Set {
+            patch: parse_settings_patch(rest)?,
+        },
+        "capture" => match rest.first().map(String::as_str) {
+            Some("start") => {
+                let Some(file) = rest.get(1) else {
+                    return Err(CliError("ctl capture start needs a file".into()));
+                };
+                extra(2)?;
+                CtlCmd::CaptureStart(PathBuf::from(file))
+            }
+            Some("stop") => {
+                extra(1)?;
+                CtlCmd::CaptureStop
+            }
+            _ => return Err(CliError("ctl capture needs start <file> or stop".into())),
+        },
+        "xfer" => {
+            use crate::ctl::proto::{XferDir, XferProto};
+            let (Some(dir), Some(proto)) = (rest.first(), rest.get(1)) else {
+                return Err(CliError(
+                    "ctl xfer needs send|recv and zmodem|ymodem|xmodem".into(),
+                ));
+            };
+            let dir = choose(
+                dir,
+                "ctl xfer",
+                &[("send", XferDir::Send), ("recv", XferDir::Recv)],
+            )?;
+            let proto = choose(
+                proto,
+                "ctl xfer",
+                &[
+                    ("zmodem", XferProto::Zmodem),
+                    ("ymodem", XferProto::Ymodem),
+                    ("xmodem", XferProto::Xmodem),
+                ],
+            )?;
+            let files: Vec<PathBuf> = rest[2..].iter().map(PathBuf::from).collect();
+            match (dir, proto) {
+                (XferDir::Send, _) if files.is_empty() => {
+                    return Err(CliError("ctl xfer send needs a file".into()));
+                }
+                (XferDir::Recv, XferProto::Xmodem) if files.len() != 1 => {
+                    return Err(CliError("ctl xfer recv xmodem needs one file name".into()));
+                }
+                (XferDir::Recv, XferProto::Zmodem | XferProto::Ymodem) if !files.is_empty() => {
+                    return Err(CliError(
+                        "ctl xfer recv: the sender names the files; give none".into(),
+                    ));
+                }
+                _ => {}
+            }
+            CtlCmd::Xfer { dir, proto, files }
+        }
         other => {
             return Err(CliError(format!(
                 "unknown ctl command '{other}'; {CTL_USAGE}"
@@ -688,6 +815,73 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
         }
     };
     Ok(Command::Ctl(CtlArgs { device, cmd, json }))
+}
+
+/// A break's or pulse's length in ms.
+fn parse_hold(value: &str, what: &str) -> Result<u32, CliError> {
+    let max = crate::ctl::proto::HOLD_MAX;
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|ms| digits(value) && (1..=max).contains(ms))
+        .ok_or_else(|| CliError(format!("invalid {what} length '{value}': 1 to {max} ms")))
+}
+
+/// `baud=N databits=N parity=P stopbits=N flow=F`, named and valued as
+/// the session's options are.
+fn parse_settings_patch(words: &[String]) -> Result<crate::ctl::proto::SettingsPatch, CliError> {
+    let mut patch = crate::ctl::proto::SettingsPatch::default();
+    if words.is_empty() {
+        return Err(CliError(
+            "ctl set needs baud=, databits=, parity=, stopbits= or flow=".into(),
+        ));
+    }
+    for word in words {
+        let Some((key, value)) = word.split_once('=') else {
+            return Err(CliError(format!("ctl set: '{word}' is not <name>=<value>")));
+        };
+        match key {
+            "baud" => {
+                let v = parse_baud(value)
+                    .map_err(|_| CliError(format!("ctl set: invalid baud rate '{value}'")))?;
+                set_once(&mut patch.baud, v, "baud=")?;
+            }
+            "databits" => {
+                let v = choose(
+                    value,
+                    "databits=",
+                    &[("5", 5), ("6", 6), ("7", 7), ("8", 8)],
+                )?;
+                set_once(&mut patch.data_bits, v, "databits=")?;
+            }
+            "parity" => {
+                let v = choose(
+                    value,
+                    "parity=",
+                    &[("none", "none"), ("even", "even"), ("odd", "odd")],
+                )?;
+                set_once(&mut patch.parity, v.to_string(), "parity=")?;
+            }
+            "stopbits" => {
+                let v = choose(value, "stopbits=", &[("1", 1), ("2", 2)])?;
+                set_once(&mut patch.stop_bits, v, "stopbits=")?;
+            }
+            "flow" => {
+                let v = choose(
+                    value,
+                    "flow=",
+                    &[("none", "none"), ("rts", "rts"), ("xon", "xon")],
+                )?;
+                set_once(&mut patch.flow, v.to_string(), "flow=")?;
+            }
+            other => {
+                return Err(CliError(format!(
+                    "ctl set: unknown setting '{other}' (baud, databits, parity, stopbits, flow)"
+                )));
+            }
+        }
+    }
+    Ok(patch)
 }
 
 fn parse_prefix_time(value: &str) -> Result<Duration, CliError> {

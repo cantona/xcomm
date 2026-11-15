@@ -9,6 +9,8 @@ pub struct OutQueue {
     buf: Box<[u8]>,
     head: usize,
     len: usize,
+    /// Bytes written out since the queue was made.
+    written: u64,
 }
 
 impl OutQueue {
@@ -18,6 +20,7 @@ impl OutQueue {
             buf: vec![0; cap].into_boxed_slice(),
             head: 0,
             len: 0,
+            written: 0,
         }
     }
 
@@ -27,6 +30,16 @@ impl OutQueue {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Bytes written out so far: with [`len`](Self::len), where a byte
+    /// queued now stands.
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     /// Appends all of `bytes`, or nothing if they do not fit.
@@ -54,6 +67,7 @@ impl OutQueue {
             Ok(n) => {
                 self.head = (self.head + n) % self.buf.len();
                 self.len -= n;
+                self.written += n as u64;
                 if self.len == 0 {
                     self.head = 0;
                 }

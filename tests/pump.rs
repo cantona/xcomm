@@ -537,3 +537,95 @@ fn the_ring_gets_bytes_whose_terminal_write_ended_the_session() {
     ctl.ring.read(0, usize::MAX, &mut kept).unwrap();
     assert_eq!(kept, sent);
 }
+
+/// A client's action is in hand from the start; once it sees bytes queued
+/// it holds the line, as a break does once what came before it is out.
+struct ActionInHand {
+    held: bool,
+    started: Instant,
+}
+
+impl Control for ActionInHand {
+    fn stop(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn tick(&mut self) -> ControlFlow<()> {
+        if self.started.elapsed() > Duration::from_millis(400) {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+    fn may_write(&self) -> bool {
+        !self.held
+    }
+    fn keys_go_at_once(&self) -> bool {
+        false
+    }
+    fn ctl_serve(
+        &mut self,
+        _ready: &[libc::pollfd],
+        queue: &mut xcomm::session::OutQueue,
+        _stdin: Option<BorrowedFd<'_>>,
+    ) -> Result<xcomm::session::CommandOutcome, xcomm::session::SessionError> {
+        self.held |= !queue.is_empty();
+        Ok(xcomm::session::CommandOutcome::Continue)
+    }
+}
+
+#[test]
+fn a_key_typed_with_a_client_action_in_hand_waits_for_it() {
+    // The key is read in the pass before the action holds the line: written
+    // in that same pass, it would reach the device before the action.
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
+    let dev = support::pty();
+    let device = raw_device(&dev);
+    let (in_r, in_w) = std::io::pipe().unwrap();
+    let (_out_r, out_w) = std::io::pipe().unwrap();
+    rustix::io::write(&in_w, b"k").unwrap();
+    // Once the key is handled the loop sleeps in poll: a SIGUSR1 now and
+    // then lets the clock end the scenario.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waking = done.clone();
+    let me = unsafe { libc::pthread_self() } as usize;
+    let waker = std::thread::spawn(move || {
+        while !waking.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+            unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR1) };
+        }
+    });
+    let mut ctl = ActionInHand {
+        held: false,
+        started: Instant::now(),
+    };
+    let reason = pump(
+        &Pump {
+            stdin: Some(in_r.as_fd()),
+            stdout: out_w.as_fd(),
+            device: device.as_fd(),
+            signals: &signals,
+            prefix: Some((
+                xcomm::cli::PrefixKey {
+                    modifier: xcomm::cli::Modifier::Ctrl,
+                    letter: b'a',
+                },
+                Duration::from_millis(25),
+            )),
+            strip_color: false,
+        },
+        &mut ctl,
+    )
+    .unwrap();
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    waker.join().unwrap();
+    drop(signals);
+    assert_eq!(reason, ExitReason::Requested);
+    assert!(ctl.held);
+    nonblocking(dev.master.as_fd());
+    let mut buf = [0u8; 16];
+    assert!(
+        rustix::io::read(&dev.master, &mut buf).is_err(),
+        "the key reached the device before the action"
+    );
+    drop(in_w);
+}

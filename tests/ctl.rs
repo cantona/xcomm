@@ -432,6 +432,16 @@ fn a_disconnected_session_answers_and_refuses_sends() {
     assert!(v["settings"].is_null());
     let o = ctl(&s, &[&link_s, "send", "x"]);
     assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    let o = ctl(&s, &[&link_s, "break"]);
+    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    // A capture needs no device.
+    let cap = dir.join("cap");
+    let o = ctl(&s, &[&link_s, "capture", "start", cap.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        ctl(&s, &[&link_s, "capture", "stop"]).status.code(),
+        Some(0)
+    );
     // udev removes the link outright: the session is asked by the name it
     // was started with.
     std::fs::remove_file(&link).unwrap();
@@ -731,4 +741,372 @@ fn rename_replaces_a_socket_a_killed_session_left() {
     drop(live);
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn break_on_a_pty_succeeds_and_the_session_goes_on() {
+    let (dev, s, path) = start(&[]);
+    let o = ctl(&s, &[&path, "break"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    shown(&s, b"break sent (");
+    write_all(dev.master.as_fd(), b"after-break");
+    shown(&s, b"after-break");
+    let o = ctl(&s, &[&path, "break", "6000"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+#[test]
+fn modem_lines_report_what_the_driver_says() {
+    let (_dev, s, path) = start(&[]);
+    // A pty has no modem lines: the error is the driver's, named.
+    let o = ctl(&s, &[&path, "dtr", "on"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(stderr(&o).contains("DTR"), "{}", stderr(&o));
+    let o = ctl(&s, &[&path, "rts", "pulse", "20"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(stderr(&o).contains("RTS"), "{}", stderr(&o));
+}
+
+#[test]
+fn set_changes_the_line_settings() {
+    let (_dev, s, path) = start(&[]);
+    let o = ctl(&s, &[&path, "set", "baud=9600"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "9600 8N1 flow none\n");
+    assert_eq!(
+        json(&ctl(&s, &["--json", &path, "status"]))["settings"]["baud"],
+        9600
+    );
+    // The reply says what the driver applied (a Linux pty keeps 8N1).
+    let v = json(&ctl(
+        &s,
+        &["--json", &path, "set", "databits=7", "parity=even"],
+    ));
+    let got = &v["settings"];
+    let exact = got["data_bits"] == 7 && got["parity"] == "even";
+    assert_eq!(v["exact"], exact, "{v}");
+    assert_eq!(got["baud"], 9600, "{v}");
+    let o = ctl(&s, &[&path, "set", "speed=1"]);
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn capture_starts_and_stops() {
+    let (dev, s, path) = start(&[]);
+    let file = s.lock_dir.join("cap.txt");
+    let file_s = file.to_str().unwrap();
+    let o = ctl(&s, &[&path, "capture", "start", file_s]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{file_s}\n"));
+    let o = ctl(&s, &[&path, "capture", "start", file_s]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("already"), "{}", stderr(&o));
+    assert_eq!(
+        json(&ctl(&s, &["--json", &path, "status"]))["capture"],
+        file_s
+    );
+    write_all(dev.master.as_fd(), b"captured");
+    shown(&s, b"captured");
+    let o = ctl(&s, &[&path, "capture", "stop"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{file_s} (8 bytes)\n"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"captured");
+    let o = ctl(&s, &[&path, "capture", "stop"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("no capture"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_relative_capture_file_is_the_clients() {
+    let (_dev, s, path) = start(&[]);
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
+        .args(["ctl", &path, "capture", "start", "rel.cap"])
+        .env("XDG_RUNTIME_DIR", &s.lock_dir)
+        .current_dir(&s.lock_dir)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(s.lock_dir.join("rel.cap").exists());
+    assert_eq!(ctl(&s, &[&path, "capture", "stop"]).status.code(), Some(0));
+}
+
+#[test]
+fn ro_session_refuses_line_commands_with_code_8() {
+    let (_dev, s, path) = start(&["--ctl", "ro"]);
+    for args in [
+        &["break"][..],
+        &["dtr", "on"],
+        &["set", "baud=9600"],
+        &["capture", "stop"],
+        &["xfer", "recv", "zmodem"],
+    ] {
+        let mut all = vec![path.as_str()];
+        all.extend_from_slice(args);
+        let o = ctl(&s, &all);
+        assert_eq!(o.status.code(), Some(8), "{args:?}: {}", stderr(&o));
+    }
+}
+
+#[test]
+fn line_requests_are_checked_before_they_run() {
+    let (_dev, s, path) = start(&[]);
+    let sock = socket(&s, &path);
+    for (line, want) in [
+        ("{\"cmd\":\"set\"}\n", "set needs a setting"),
+        ("{\"cmd\":\"set\",\"data_bits\":9}\n", "data bits 9"),
+        ("{\"cmd\":\"break\",\"ms\":0}\n", "break of 0 ms"),
+        (
+            "{\"cmd\":\"modem\",\"line\":\"dtr\",\"op\":\"pulse\",\"ms\":9000}\n",
+            "pulse of 9000 ms",
+        ),
+        (
+            "{\"cmd\":\"xfer\",\"dir\":\"send\",\"proto\":\"zmodem\",\"cwd\":\"/\"}\n",
+            "needs a file",
+        ),
+        (
+            "{\"cmd\":\"xfer\",\"dir\":\"recv\",\"proto\":\"zmodem\",\"files\":[\"a\"],\"cwd\":\"/\"}\n",
+            "takes none",
+        ),
+        (
+            "{\"cmd\":\"xfer\",\"dir\":\"recv\",\"proto\":\"xmodem\",\"files\":[\"a\"],\"cwd\":\"rel\"}\n",
+            "absolute cwd",
+        ),
+    ] {
+        let (_, v) = raw_request(&sock, line);
+        assert_eq!(v["code"], 2, "{line}: {v}");
+        assert!(v["error"].as_str().unwrap().contains(want), "{line}: {v}");
+    }
+}
+
+/// Starts `xcomm ctl <args>` without waiting for it.
+fn ctl_spawn(s: &Spawned, args: &[&str]) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
+        .arg("ctl")
+        .args(args)
+        .env("XDG_RUNTIME_DIR", &s.lock_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn a_held_off_line_does_not_keep_a_break_waiting() {
+    let (dev, s, path) = start(&[]);
+    // The device takes nothing: a send fills the session's queue.
+    rustix::termios::tcflow(&dev.slave, rustix::termios::Action::OOff).unwrap();
+    let file = s.lock_dir.join("fill");
+    std::fs::write(&file, vec![b'f'; 200 << 10]).unwrap();
+    let mut filler = ctl_spawn(&s, &[&path, "send", "--file", file.to_str().unwrap()]);
+    std::thread::sleep(Duration::from_millis(300));
+    let asked = std::time::Instant::now();
+    let o = ctl(&s, &[&path, "break", "10"]);
+    let took = asked.elapsed();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // It waited for the queue until the line had taken nothing for 2 s.
+    assert!(
+        took >= Duration::from_millis(1500) && took < Duration::from_secs(6),
+        "{took:?}"
+    );
+    rustix::termios::tcflow(&dev.slave, rustix::termios::Action::OOn).unwrap();
+    let _ = filler.kill();
+    let _ = filler.wait();
+}
+
+#[test]
+fn an_action_given_up_on_is_not_run_later() {
+    let (dev, s, path) = start(&[]);
+    rustix::termios::tcflow(&dev.slave, rustix::termios::Action::OOff).unwrap();
+    let file = s.lock_dir.join("fill");
+    std::fs::write(&file, vec![b'f'; 200 << 10]).unwrap();
+    let filler = ctl_spawn(&s, &[&path, "send", "--file", file.to_str().unwrap()]);
+    std::thread::sleep(Duration::from_millis(300));
+    // Asked, then given up on while it waits behind the queue.
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    stream
+        .write_all(b"{\"cmd\":\"set\",\"baud\":4800}\n")
+        .unwrap();
+    drop(stream);
+    // Past the 2 s a waiting action gets.
+    std::thread::sleep(Duration::from_secs(3));
+    let v = json(&ctl(&s, &["--json", &path, "status"]));
+    assert_eq!(v["settings"]["baud"], 115200, "{v}");
+    // Nor once the queue is out.
+    rustix::termios::tcflow(&dev.slave, rustix::termios::Action::OOn).unwrap();
+    let drainer = {
+        let master = dev.master.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            let mut got = 0;
+            while got < 200 << 10 {
+                match rustix::io::read(&master, &mut buf) {
+                    Ok(n) if n > 0 => got += n,
+                    _ => break,
+                }
+            }
+        })
+    };
+    let o = filler.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    drainer.join().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let v = json(&ctl(&s, &["--json", &path, "status"]));
+    assert_eq!(v["settings"]["baud"], 115200, "{v}");
+}
+
+#[test]
+fn the_session_goes_on_during_a_long_break() {
+    let (dev, s, path) = start(&[]);
+    let asked = std::time::Instant::now();
+    let breaker = ctl_spawn(&s, &[&path, "break", "2000"]);
+    std::thread::sleep(Duration::from_millis(300));
+    // Answered, and output shown, while the break lasts.
+    let o = ctl(&s, &[&path, "status"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(asked.elapsed() < Duration::from_millis(1500));
+    write_all(dev.master.as_fd(), b"during-break");
+    shown(&s, b"during-break");
+    assert!(asked.elapsed() < Duration::from_millis(1800));
+    let o = breaker.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(asked.elapsed() >= Duration::from_secs(2));
+    shown(&s, b"break sent (");
+}
+
+#[test]
+fn a_prompt_opened_during_a_break_lets_it_end() {
+    let (_dev, s, path) = start(&[]);
+    let asked = std::time::Instant::now();
+    let breaker = ctl_spawn(&s, &[&path, "break", "800"]);
+    std::thread::sleep(Duration::from_millis(200));
+    // The baud prompt: open while the client waits for its reply.
+    write_all(s.host.master.as_fd(), b"\x01p");
+    let o = breaker.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        asked.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        asked.elapsed()
+    );
+    shown(&s, b"baud [");
+    write_all(s.host.master.as_fd(), b"\x1b");
+}
+
+#[test]
+fn nothing_is_written_into_a_break() {
+    let (dev, s, path) = start(&[]);
+    let breaker = ctl_spawn(&s, &[&path, "break", "1000"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let sent = std::time::Instant::now();
+    let o = ctl(&s, &[&path, "send", "-n", "after-break"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    read_until(dev.master.as_fd(), b"after-break", T);
+    // Held until the break ended, ~800 ms after the send.
+    assert!(
+        sent.elapsed() >= Duration::from_millis(600),
+        "{:?}",
+        sent.elapsed()
+    );
+    assert_eq!(breaker.wait_with_output().unwrap().status.code(), Some(0));
+}
+
+#[test]
+fn a_busy_line_does_not_starve_an_action() {
+    let (dev, s, path) = start(&[]);
+    // ~12 KiB/s taken, and a long send keeping the queue full.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drainer = {
+        let master = dev.master.try_clone().unwrap();
+        let fl = rustix::fs::fcntl_getfl(&master).unwrap();
+        rustix::fs::fcntl_setfl(&master, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = rustix::io::read(&master, &mut buf);
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        })
+    };
+    let file = s.lock_dir.join("long");
+    std::fs::write(&file, vec![b'l'; 400 << 10]).unwrap();
+    let mut filler = ctl_spawn(&s, &[&path, "send", "--file", file.to_str().unwrap()]);
+    std::thread::sleep(Duration::from_millis(500));
+    let asked = std::time::Instant::now();
+    let o = ctl(&s, &[&path, "break", "10"]);
+    let took = asked.elapsed();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // Behind what was queued when it came (a queue's worth), not the
+    // whole send (~30 s).
+    assert!(took < Duration::from_secs(12), "{took:?}");
+    let _ = filler.kill();
+    let _ = filler.wait();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    drainer.join().unwrap();
+}
+
+#[test]
+fn an_action_from_a_half_closed_client_runs_and_is_answered() {
+    let (_dev, s, path) = start(&[]);
+    // As `printf '...' | socat - UNIX-CONNECT:...` does.
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    stream.set_read_timeout(Some(T)).unwrap();
+    stream
+        .write_all(b"{\"cmd\":\"set\",\"baud\":9600}\n")
+        .unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let got = replies(&mut BufReader::new(stream));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0]["ok"], true, "{got:?}");
+    let v = json(&ctl(&s, &["--json", &path, "status"]));
+    assert_eq!(v["settings"]["baud"], 9600, "{v}");
+}
+
+#[test]
+fn requests_that_come_with_the_close_still_run() {
+    let (dev, s, path) = start(&[]);
+    let sock = socket(&s, &path);
+    // Accepted first, so the requests and the close arrive together.
+    let mut stream = UnixStream::connect(&sock).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    stream
+        .write_all(b"{\"cmd\":\"send\",\"data_b64\":\"QUFB\"}\n{\"cmd\":\"set\",\"baud\":4800}\n")
+        .unwrap();
+    drop(stream);
+    assert_eq!(read_until(dev.master.as_fd(), b"AAA", T), b"AAA");
+    let until = std::time::Instant::now() + T;
+    loop {
+        let v = json(&ctl(&s, &["--json", &path, "status"]));
+        if v["settings"]["baud"] == 4800 {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "{v}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_action_read_after_its_deadline_is_not_run() {
+    let (_dev, s, path) = start(&[]);
+    // A prompt is open: the session serves no client meanwhile.
+    write_all(s.host.master.as_fd(), b"\x01p");
+    shown(&s, b"baud [");
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    stream.set_read_timeout(Some(T)).unwrap();
+    let deadline = xcomm::ctl::proto::now_ms() + 200;
+    stream
+        .write_all(
+            format!("{{\"cmd\":\"set\",\"baud\":4800,\"deadline_ms\":{deadline}}}\n").as_bytes(),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    write_all(s.host.master.as_fd(), b"\x1b");
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["code"], 1, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("deadline"), "{v}");
+    let v = json(&ctl(&s, &["--json", &path, "status"]));
+    assert_eq!(v["settings"]["baud"], 115200, "{v}");
 }

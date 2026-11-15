@@ -13,7 +13,7 @@ use xcomm::ctl::CtlMode;
 use xcomm::ctl::proto::Status;
 use xcomm::ctl::server::{CtlServer, Session};
 use xcomm::hosttty::SignalPipe;
-use xcomm::session::{Control, ExitReason, OutQueue, Pump, pump};
+use xcomm::session::{CommandOutcome, Control, ExitReason, OutQueue, Pump, SessionError, pump};
 
 struct Counting;
 
@@ -117,7 +117,12 @@ impl Control for Count {
             .as_ref()
             .and_then(|s| s.poll_fds(self.ring.end(), out))
     }
-    fn ctl_serve(&mut self, ready: &[libc::pollfd], queue: &mut OutQueue) {
+    fn ctl_serve(
+        &mut self,
+        ready: &[libc::pollfd],
+        queue: &mut OutQueue,
+        _stdin: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> Result<CommandOutcome, SessionError> {
         if let Some(server) = &mut self.server {
             let mut view = View {
                 ring: &self.ring,
@@ -125,6 +130,7 @@ impl Control for Count {
             };
             server.serve(ready, &mut view);
         }
+        Ok(CommandOutcome::Continue)
     }
 }
 

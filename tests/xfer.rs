@@ -615,3 +615,95 @@ fn a_blocked_sigchld_does_not_hide_the_end_of_a_transfer() {
     drop(s);
     let _ = std::fs::remove_dir_all(&here);
 }
+
+fn ctl(s: &support::Spawned, args: &[&str]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xcomm"));
+    cmd.arg("ctl")
+        .args(args)
+        .env("XDG_RUNTIME_DIR", &s.lock_dir)
+        .stdin(Stdio::null());
+    cmd
+}
+
+#[test]
+fn ctl_xfer_send_roundtrip() {
+    let Some(p) = need(&["rz"]) else { return };
+    let (here, there) = (scratch("cs-here"), scratch("cs-there"));
+    let sent = data(256 << 10);
+    std::fs::write(here.join("two.bin"), &sent).unwrap();
+    let (dev, s) = start_in(&there, &[]);
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let remote = Remote::start(&p[0], &["-y"], &there, &dev.master);
+    // The terminal is read meanwhile: sz writes its progress there, and a
+    // macOS pty holds about 1 KiB.
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let master = s.host.master.try_clone().unwrap();
+        let fl = rustix::fs::fcntl_getfl(&master).unwrap();
+        rustix::fs::fcntl_setfl(&master, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop.load(Ordering::Relaxed) {
+                if rustix::io::read(&master, &mut buf).is_err() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        })
+    };
+    // A relative name is the client's: from `here`, not the session's cwd.
+    let o = ctl(&s, &[&path, "xfer", "send", "zmodem", "two.bin"])
+        .current_dir(&here)
+        .output()
+        .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        format!("transfer done: {}\n", lrzsz("sz").unwrap())
+    );
+    remote.received(&there.join("two.bin"), &sent);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&here);
+    let _ = std::fs::remove_dir_all(&there);
+}
+
+#[test]
+fn closing_the_client_aborts_its_transfer() {
+    if need(&["rz"]).is_none() {
+        return;
+    }
+    let here = scratch("ca-here");
+    let (dev, s) = start_in(&here, &[]);
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    // No sender: rz waits until it is aborted.
+    let mut client = ctl(&s, &[&path, "xfer", "recv", "zmodem"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    read_until(
+        s.host.master.as_fd(),
+        b"transfer started for a control client",
+        T,
+    );
+    // The port is the program's meanwhile.
+    for args in [&[path.as_str(), "break"][..], &[&path, "send", "x"]] {
+        let o = ctl(&s, args).output().unwrap();
+        assert_eq!(o.status.code(), Some(5), "{args:?}");
+    }
+    client.kill().unwrap();
+    client.wait().unwrap();
+    assert_eq!(outcome(&s), "transfer aborted");
+    let o = ctl(&s, &["--json", &path, "status"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["transfer"], false);
+    drop(dev);
+    let _ = std::fs::remove_dir_all(&here);
+}

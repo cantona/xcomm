@@ -9,7 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::proto::{self, Request, Status};
+use super::proto::{self, ModemLine, ModemOp, Request, SettingsPatch, Status, XferDir, XferProto};
 use super::{CtlError, CtlMode, code};
 use crate::ring::Ring;
 
@@ -21,6 +21,30 @@ const READS_PER_STEP: usize = 4;
 /// How long accepting waits after it failed for want of descriptors: the
 /// pending connection keeps the listener readable, and poll would spin.
 const ACCEPT_PAUSE: Duration = Duration::from_secs(1);
+
+/// A request that acts on the session rather than on the server: the
+/// session takes it with [`CtlServer::next_action`] and answers it with
+/// [`CtlServer::finish_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Break {
+        ms: u32,
+    },
+    Modem {
+        line: ModemLine,
+        op: ModemOp,
+        ms: u32,
+    },
+    Set(SettingsPatch),
+    CaptureStart(PathBuf),
+    CaptureStop,
+    Xfer {
+        dir: XferDir,
+        proto: XferProto,
+        files: Vec<PathBuf>,
+        cwd: PathBuf,
+    },
+}
 
 /// What the server needs from the session.
 pub trait Session {
@@ -44,6 +68,8 @@ pub struct CtlServer {
     clients: Vec<Client>,
     /// Accepting failed (EMFILE, ENFILE): not polled again until then.
     accept_paused: Option<Instant>,
+    /// The id the next client gets.
+    next_id: u64,
 }
 
 /// Bytes the session has taken from a client for the device.
@@ -55,6 +81,7 @@ struct Sending {
 }
 
 struct Client {
+    id: u64,
     stream: UnixStream,
     /// Received, not yet handled: request lines.
     input: Vec<u8>,
@@ -66,16 +93,26 @@ struct Client {
     sending: Option<Sending>,
     /// Subscribed: the offset of the next device byte to write.
     cursor: Option<u64>,
+    /// A request for the session, not taken yet.
+    action: Option<Action>,
+    /// Its deadline (`deadline_ms`), if the client gave one.
+    action_deadline: Option<u64>,
+    /// The session has taken its action and owes the reply.
+    awaiting: bool,
     /// No more requests: close once the output is written.
     closing: bool,
     /// The peer sends no more. What it sent is still answered.
     eof: bool,
+    /// It closed the connection with requests unread: they still run
+    /// (`printf ... | socat -u`), with no one to answer.
+    unattended: bool,
     dead: bool,
 }
 
 impl Client {
-    fn new(stream: UnixStream) -> Client {
+    fn new(id: u64, stream: UnixStream) -> Client {
         Client {
+            id,
             stream,
             input: Vec::new(),
             scanned: 0,
@@ -83,8 +120,12 @@ impl Client {
             written: 0,
             sending: None,
             cursor: None,
+            action: None,
+            action_deadline: None,
+            awaiting: false,
             closing: false,
             eof: false,
+            unattended: false,
             dead: false,
         }
     }
@@ -92,7 +133,10 @@ impl Client {
     /// Serving a request: no other is read until it is done, so replies
     /// come in order and a client cannot queue unbounded work.
     fn busy(&self) -> bool {
-        self.written < self.output.len() || self.sending.is_some()
+        self.written < self.output.len()
+            || self.sending.is_some()
+            || self.action.is_some()
+            || self.awaiting
     }
 
     fn events(&self, ring_end: u64) -> libc::c_short {
@@ -114,6 +158,23 @@ impl Client {
     fn reply(&mut self, bytes: Vec<u8>) {
         self.output = bytes;
         self.written = 0;
+    }
+
+    /// Whether the peer has closed the connection, not just its writing
+    /// side (that still waits for replies). Asked with a poll for POLLOUT,
+    /// which shows POLLHUP only then, on Linux and macOS alike; a busy
+    /// client is otherwise polled for no events, and macOS reports no
+    /// hangup for those.
+    fn peer_gone(&self) -> bool {
+        let mut fd = pollfd(self.stream.as_raw_fd(), libc::POLLOUT);
+        // SAFETY: one valid pollfd, no wait.
+        let n = unsafe { libc::poll(&mut fd, 1, 0) };
+        n > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    }
+
+    /// Sending, or waiting on the session for its action's result.
+    fn waiting(&self) -> bool {
+        self.sending.is_some() || self.action.is_some() || self.awaiting
     }
 
     /// Where the first request line in `input` ends.
@@ -164,6 +225,10 @@ impl Client {
 
     /// Writes what can be written of the reply.
     fn flush(&mut self) {
+        if self.unattended {
+            self.output = Vec::new();
+            self.written = 0;
+        }
         while self.written < self.output.len() {
             match self.stream.write(&self.output[self.written..]) {
                 Ok(n) => self.written += n,
@@ -235,9 +300,19 @@ impl Client {
         }
         let hup = revents & (libc::POLLHUP | libc::POLLERR) != 0;
         let readable = revents & libc::POLLIN != 0 || hup;
+        let was_waiting = self.waiting();
         // On a hangup, read on to the end: poll reports it until then.
         if readable && !self.eof && (!self.busy() || hup) && !self.take_input(hup) {
             self.eof = true;
+        }
+        if !self.unattended && (hup || (revents == 0 && was_waiting)) && self.peer_gone() {
+            // What it was waiting for is not wanted now. Requests that came
+            // with the close still run.
+            if was_waiting {
+                self.dead = true;
+                return;
+            }
+            self.unattended = true;
         }
         loop {
             self.send_more(s);
@@ -261,10 +336,9 @@ impl Client {
         if self.dead {
             return;
         }
-        // Closing its end (even only for writing) cancels a send and ends a
-        // subscription, also one it asked for just before closing; else poll
-        // would report the end on every pass until they finish.
-        if self.eof && (self.sending.is_some() || self.cursor.is_some()) {
+        // A subscriber that closes even only its writing side is done,
+        // also one that asked just before closing.
+        if self.eof && self.cursor.is_some() {
             self.dead = true;
             return;
         }
@@ -299,14 +373,18 @@ impl Client {
     }
 
     fn handle(&mut self, line: &[u8], mode: CtlMode, s: &mut dyn Session) {
-        let request: Request = match serde_json::from_slice(line) {
-            Ok(r) => r,
+        let (request, deadline) = match serde_json::from_slice::<proto::Envelope>(line) {
+            Ok(e) => (e.request, e.deadline_ms),
             Err(e) => {
                 self.reply(proto::err(code::USAGE, &format!("bad request: {e}")));
                 self.closing = true;
                 return;
             }
         };
+        if deadline.is_some_and(|d| proto::now_ms() > d) {
+            return self.reply(expired());
+        }
+        self.action_deadline = deadline;
         let ring = s.ring();
         match request {
             Request::Status => {
@@ -379,8 +457,98 @@ impl Client {
                 self.reply(proto::ok(serde_json::json!({ "start": start })));
                 self.cursor = Some(start);
             }
+            Request::Break { ms } => {
+                if let Some(e) = hold_error(ms, "break") {
+                    return self.reply(e);
+                }
+                self.act(mode, Action::Break { ms });
+            }
+            Request::Modem { line, op, ms } => {
+                if let Some(e) = hold_error(ms, "pulse") {
+                    return self.reply(e);
+                }
+                self.act(mode, Action::Modem { line, op, ms });
+            }
+            Request::Set { patch } => {
+                if patch.is_empty() {
+                    return self.reply(proto::err(code::USAGE, "set needs a setting"));
+                }
+                if let Err(e) = patch.apply(crate::cli::LineSettings::default()) {
+                    return self.reply(proto::err(code::USAGE, &e));
+                }
+                self.act(mode, Action::Set(patch));
+            }
+            Request::CaptureStart { path } => {
+                if path.is_empty() {
+                    return self.reply(proto::err(code::USAGE, "capture needs a file"));
+                }
+                self.act(mode, Action::CaptureStart(PathBuf::from(path)));
+            }
+            Request::CaptureStop => self.act(mode, Action::CaptureStop),
+            Request::Xfer {
+                dir,
+                proto: xproto,
+                files,
+                cwd,
+            } => {
+                let want = match (dir, xproto) {
+                    (XferDir::Send, _) if files.is_empty() => Some("xfer send needs a file"),
+                    (XferDir::Recv, XferProto::Xmodem) if files.len() != 1 => {
+                        Some("xfer recv xmodem needs one file name")
+                    }
+                    (XferDir::Recv, XferProto::Zmodem | XferProto::Ymodem) if !files.is_empty() => {
+                        Some("the sender names the files: xfer recv takes none")
+                    }
+                    _ => None,
+                };
+                if let Some(why) = want {
+                    return self.reply(proto::err(code::USAGE, why));
+                }
+                if !Path::new(&cwd).is_absolute() {
+                    return self.reply(proto::err(code::USAGE, "xfer needs an absolute cwd"));
+                }
+                self.act(
+                    mode,
+                    Action::Xfer {
+                        dir,
+                        proto: xproto,
+                        files: files.into_iter().map(PathBuf::from).collect(),
+                        cwd: PathBuf::from(cwd),
+                    },
+                );
+            }
         }
     }
+
+    /// Hands `action` to the session, unless the socket is read-only.
+    fn act(&mut self, mode: CtlMode, action: Action) {
+        if mode != CtlMode::ReadWrite {
+            self.reply(proto::err(
+                code::DENIED,
+                "the control socket is read-only (--ctl ro)",
+            ));
+            return;
+        }
+        self.action = Some(action);
+    }
+}
+
+/// The reply to a request read, or taken, after its deadline.
+fn expired() -> Vec<u8> {
+    proto::err(
+        code::FAILED,
+        "not run: the session took it after the client's deadline",
+    )
+}
+
+/// A reply refusing a hold of `ms`, if it is out of range.
+fn hold_error(ms: u32, what: &str) -> Option<Vec<u8>> {
+    (!(1..=proto::HOLD_MAX).contains(&ms)).then(|| {
+        proto::err(
+            code::USAGE,
+            &format!("{what} of {ms} ms: 1 to {} ms", proto::HOLD_MAX),
+        )
+    })
 }
 
 impl CtlServer {
@@ -415,7 +583,61 @@ impl CtlServer {
             mode,
             clients: Vec::new(),
             accept_paused: None,
+            next_id: 0,
         })
+    }
+
+    /// The next request that acts on the session, not taken yet, with its
+    /// client's id. One whose client has closed the connection is dropped:
+    /// it was given up on (a client that timed out has said it failed).
+    pub fn pending_action(&mut self) -> Option<(u64, &Action)> {
+        let now = proto::now_ms();
+        for c in &mut self.clients {
+            if c.action.is_some() && !c.unattended && c.peer_gone() {
+                c.action = None;
+                c.dead = true;
+            } else if c.action.is_some() && c.action_deadline.is_some_and(|d| now > d) {
+                c.action = None;
+                c.reply(expired());
+                c.flush();
+            }
+        }
+        self.clients.retain(|c| !c.dead);
+        self.clients
+            .iter()
+            .find_map(|c| c.action.as_ref().map(|a| (c.id, a)))
+    }
+
+    /// Takes [`pending_action`](Self::pending_action), with the client's
+    /// id. The client waits for [`finish_action`](Self::finish_action).
+    pub fn next_action(&mut self) -> Option<(u64, Action)> {
+        self.pending_action()?;
+        let c = self.clients.iter_mut().find(|c| c.action.is_some())?;
+        c.awaiting = true;
+        Some((c.id, c.action.take().expect("found with one")))
+    }
+
+    /// Answers client `id`'s action, if the client is still there.
+    pub fn finish_action(&mut self, id: u64, result: Result<serde_json::Value, (u8, String)>) {
+        if let Some(c) = self.clients.iter_mut().find(|c| c.id == id) {
+            c.awaiting = false;
+            c.reply(match result {
+                Ok(body) => proto::ok(body),
+                Err((code, msg)) => proto::err(code, &msg),
+            });
+            c.flush();
+        }
+        self.clients.retain(|c| !c.dead);
+    }
+
+    /// Client `id` has closed the connection: what it asked for is not
+    /// wanted any more. (One that closed only its writing side waits for
+    /// the reply.)
+    pub fn abandoned(&self, id: u64) -> bool {
+        self.clients
+            .iter()
+            .find(|c| c.id == id)
+            .is_none_or(|c| c.peer_gone())
     }
 
     pub fn path(&self) -> &Path {
@@ -452,7 +674,14 @@ impl CtlServer {
         let listen = if paused.is_some() { 0 } else { libc::POLLIN };
         out.push(pollfd(self.listener.as_raw_fd(), listen));
         for c in &self.clients {
-            out.push(pollfd(c.stream.as_raw_fd(), c.events(ring_end)));
+            // One that closed its end and waits on the session has nothing
+            // to poll for, and a hangup would be reported on every pass.
+            let fd = if c.eof && c.written >= c.output.len() {
+                -1
+            } else {
+                c.stream.as_raw_fd()
+            };
+            out.push(pollfd(fd, c.events(ring_end)));
         }
         paused
     }
@@ -517,7 +746,8 @@ impl CtlServer {
                 let _ = (&stream).write(&proto::err(code::FAILED, &msg));
                 continue;
             }
-            let mut c = Client::new(stream);
+            let mut c = Client::new(self.next_id, stream);
+            self.next_id += 1;
             // A request may already be there.
             c.step(libc::POLLIN, self.mode, s);
             if !c.dead {
