@@ -92,6 +92,17 @@ fn standard_and_odd_bauds_round_trip() {
             baud,
             ..LineSettings::default()
         };
+        // A macOS pty takes only the termios rates: the others go through
+        // IOSSIOSPEED, which serial drivers have and the pty does not.
+        #[cfg(target_os = "macos")]
+        if baud > 230_400 || baud == 31_250 || baud == 74_880 {
+            let before = port.settings();
+            let e = port.configure(&s).unwrap_err().to_string();
+            assert!(e.contains("IOSSIOSPEED"), "{baud}: {e}");
+            assert_eq!(port.settings(), before);
+            assert_eq!(port.read_settings().unwrap().baud, before.baud);
+            continue;
+        }
         assert_eq!(port.configure(&s).unwrap(), Applied::Exact, "{baud}");
         assert_eq!(port.read_settings().unwrap().baud, baud);
     }

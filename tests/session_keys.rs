@@ -34,9 +34,9 @@ fn speed(dev: &support::Pty) -> u32 {
 fn quits_with(keys: &[u8], env: &[(&str, &str)]) {
     let (_dev, mut s, _) = start(&[], env);
     write_all(s.host.master.as_fd(), keys);
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
     assert!(
-        tcgetattr(s.host.slave.as_fd())
+        tcgetattr(s.host.master.as_fd())
             .unwrap()
             .local_modes
             .contains(LocalModes::ICANON)
@@ -227,7 +227,7 @@ fn ctrl_a_w_toggles_line_wrap_and_restores_it_on_exit() {
         read_until(s.host.master.as_fd(), b"\x1b[?7h", T),
         b"\x18\x1b[?7h"
     );
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 #[test]
@@ -318,9 +318,9 @@ fn sigterm_while_prompting_ends_the_session() {
     write_all(s.host.master.as_fd(), b"\x01p");
     read_until(s.host.master.as_fd(), b"baud [115200]: ", T);
     unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
     assert!(
-        tcgetattr(s.host.slave.as_fd())
+        tcgetattr(s.host.master.as_fd())
             .unwrap()
             .local_modes
             .contains(LocalModes::ICANON)
@@ -366,7 +366,7 @@ fn with_stdout_redirected_commands_talk_on_the_terminal() {
     write_all(dev.master.as_fd(), b"data");
     assert_eq!(read_until(out_r.as_fd(), b"data", T), b"data");
     write_all(s.host.master.as_fd(), b"\x01x");
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
     // stdout carried the device bytes and nothing else.
     let mut rest = Vec::new();
     std::io::Read::read_to_end(
@@ -394,7 +394,7 @@ fn quit_works_while_the_device_takes_no_input() {
         Duration::from_secs(20),
     ));
     assert!(out.contains("typed keys are dropped"), "{out:?}");
-    assert!(wait_exit(&mut s.child, Duration::from_secs(20)).success());
+    assert!(s.wait_exit(Duration::from_secs(20)).success());
     typist.join().unwrap();
 }
 
@@ -402,7 +402,12 @@ fn quit_works_while_the_device_takes_no_input() {
 fn quit_sends_the_keys_typed_before_it() {
     let (dev, mut s, _) = start(&[], &[]);
     write_all(s.host.master.as_fd(), b"hello\r\x01x");
-    assert!(wait_exit(&mut s.child, T).success());
+    // Read before the exit on macOS: there what a pty peer has not read is
+    // still queued on the port, and closing the port discards it.
+    #[cfg(target_os = "macos")]
+    assert_eq!(read_until(dev.master.as_fd(), b"\r", T), b"hello\r");
+    assert!(s.wait_exit(T).success());
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(read_until(dev.master.as_fd(), b"\r", T), b"hello\r");
 }
 
@@ -455,7 +460,7 @@ fn sigterm_ends_a_session_with_wrap_off_and_the_terminal_stalled() {
     write_all(dev.master.as_fd(), b"more");
     std::thread::sleep(Duration::from_millis(100));
     unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 /// Stopped and continued with wrap off and the terminal taking nothing:
@@ -475,5 +480,5 @@ fn sigterm_sent_while_stopped_with_wrap_off_and_the_terminal_stalled_ends_the_se
     support::wait_stopped(pid, T);
     unsafe { libc::kill(pid, libc::SIGTERM) };
     unsafe { libc::kill(pid, libc::SIGCONT) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }

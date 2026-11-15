@@ -11,7 +11,7 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use support::{lock_dir, read_until, spawn_xcomm, wait_exit, write_all};
+use support::{lock_dir, read_until, spawn_xcomm, write_all};
 
 const ALLOWED: &str = "/dev/ttyUSB1";
 const T: Duration = Duration::from_secs(5);
@@ -51,5 +51,5 @@ fn hw_modem_line_commands() {
     command(&s, b'h', "xcomm: hung up (DTR dropped for 500 ms)\r\n");
     let mut s = s;
     write_all(s.host.master.as_fd(), b"\x01x");
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }

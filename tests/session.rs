@@ -44,15 +44,15 @@ fn keyboard_bytes_reach_the_device_unchanged() {
 fn sigterm_exits_cleanly_and_restores_the_terminal() {
     let (_dev, mut s) = start(&[]);
     assert!(
-        !tcgetattr(s.host.slave.as_fd())
+        !tcgetattr(s.host.master.as_fd())
             .unwrap()
             .local_modes
             .contains(LocalModes::ICANON)
     );
     unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
     assert!(
-        tcgetattr(s.host.slave.as_fd())
+        tcgetattr(s.host.master.as_fd())
             .unwrap()
             .local_modes
             .contains(LocalModes::ICANON)
@@ -65,16 +65,16 @@ fn terminal_hangup_ends_the_session() {
     let support::Pty { master, slave, .. } = std::mem::replace(&mut s.host, support::pty());
     drop(master);
     drop(slave);
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 #[test]
 fn unplugged_device_ends_the_session_with_status_1() {
     let (dev, mut s) = start(&[]);
     drop(dev);
-    let status = wait_exit(&mut s.child, T);
+    let status = s.wait_exit(T);
     assert_eq!(status.code(), Some(1));
-    let out = read_until(s.host.master.as_fd(), b"disconnected", T);
+    let out = s.read_after_exit(b"disconnected", T);
     assert!(String::from_utf8_lossy(&out).contains("disconnected"));
 }
 
@@ -86,9 +86,9 @@ fn a_locked_port_exits_2_naming_the_holder() {
     let first = spawn_xcomm(&[&path], &dir);
     read_until(first.host.master.as_fd(), b"\r\n", T);
     let mut second = spawn_xcomm(&[&path], &dir);
-    let status = wait_exit(&mut second.child, T);
+    let status = second.wait_exit(T);
     assert_eq!(status.code(), Some(2));
-    let msg = read_until(second.host.master.as_fd(), b"\n", T);
+    let msg = second.read_after_exit(b"\n", T);
     let msg = String::from_utf8_lossy(&msg);
     assert!(msg.contains(&first.child.id().to_string()), "{msg}");
     std::mem::forget(dir);
@@ -161,7 +161,7 @@ fn job_control_stop_gives_the_terminal_back_and_resume_takes_it_again() {
     let (_dev, mut s) = start(&[]);
     let pid = s.child.id();
     let canon = |s: &support::Spawned| {
-        tcgetattr(s.host.slave.as_fd())
+        tcgetattr(s.host.master.as_fd())
             .unwrap()
             .local_modes
             .contains(LocalModes::ICANON)
@@ -184,7 +184,7 @@ fn job_control_stop_gives_the_terminal_back_and_resume_takes_it_again() {
         std::thread::sleep(Duration::from_millis(10));
     }
     unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 #[cfg(target_os = "linux")]
@@ -202,7 +202,7 @@ fn hangup_while_stopped_ends_the_session_cleanly() {
     let support::Pty { master, slave, .. } = std::mem::replace(&mut s.host, support::pty());
     drop(master);
     drop(slave);
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 #[cfg(target_os = "linux")]
@@ -311,7 +311,7 @@ fn hangup_while_the_device_streams_exits_cleanly() {
         let support::Pty { master, slave, .. } = std::mem::replace(&mut s.host, support::pty());
         drop(master);
         drop(slave);
-        let status = wait_exit(&mut s.child, T);
+        let status = s.wait_exit(T);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(dev);
         feeder.join().unwrap();
@@ -379,7 +379,7 @@ fn sigint_while_typing_floods_the_device_exits_cleanly() {
         });
         std::thread::sleep(Duration::from_millis(20));
         unsafe { libc::kill(s.child.id() as i32, libc::SIGINT) };
-        let status = wait_exit(&mut s.child, T);
+        let status = s.wait_exit(T);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         typist.join().unwrap();
         drain.join().unwrap();
@@ -485,7 +485,7 @@ fn sigterm_sent_while_stopped_in_a_blocked_write_ends_the_session() {
     support::wait_stopped(pid, T);
     unsafe { libc::kill(pid, libc::SIGTERM) };
     unsafe { libc::kill(pid, libc::SIGCONT) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 const COLORED: &[u8] = b"\x1b[1;31mred\x1b[0m \x1b[2J\x1b[10;5Hend";

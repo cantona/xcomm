@@ -7,7 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use support::{lock_dir, read_until, spawn_with_env, wait_exit, write_all};
+use support::{lock_dir, read_until, spawn_with_env, write_all};
 
 const T: Duration = Duration::from_secs(10);
 
@@ -25,7 +25,7 @@ fn start(extra: &[&str], dir: &Path) -> (support::Pty, support::Spawned, String)
 
 fn quit(mut s: support::Spawned) -> support::Spawned {
     write_all(s.host.master.as_fd(), b"\x01x");
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
     s
 }
 
@@ -96,6 +96,8 @@ fn key_l_starts_and_stops_capture() {
     drop(s);
 }
 
+/// macOS has no /dev/full.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_capture_that_cannot_be_written_stops_and_the_session_goes_on() {
     let dir = lock_dir("capture");
@@ -142,8 +144,16 @@ fn a_dash_c_file_that_cannot_be_opened_ends_the_run() {
     let out = read_until(s.host.master.as_fd(), b"\n", T);
     let out = String::from_utf8_lossy(&out);
     assert!(out.contains("-C /nonexistent-dir/x.log:"), "{out}");
-    assert_eq!(wait_exit(&mut s.child, T).code(), Some(1));
+    assert_eq!(s.wait_exit(T).code(), Some(1));
 }
+
+/// Bytes a pipe reader falls behind: more than a FIFO holds, less than
+/// that and the 64 KiB capture buffer together. A FIFO holds 64 KiB on
+/// Linux, 8 KiB on macOS.
+#[cfg(target_os = "macos")]
+const BEHIND: usize = 70_000;
+#[cfg(not(target_os = "macos"))]
+const BEHIND: usize = 100_000;
 
 fn mkfifo(path: &Path) {
     let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -165,10 +175,7 @@ fn a_fifo_with_no_reader_fails_at_once() {
     );
     let out = read_until(s.host.master.as_fd(), b"\n", T);
     assert!(String::from_utf8_lossy(&out).contains("fifo:"), "{out:?}");
-    assert_eq!(
-        wait_exit(&mut s.child, Duration::from_secs(2)).code(),
-        Some(1)
-    );
+    assert_eq!(s.wait_exit(Duration::from_secs(2)).code(), Some(1));
 }
 
 #[test]
@@ -201,7 +208,7 @@ fn a_fifo_that_stops_reading_stops_the_capture_not_the_session() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
     unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
 }
 
 #[test]
@@ -261,7 +268,7 @@ fn a_port_that_cannot_be_had_leaves_no_capture_file() {
         &dir,
         &[],
     );
-    assert_ne!(wait_exit(&mut s.child, T).code(), Some(0));
+    assert_ne!(s.wait_exit(T).code(), Some(0));
     assert!(!file.exists());
 }
 
@@ -276,9 +283,8 @@ fn a_pipe_reader_briefly_behind_gets_every_byte() {
         .open(&fifo)
         .unwrap();
     let (dev, s, _) = start(&["-C", fifo.to_str().unwrap()], &dir);
-    // More than the pipe holds, less than the pipe and the buffer together;
-    // the reader starts late.
-    let mut data: Vec<u8> = (0..100_000).map(|i| b'a' + (i % 26) as u8).collect();
+    // The reader starts late.
+    let mut data: Vec<u8> = (0..BEHIND).map(|i| b'a' + (i % 26) as u8).collect();
     data.extend_from_slice(b"<END>");
     let master = dev.master.try_clone().unwrap();
     let sent = data.clone();
@@ -318,6 +324,13 @@ fn the_file_prompt_keeps_to_its_limit() {
     let end = out.windows(2).position(|w| w == b"\r\n").unwrap();
     assert_eq!(end, 1022, "{:?}", &out[1015..end + 2]);
     assert_eq!(&out[1018..end], b"aa\xc3\xa9");
+    // The error line repeats the long name. Read it before quitting: a
+    // macOS pty holds about 1 KiB, and xcomm waits for the terminal.
+    let mut rest = out[end + 2..].to_vec();
+    let error = b"capture: ";
+    while !(rest.windows(error.len()).any(|w| w == error) && rest.ends_with(b"\r\n")) {
+        rest.extend(read_until(s.host.master.as_fd(), b"\n", T));
+    }
     drop(quit(s));
 }
 
@@ -332,7 +345,7 @@ fn quitting_waits_briefly_for_a_pipe_reader_behind() {
         .open(&fifo)
         .unwrap();
     let (dev, mut s, _) = start(&["-C", fifo.to_str().unwrap()], &dir);
-    let mut data: Vec<u8> = (0..100_000).map(|i| b'a' + (i % 26) as u8).collect();
+    let mut data: Vec<u8> = (0..BEHIND).map(|i| b'a' + (i % 26) as u8).collect();
     data.extend_from_slice(b"<END>");
     let master = dev.master.try_clone().unwrap();
     let sent = data.clone();
@@ -346,7 +359,7 @@ fn quitting_waits_briefly_for_a_pipe_reader_behind() {
     rustix::fs::fcntl_setfl(&reader, fl - rustix::fs::OFlags::NONBLOCK).unwrap();
     let mut got = Vec::new();
     std::io::Read::read_to_end(&mut &reader, &mut got).unwrap();
-    assert!(wait_exit(&mut s.child, T).success());
+    assert!(s.wait_exit(T).success());
     assert_eq!(got, data);
 }
 

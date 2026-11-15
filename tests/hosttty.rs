@@ -16,10 +16,15 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn same_modes(a: &Termios, b: &Termios) -> bool {
+    // macOS sets PENDIN itself when ICANON goes back on.
+    #[cfg(target_os = "macos")]
+    let kernel_set = LocalModes::PENDIN;
+    #[cfg(not(target_os = "macos"))]
+    let kernel_set = LocalModes::empty();
     a.input_modes == b.input_modes
         && a.output_modes == b.output_modes
         && a.control_modes == b.control_modes
-        && a.local_modes == b.local_modes
+        && a.local_modes - kernel_set == b.local_modes - kernel_set
 }
 
 fn assert_raw(t: &Termios) {
@@ -241,12 +246,14 @@ fn abort_restore_chains_to_an_earlier_handler() {
 
 #[test]
 fn dies_in_raw_mode_by_abort() {
-    assert!(aborted(die_in_raw_mode("abort")));
+    let status = die_in_raw_mode("abort");
+    assert!(aborted(status), "{status:?}");
 }
 
 #[test]
 fn dies_in_raw_mode_by_allocation_failure() {
-    assert!(aborted(die_in_raw_mode("alloc")));
+    let status = die_in_raw_mode("alloc");
+    assert!(aborted(status), "{status:?}");
 }
 
 #[test]
@@ -279,7 +286,8 @@ fn dies_in_raw_mode_by_segfault_even_if_sigsegv_was_ignored() {
 
 #[test]
 fn dies_in_raw_mode_by_sigquit() {
-    assert!(killed_by(die_in_raw_mode("quit"), libc::SIGQUIT));
+    let status = die_in_raw_mode("quit");
+    assert!(killed_by(status, libc::SIGQUIT), "{status:?}");
 }
 
 #[test]

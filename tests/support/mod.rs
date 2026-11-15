@@ -20,7 +20,16 @@ pub fn pty() -> Pty {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     #[cfg(not(target_os = "linux"))]
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY;
-    let master = openpt(flags).unwrap();
+    // Concurrent opens of /dev/ptmx on macOS now and then fail with -6, the
+    // kernel's private EREDRIVEOPEN; a plain C loop of posix_openpt on 16
+    // threads shows it too. Another try succeeds.
+    let mut tries = 0;
+    let master = loop {
+        match openpt(flags) {
+            Err(e) if e.raw_os_error() == -6 && tries < 10 => tries += 1,
+            r => break r.unwrap(),
+        }
+    };
     // macOS has no O_CLOEXEC for posix_openpt; set it so a child spawned by
     // another test thread cannot hold this master open.
     #[cfg(not(target_os = "linux"))]
@@ -45,9 +54,18 @@ pub fn pty() -> Pty {
 /// Reads until `needle` has been seen; panics with the bytes read so far on
 /// timeout.
 pub fn read_until(fd: BorrowedFd<'_>, needle: &[u8], timeout: Duration) -> Vec<u8> {
+    read_until_after(fd, needle, timeout, Vec::new())
+}
+
+/// Like read_until, with `got` already read.
+fn read_until_after(
+    fd: BorrowedFd<'_>,
+    needle: &[u8],
+    timeout: Duration,
+    mut got: Vec<u8>,
+) -> Vec<u8> {
     assert!(!needle.is_empty(), "read_until needs a non-empty needle");
     let deadline = Instant::now() + timeout;
-    let mut got = Vec::new();
     let mut buf = [0u8; 4096];
     while !got.windows(needle.len()).any(|w| w == needle) {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -85,14 +103,162 @@ pub fn borrow(fd: &OwnedFd) -> BorrowedFd<'_> {
 pub struct Spawned {
     pub child: std::process::Child,
     /// xcomm's terminal: write to `host.master` to type, read it to see.
+    /// Read its modes through `host.master` too: macOS revokes `host.slave`
+    /// when xcomm, its session leader, exits.
     pub host: Pty,
     pub lock_dir: PathBuf,
+    /// Terminal output read by `free_exiting`; `read_after_exit` hands it
+    /// out first.
+    tail: Vec<u8>,
+}
+
+impl Spawned {
+    /// Waits for the child to exit, killing it after `timeout`.
+    pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                return s;
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!("child still running after {timeout:?}");
+            }
+            self.free_exiting();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Reads the terminal until `needle`, after the child has exited.
+    pub fn read_after_exit(&mut self, needle: &[u8], timeout: Duration) -> Vec<u8> {
+        let got = std::mem::take(&mut self.tail);
+        read_until_after(self.host.master.as_fd(), needle, timeout, got)
+    }
+
+    /// On macOS a session leader cannot finish exiting while output it
+    /// wrote to its terminal is unread and another descriptor on that
+    /// terminal is open, as `host.slave` is. Once the child is past its own
+    /// code, output is restarted (a test may have stopped it) and read into
+    /// `tail`. Linux does not wait.
+    #[cfg(target_os = "macos")]
+    fn free_exiting(&mut self) {
+        if !in_exit(self.child.id()) {
+            return;
+        }
+        let _ = rustix::termios::tcflow(&self.host.slave, rustix::termios::Action::OOn);
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut fds = [PollFd::new(&self.host.master, PollFlags::IN)];
+            match poll(
+                &mut fds,
+                Some(&rustix::event::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                }),
+            ) {
+                Ok(n) if n > 0 && fds[0].revents().contains(PollFlags::IN) => {}
+                _ => return,
+            }
+            match rustix::io::read(&self.host.master, &mut buf) {
+                Ok(n) if n > 0 => self.tail.extend_from_slice(&buf[..n]),
+                _ => return,
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn free_exiting(&mut self) {}
+}
+
+/// Whether process `pid` is working its way through exit (the E in ps).
+/// proc_pidinfo cannot tell: it fails with ESRCH from then on.
+#[cfg(target_os = "macos")]
+fn in_exit(pid: u32) -> bool {
+    // <sys/sysctl.h> struct kinfo_proc (not in the libc crate) on 64-bit
+    // macOS: 648 bytes, kp_proc.p_flag at byte 32. P_WEXIT from <sys/proc.h>.
+    const KINFO_PROC_SIZE: usize = 648;
+    const P_FLAG_AT: usize = 32;
+    const P_WEXIT: u32 = 0x2000;
+    // Room for a larger struct too, so a layout change shows as a size and
+    // not as ENOMEM.
+    let mut info = [0u8; 4096];
+    let mut size = info.len();
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as libc::c_int,
+    ];
+    // SAFETY: `info` is `size` bytes; sysctl writes at most that and stores
+    // the length it wrote in `size`.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            info.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        in_exit_failure(&format!(
+            "in_exit: sysctl KERN_PROC_PID {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+        return false;
+    }
+    // No such process (already reaped).
+    if size == 0 {
+        return false;
+    }
+    if size != KINFO_PROC_SIZE {
+        in_exit_failure(&format!(
+            "in_exit: kinfo_proc is {size} bytes, not {KINFO_PROC_SIZE}"
+        ));
+        return false;
+    }
+    let p_flag = u32::from_ne_bytes(info[P_FLAG_AT..P_FLAG_AT + 4].try_into().unwrap());
+    p_flag & P_WEXIT != 0
+}
+
+/// Reports an in_exit failure the first time only: Drop asks every 10 ms.
+#[cfg(target_os = "macos")]
+fn in_exit_failure(msg: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        harness_failure(msg);
+    }
+}
+
+/// Fails the test, or only reports `msg` when the thread is already
+/// unwinding: a second panic in a Drop would abort the whole test binary.
+fn harness_failure(msg: &str) {
+    if std::thread::panicking() {
+        eprintln!("{msg}");
+    } else {
+        panic!("{msg}");
+    }
 }
 
 impl Drop for Spawned {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Not wait(): a child that cannot finish exiting would hang the test
+        // for good. One left over is let go when `host` closes below.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            self.free_exiting();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // Its lock directory stays: the child may still hold a lock there.
+            harness_failure(&format!(
+                "pid {} still running 10 s after SIGKILL; left behind",
+                self.child.id()
+            ));
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.lock_dir);
     }
 }
@@ -177,10 +343,12 @@ pub fn spawn_with(
         child,
         host,
         lock_dir: lock_dir.to_path_buf(),
+        tail: Vec::new(),
     }
 }
 
-/// Waits for the child to exit, killing it after `timeout`.
+/// Waits for a child not started by `spawn_with` to exit, killing it after
+/// `timeout`.
 pub fn wait_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
