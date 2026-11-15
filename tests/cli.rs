@@ -955,3 +955,13 @@ fn ctl_option_of_a_session() {
     assert!(err(&["--ctl", "rx", "x"], &[]).contains("--ctl"));
     assert!(err(&["--ctl", "ro", "--ctl", "rw", "x"], &[]).contains("more than once"));
 }
+
+#[test]
+fn headless_and_marker_options() {
+    let t = term(&["x"], &[]);
+    assert!(!t.headless && t.ctl_marker);
+    let t = term(&["--headless", "--no-ctl-marker", "x"], &[]);
+    assert!(t.headless && !t.ctl_marker);
+    assert!(term(&["--headless", "--ctl", "ro", "x"], &[]).headless);
+    assert!(err(&["--headless", "--ctl", "off", "x"], &[]).contains("--headless needs"));
+}

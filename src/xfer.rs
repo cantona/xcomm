@@ -98,7 +98,7 @@ impl std::fmt::Display for XferError {
 impl std::error::Error for XferError {}
 
 /// A running lrzsz program. Its stdin and stdout are the port, set blocking
-/// for it; its stderr is the terminal, for progress.
+/// for it; its stderr is xcomm's, for progress, unless no one watches it.
 pub struct Transfer<'a> {
     port: &'a Port,
     child: Child,
@@ -112,13 +112,14 @@ pub struct Transfer<'a> {
 impl<'a> Transfer<'a> {
     /// Starts the program for `proto` and `dir` in `cwd`, with `files` as
     /// its arguments (the files to send, or the name to receive an XMODEM
-    /// file as).
+    /// file as). `progress` false sends the program's messages nowhere.
     pub fn start(
         port: &'a Port,
         proto: Proto,
         dir: Direction,
         files: &[PathBuf],
         cwd: &Path,
+        progress: bool,
     ) -> Result<Transfer<'a>, XferError> {
         let plain = program(proto, dir);
         let other = prefixed(proto, dir);
@@ -158,7 +159,11 @@ impl<'a> Transfer<'a> {
             cmd.current_dir(cwd)
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::from(output))
-                .stderr(Stdio::inherit());
+                .stderr(if progress {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                });
             stop_with_parent(&mut cmd);
             cmd.spawn()
         };

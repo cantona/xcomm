@@ -150,7 +150,8 @@ fn send_line_endings_and_hex() {
 
 #[test]
 fn send_file_larger_than_a_request() {
-    let (dev, s, path) = start(&[]);
+    // No markers: each would fill a macOS pty the test does not read.
+    let (dev, s, path) = start(&["--no-ctl-marker"]);
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     let data: Vec<u8> = (0..1_500_000)
         .map(|_| {
@@ -1109,4 +1110,120 @@ fn an_action_read_after_its_deadline_is_not_run() {
     assert!(v["error"].as_str().unwrap().contains("deadline"), "{v}");
     let v = json(&ctl(&s, &["--json", &path, "status"]));
     assert_eq!(v["settings"]["baud"], 115200, "{v}");
+}
+
+#[test]
+fn marker_shown_in_terminal() {
+    let (dev, s, path) = start(&[]);
+    let o = ctl(&s, &[&path, "send", "ls\x1b"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    read_until(dev.master.as_fd(), b"\r", T);
+    // Dim (color is on: a terminal, TERM=xterm), controls as ^X.
+    shown(&s, b"\x1b[0;2m\r\n[ctl] ls^[^M\x1b[0m\r\n");
+    let (dev, s, path) = start(&["--color", "never"]);
+    let o = ctl(&s, &[&path, "send", "--hex", "01 7f 41"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    read_until(dev.master.as_fd(), b"A", T);
+    shown(&s, b"\x1b[0m\r\n[ctl] ^A^?A\x1b[0m\r\n");
+}
+
+#[test]
+fn no_ctl_marker_suppresses_it() {
+    let (dev, s, path) = start(&["--no-ctl-marker"]);
+    let o = ctl(&s, &[&path, "send", "ls"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    read_until(dev.master.as_fd(), b"\r", T);
+    write_all(dev.master.as_fd(), b"MARK");
+    let got = read_until(s.host.master.as_fd(), b"MARK", T);
+    assert!(
+        !String::from_utf8_lossy(&got).contains("[ctl]"),
+        "{:?}",
+        String::from_utf8_lossy(&got)
+    );
+}
+
+#[test]
+fn a_marker_escapes_c1_and_is_cut_between_characters() {
+    let (dev, s, path) = start(&["--color", "never"]);
+    let o = ctl(&s, &[&path, "send", "-n", "--hex", "c2 9b 32 4a ff"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    read_until(dev.master.as_fd(), b"J\xff", T);
+    shown(&s, b"\x1b[0m\r\n[ctl] \\x9b2J\\xff\x1b[0m\r\n");
+    let long = "\u{e9}".repeat(125);
+    let o = ctl(&s, &[&path, "send", "-n", &long]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let mut want = b"\x1b[0m\r\n[ctl] ".to_vec();
+    want.extend_from_slice("\u{e9}".repeat(100).as_bytes());
+    want.extend_from_slice(b"... (250 bytes)\x1b[0m\r\n");
+    shown(&s, &want);
+}
+
+#[test]
+fn a_marker_waits_for_the_device_to_finish_a_sequence() {
+    let (dev, s, path) = start(&[]);
+    write_all(dev.master.as_fd(), b"\x1b[1;");
+    shown(&s, b"\x1b[1;");
+    let o = ctl(&s, &[&path, "send", "x"]);
+    // At once: the marker waits MARKER_WAIT (100 ms) at most.
+    write_all(dev.master.as_fd(), b"31mred");
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // The rest of the device's sequence comes first, the marker after it;
+    // then the device's bold red is given back.
+    let got = read_until(s.host.master.as_fd(), b"[ctl] x^M\x1b[0m\x1b[1;31m\r\n", T);
+    let got = String::from_utf8_lossy(&got);
+    let red = got.find("31mred").expect(&got);
+    assert!(red < got.find("[ctl]").unwrap(), "{got:?}");
+    // A sequence that never ends holds it back only a while; CAN ends it.
+    write_all(dev.master.as_fd(), b"\x1b[2;");
+    shown(&s, b"\x1b[2;");
+    let o = ctl(&s, &[&path, "send", "y"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    shown(&s, b"\x18\x1b[0;2m\r\n[ctl] y^M\x1b[0m\x1b[1;31m\r\n");
+}
+
+#[test]
+fn markers_for_a_terminal_nobody_reads_do_not_stop_the_session() {
+    let (dev, s, path) = start(&[]);
+    // The device takes what is sent; the terminal is not read.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let device = {
+        let master = dev.master.try_clone().unwrap();
+        let fl = rustix::fs::fcntl_getfl(&master).unwrap();
+        rustix::fs::fcntl_setfl(&master, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if rustix::io::read(master.as_fd(), &mut buf).is_err() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        })
+    };
+    // About 100 KiB of markers: more than a pty holds.
+    let text = "m".repeat(190);
+    for i in 0..500 {
+        let o = ctl(&s, &[&path, "send", &format!("{i:03}{text}")]);
+        assert_eq!(o.status.code(), Some(0), "send {i}: {}", stderr(&o));
+    }
+    let t = std::time::Instant::now();
+    let o = ctl(&s, &[&path, "status"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    // Device output now waits for the markers begun before it.
+    write_all(dev.master.as_fd(), b"AFTER");
+    // Read now: what was held shows, the rest as a count, then the device.
+    let got = read_until(s.host.master.as_fd(), b"AFTER", T);
+    let got = String::from_utf8_lossy(&got);
+    assert!(
+        got.contains("[ctl] 000mmm"),
+        "{}",
+        &got[..200.min(got.len())]
+    );
+    let count = got
+        .find("more sends not shown)\x1b[0m\r\n")
+        .expect("the count");
+    assert!(count < got.find("AFTER").unwrap());
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    device.join().unwrap();
 }

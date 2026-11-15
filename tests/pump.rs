@@ -90,7 +90,7 @@ fn closed_input_with_a_full_queue_does_not_spin() {
     let reason = pump(
         &Pump {
             stdin: Some(in_r.as_fd()),
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -142,7 +142,7 @@ fn sigterm_ends_the_session_while_a_nonblocking_terminal_is_stalled() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -208,7 +208,7 @@ fn sigterm_ends_the_session_while_a_blocking_terminal_is_stalled() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -248,7 +248,7 @@ fn a_terminal_that_goes_away_ends_the_session_as_gone() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: slave.as_fd(),
+            stdout: Some(slave.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -278,7 +278,7 @@ fn a_pipe_reader_that_leaves_ends_the_session_as_gone() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -325,7 +325,7 @@ fn end_of_input_waits_until_everything_reached_the_device() {
     let reason = pump(
         &Pump {
             stdin: Some(in_r.as_fd()),
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -373,7 +373,7 @@ fn a_sigtstp_caught_before_the_stop_does_not_stop_again() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -427,7 +427,7 @@ fn a_sigtstp_after_the_continue_stops_again() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -480,7 +480,7 @@ fn the_ring_gets_device_bytes_as_read_whatever_is_shown() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -523,7 +523,7 @@ fn the_ring_gets_bytes_whose_terminal_write_ended_the_session() {
     let reason = pump(
         &Pump {
             stdin: None,
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: None,
@@ -601,7 +601,7 @@ fn a_key_typed_with_a_client_action_in_hand_waits_for_it() {
     let reason = pump(
         &Pump {
             stdin: Some(in_r.as_fd()),
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: device.as_fd(),
             signals: &signals,
             prefix: Some((

@@ -247,6 +247,11 @@ pub struct TermOpts {
     pub ring_size: usize,
     /// `--ctl`: what the control socket allows.
     pub ctl: crate::ctl::CtlMode,
+    /// `--headless`: no terminal; the control socket is the only way in.
+    pub headless: bool,
+    /// Show what control clients send in the terminal (`--no-ctl-marker`
+    /// turns it off).
+    pub ctl_marker: bool,
 }
 
 /// What `xcomm ctl` sends.
@@ -375,6 +380,7 @@ xcomm {version}: a serial terminal
 
 Usage:
   xcomm [options] <device>
+  xcomm --headless [options] <device>
   xcomm ctl [--json] <device> status|send|read|wait|run ...
   xcomm ctl [--json] sessions
   xcomm --show-prefix [--prefix <key> | -m]
@@ -414,6 +420,11 @@ Display:
 Control socket (for scripts and agents, from another terminal):
   --ctl rw|ro|off            what the session's socket allows: everything,
                              status and read only, or no socket (default rw)
+  --headless                 no terminal: device output goes only to the
+                             socket's clients and -C; runs until SIGTERM,
+                             SIGINT or SIGHUP (not with --ctl off)
+  --no-ctl-marker            do not show what clients send as a dim
+                             [ctl] line in the terminal
   xcomm ctl <device> status  port, settings, modem lines and offsets
   xcomm ctl <device> send <text>
                              send <text> and Enter (CR); -n for no line
@@ -1083,6 +1094,8 @@ pub fn parse(
     let mut capture: Option<PathBuf> = None;
     let mut ring_size: Option<usize> = None;
     let mut ctl: Option<crate::ctl::CtlMode> = None;
+    let mut headless = false;
+    let mut ctl_marker = true;
     let mut show_prefix = false;
     let mut version = false;
     let mut help = false;
@@ -1168,6 +1181,8 @@ pub fn parse(
             Short('o') => no_init = true,
             Long("no-lock") => no_lock = true,
             Long("low-latency") => low_latency = true,
+            Long("headless") => headless = true,
+            Long("no-ctl-marker") => ctl_marker = false,
             Long("ctl") => {
                 let v = choose(
                     &text(p.value()?, "--ctl")?,
@@ -1278,6 +1293,13 @@ pub fn parse(
     let Some(device) = device else {
         return Err(CliError(USAGE.into()));
     };
+    let ctl = ctl.unwrap_or(crate::ctl::CtlMode::ReadWrite);
+    if headless && ctl == crate::ctl::CtlMode::Off {
+        return Err(CliError(
+            "--headless needs the control socket: with --ctl off nothing could reach the session"
+                .into(),
+        ));
+    }
     let prefix = resolve_prefix(prefix, env)?;
     let defaults = LineSettings::default();
     Ok(Command::Term(TermOpts {
@@ -1298,6 +1320,8 @@ pub fn parse(
         color: color.unwrap_or(ColorMode::Auto),
         capture,
         ring_size: ring_size.unwrap_or(DEFAULT_RING_SIZE),
-        ctl: ctl.unwrap_or(crate::ctl::CtlMode::ReadWrite),
+        ctl,
+        headless,
+        ctl_marker,
     }))
 }

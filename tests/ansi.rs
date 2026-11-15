@@ -1,4 +1,7 @@
-use xcomm::ansi::{EscapeStripper, SGR_HELD_MAX, SgrFilter, color_enabled, device_color_enabled};
+use xcomm::ansi::{
+    EscapeStripper, SGR_HELD_MAX, SgrFilter, color_enabled, device_color_enabled, ends_inside,
+    term_state,
+};
 use xcomm::cli::ColorMode;
 
 fn sgr(chunks: &[&[u8]]) -> Vec<u8> {
@@ -311,4 +314,67 @@ fn device_color_ignores_no_color() {
     assert!(!device_color_enabled(ColorMode::Auto, false, &none));
     assert!(device_color_enabled(ColorMode::Always, false, &dumb));
     assert!(!device_color_enabled(ColorMode::Never, true, &none));
+}
+
+#[test]
+fn ends_inside_sequences_and_characters() {
+    for t in [
+        &b"text\x1b"[..],
+        b"text\x1b[",
+        b"text\x1b[1;3",
+        b"\x1b]0;title",
+        b"\x1b]0;title\x1b",
+        b"\x1bP1$r",
+        "caf\u{e9}".as_bytes().split_last().unwrap().1,
+        &"\u{65e5}".as_bytes()[..2],
+        &"\u{1f600}".as_bytes()[..3],
+    ] {
+        assert!(ends_inside(t), "{t:?}");
+    }
+    for t in [
+        &b""[..],
+        b"plain",
+        b"\x1b[1;31mred",
+        b"\x1b[0m",
+        b"\x1b]0;title\x07",
+        b"\x1b]0;title\x1b\\",
+        b"\x1b(B",
+        "caf\u{e9}".as_bytes(),
+        "\u{1f600}".as_bytes(),
+        b"\x1b[31\x18",
+    ] {
+        assert!(!ends_inside(t), "{t:?}");
+    }
+}
+
+#[test]
+fn term_state_gives_the_sgr_since_the_last_reset() {
+    let st = term_state(b"\x1b[31mred\x1b[0mplain\x1b[1mbold\x1b[4;32mgreen");
+    assert_eq!(st.sgr, b"\x1b[1m\x1b[4;32m");
+    assert!(!st.inside);
+    // A reset with more after it is kept: it sets those.
+    assert_eq!(term_state(b"\x1b[31mx\x1b[0;1my").sgr, b"\x1b[0;1m");
+    assert_eq!(term_state(b"\x1b[31mx\x1b[;7my").sgr, b"\x1b[;7m");
+    assert_eq!(term_state(b"\x1b[31mx\x1b[my").sgr, b"");
+    assert_eq!(term_state(b"\x1b[31mx\x1b[00my").sgr, b"");
+    // Not SGR: private, with intermediates, other finals; RIS resets.
+    assert_eq!(
+        term_state(b"\x1b[1m\x1b[?25m\x1b[1 m\x1b[2J").sgr,
+        b"\x1b[1m"
+    );
+    assert_eq!(term_state(b"\x1b[1m\x1bcx").sgr, b"");
+    // So does DECSTR.
+    assert_eq!(term_state(b"\x1b[1m\x1b[!p\x1b[4mx").sgr, b"\x1b[4m");
+    // An unfinished one is not kept, and is reported.
+    let st = term_state(b"\x1b[1m\x1b[3");
+    assert_eq!((st.sgr.as_slice(), st.inside), (&b"\x1b[1m"[..], true));
+    // Only the latest whole sequences, up to a bound.
+    let many = b"\x1b[1m".repeat(5000);
+    let st = term_state(&many);
+    assert!(
+        st.sgr.len() <= 16 << 10 && st.sgr.len() > (16 << 10) - 4,
+        "{}",
+        st.sgr.len()
+    );
+    assert!(st.sgr.starts_with(b"\x1b[1m"));
 }

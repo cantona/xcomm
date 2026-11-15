@@ -107,6 +107,13 @@ pub trait Control {
     /// Device bytes as read (after the terminal has them): the ring and
     /// the control socket's subscribers take them.
     fn device_output(&mut self, _bytes: &[u8]) {}
+    /// What xcomm began writing to the terminal and the terminal did not
+    /// take yet: it goes there before anything else.
+    fn take_unshown(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+    /// What `take_unshown` gave was cut short by the end of the session.
+    fn cut_unshown(&mut self) {}
     /// Whether queued bytes may be written to the device now: not into a
     /// client's break, nor while its action waits for the driver to send
     /// what came before it.
@@ -180,7 +187,8 @@ pub struct Pump<'a> {
     /// starts is reopened onto /dev/null by the Rust runtime, so it reads as
     /// end of input.)
     pub stdin: Option<BorrowedFd<'a>>,
-    pub stdout: BorrowedFd<'a>,
+    /// Where device output is shown; None when headless.
+    pub stdout: Option<BorrowedFd<'a>>,
     pub device: BorrowedFd<'a>,
     pub signals: &'a SignalPipe,
     /// The command prefix, when keyboard input is a terminal; None passes
@@ -394,6 +402,24 @@ fn write_out(
     })
 }
 
+/// Writes the rest of what xcomm began writing to the terminal, so that
+/// other output does not land inside it.
+fn finish_shown(
+    stdout: BorrowedFd<'_>,
+    p: &Pump<'_>,
+    ctl: &mut dyn Control,
+) -> Result<Signaled, SessionError> {
+    let rest = ctl.take_unshown();
+    if rest.is_empty() {
+        return Ok(Signaled::Nothing);
+    }
+    let r = write_out(stdout, &rest, p, ctl);
+    if matches!(r, Ok(Signaled::Exit(_))) {
+        ctl.cut_unshown();
+    }
+    r
+}
+
 /// Writes what is queued for the device, for up to QUIT_DRAIN: keys typed
 /// before a quit still go out, and a device that takes nothing (held off by
 /// flow control) cannot keep the session from ending. A termination signal
@@ -571,12 +597,17 @@ fn pump_with(
                 told_dropping = true;
                 ctl.dropping_input();
             }
-            if !echo.is_empty() {
-                let r = write_out(p.stdout, &echo, p, ctl)?;
+            if let Some(stdout) = p.stdout.filter(|_| !echo.is_empty()) {
+                let before = finish_shown(stdout, p, ctl)?;
+                if let Signaled::Exit(exit) = before {
+                    return Ok(exit);
+                }
+                let r = write_out(stdout, &echo, p, ctl)?;
                 echo.clear();
                 match r {
                     Signaled::Exit(exit) => return Ok(exit),
                     Signaled::Resumed => continue,
+                    Signaled::Nothing if matches!(before, Signaled::Resumed) => continue,
                     Signaled::Nothing => {}
                 }
             }
@@ -615,21 +646,29 @@ fn pump_with(
                         }
                         _ => {}
                     }
-                    let shown = match sgr.as_mut() {
-                        None => &buf[..n],
-                        Some(f) => {
+                    let before = match p.stdout {
+                        Some(stdout) => finish_shown(stdout, p, ctl)?,
+                        None => Signaled::Nothing,
+                    };
+                    if let Signaled::Exit(exit) = before {
+                        return Ok(exit);
+                    }
+                    let shown = match (p.stdout, sgr.as_mut()) {
+                        (None, _) => Ok(Signaled::Nothing),
+                        (Some(stdout), None) => write_out(stdout, &buf[..n], p, ctl),
+                        (Some(stdout), Some(f)) => {
                             filtered.clear();
                             f.filter(&buf[..n], &mut filtered);
-                            &filtered
+                            write_out(stdout, &filtered, p, ctl)
                         }
                     };
-                    let shown = write_out(p.stdout, shown, p, ctl);
                     // After the terminal has them, whatever the write did,
                     // as the capture has them: raw, as read.
                     ctl.device_output(&buf[..n]);
                     match shown? {
                         Signaled::Exit(exit) => return Ok(exit),
                         Signaled::Resumed => continue,
+                        Signaled::Nothing if matches!(before, Signaled::Resumed) => continue,
                         Signaled::Nothing => {}
                     }
                 }
@@ -690,8 +729,11 @@ fn pump_with(
                                 told_dropping = true;
                                 ctl.dropping_input();
                             }
-                            if !echo.is_empty() {
-                                let r = write_out(p.stdout, &echo, p, ctl)?;
+                            if let Some(stdout) = p.stdout.filter(|_| !echo.is_empty()) {
+                                if let Signaled::Exit(exit) = finish_shown(stdout, p, ctl)? {
+                                    return Ok(exit);
+                                }
+                                let r = write_out(stdout, &echo, p, ctl)?;
                                 echo.clear();
                                 if let Signaled::Exit(exit) = r {
                                     return Ok(exit);
@@ -926,7 +968,9 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
 
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let raw = if rustix::termios::isatty(stdin.as_fd()) {
+    // Headless: neither read nor written, whatever they are.
+    let shown = (!opts.headless).then(|| stdout.as_fd());
+    let raw = if !opts.headless && rustix::termios::isatty(stdin.as_fd()) {
         match enter_raw(stdin.as_fd(), &signals)? {
             Some(raw) => Some(raw),
             // Ended by a signal before the session started.
@@ -961,29 +1005,38 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         None => {}
     }
     notices.say(&banner(&path, opts, &port, applied, low_latency, keys_on));
+    if opts.headless
+        && let Some(server) = &server
+    {
+        notices.say(&format!(
+            "headless session on {}, socket {}",
+            path.display(),
+            server.path().display()
+        ));
+    }
     if let Some(c) = &capture {
         notices.say(&format!("capturing to {}", c.path().display()));
     }
 
     let stderr = io::stderr();
-    let stdin_fd = readable(stdin.as_fd()).then_some(stdin.as_fd());
+    let stdin_fd = (!opts.headless && readable(stdin.as_fd())).then_some(stdin.as_fd());
     // Piped input read but not yet written is lost when the device goes
     // away, so going on after it comes back would leave a hole in the
     // stream: a disconnect ends such a session, as it always did.
     let piped = !keys_on && stdin_fd.is_some();
     let prefix = keys_on.then_some((opts.prefix.key, opts.prefix_time));
-    let strip_color = !crate::ansi::device_color_enabled(
-        opts.color,
-        rustix::termios::isatty(stdout.as_fd()),
-        env,
-    );
+    let color =
+        crate::ansi::device_color_enabled(opts.color, rustix::termios::isatty(stdout.as_fd()), env);
+    let strip_color = !color;
+    // What control clients send, shown in the terminal the user watches.
+    let marker = (opts.ctl_marker && shown.is_some_and(rustix::termios::isatty)).then_some(color);
     let names = commands::Names {
         device: path.display().to_string(),
         stable: stable.display().to_string(),
         tty: tty.clone(),
         herdr_pane: env("HERDR_PANE_ID").filter(|p| !p.is_empty()),
     };
-    let mut kept = commands::Kept::new(capture, ring, server, names);
+    let mut kept = commands::Kept::new(capture, ring, server, names, marker);
     let mut port_tty = port.tty_name().to_string();
     // Taken at the open: a descriptor revoked by a hangup cannot be asked
     // (macOS fstat fails on it).
@@ -996,7 +1049,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             raw.as_ref(),
             Some(&port),
             opts,
-            stdout.as_fd(),
+            shown,
             stderr.as_fd(),
             &signals,
             kept,
@@ -1006,7 +1059,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         }
         let pump_io = Pump {
             stdin: stdin_fd,
-            stdout: stdout.as_fd(),
+            stdout: shown,
             device: port.fd(),
             signals: &signals,
             prefix,
@@ -1035,7 +1088,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             raw.as_ref(),
             None,
             opts,
-            stdout.as_fd(),
+            shown,
             stderr.as_fd(),
             &signals,
             kept,

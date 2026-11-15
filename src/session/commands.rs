@@ -194,6 +194,22 @@ pub(super) struct Live<'a> {
     ui_cancel: &'static str,
     /// stdout when it is a terminal: where line wrap is switched.
     screen: Option<BorrowedFd<'a>>,
+    /// Show what control clients send on `screen`, dim when true.
+    marker: Option<bool>,
+    /// Markers not shown yet: the device's output stopped inside an escape
+    /// sequence or a character. Since when, to show them anyway later.
+    markers: Vec<u8>,
+    markers_since: Option<Instant>,
+    /// The rest of markers a signal cut short, written as they are next.
+    unshown: std::cell::RefCell<Vec<u8>>,
+    /// Sends not shown: the markers waiting had reached MARKERS_MAX.
+    unmarked: usize,
+    /// When to try `unshown` again, and the wait after that: longer while
+    /// the terminal takes nothing.
+    retry_at: Option<Instant>,
+    retry: Duration,
+    /// No terminal at all (`--headless`).
+    headless: bool,
     signals: &'a SignalPipe,
     echo: bool,
     /// Line wrap as xcomm last set it; terminals start with it on.
@@ -227,6 +243,8 @@ pub(super) struct Kept {
     server: Option<CtlServer>,
     names: Names,
     lines: (Option<bool>, Option<bool>),
+    /// Show what control clients send, dim when true.
+    marker: Option<bool>,
 }
 
 impl Kept {
@@ -235,6 +253,7 @@ impl Kept {
         ring: Ring,
         server: Option<CtlServer>,
         names: Names,
+        marker: Option<bool>,
     ) -> Kept {
         Kept {
             echo: false,
@@ -244,6 +263,7 @@ impl Kept {
             server,
             names,
             lines: (None, None),
+            marker,
         }
     }
 }
@@ -339,6 +359,11 @@ struct View<'v> {
     transferring: bool,
     /// Where sent bytes go, or the reply code why they cannot.
     queue: Result<&'v mut OutQueue, u8>,
+    /// Whether to show sent bytes, dim when true, and where they wait to
+    /// be shown.
+    marker: Option<bool>,
+    markers: &'v mut Vec<u8>,
+    unmarked: &'v mut usize,
 }
 
 impl ctl::server::Session for View<'_> {
@@ -389,6 +414,144 @@ impl ctl::server::Session for View<'_> {
             Err(code) => Err((*code, why_not(*code).into())),
         }
     }
+
+    fn sent(&mut self, bytes: &[u8]) {
+        if self.marker.is_none() {
+            return;
+        }
+        if self.markers.len() < MARKERS_MAX {
+            marker_line(bytes, self.markers);
+        } else {
+            *self.unmarked += 1;
+        }
+    }
+}
+
+/// Best effort: a terminal that is gone is noticed by the loop. A signal
+/// gives up on the rest, so it is acted on without waiting for a terminal
+/// that is not being read. Returns how much was written.
+fn write_all_to(fd: BorrowedFd<'_>, signals: &SignalPipe, mut bytes: &[u8]) -> usize {
+    let all = bytes.len();
+    while !bytes.is_empty() {
+        match rustix::io::write(fd, bytes) {
+            Ok(n) => {
+                bytes = &bytes[n..];
+                // A caught signal can end a blocked write early with a short
+                // count instead of EINTR.
+                if !bytes.is_empty() && signal_waiting(signals) {
+                    return all - bytes.len();
+                }
+            }
+            Err(rustix::io::Errno::INTR) => {
+                if signal_waiting(signals) {
+                    return all - bytes.len();
+                }
+            }
+            // Non-blocking (set so by another program): wait for room.
+            Err(rustix::io::Errno::AGAIN) => {
+                let signal_fd = signals.fd();
+                let mut fds = [
+                    PollFd::new(&fd, PollFlags::OUT),
+                    PollFd::new(&signal_fd, PollFlags::IN),
+                ];
+                if poll(&mut fds, None).is_err() || fds[1].revents().contains(PollFlags::IN) {
+                    return all - bytes.len();
+                }
+            }
+            Err(_) => return all - bytes.len(),
+        }
+    }
+    all
+}
+
+/// Writes what the terminal takes until `until` (now: what it has room
+/// for), in pieces small enough not to block on it, and returns how much.
+/// A signal waiting ends it.
+fn write_within(fd: BorrowedFd<'_>, signals: &SignalPipe, bytes: &[u8], until: Instant) -> usize {
+    let mut done = 0;
+    let signal_fd = signals.fd();
+    for piece in bytes.chunks(64) {
+        let mut fds = [
+            PollFd::new(&fd, PollFlags::OUT),
+            PollFd::new(&signal_fd, PollFlags::IN),
+        ];
+        let wait =
+            rustix::event::Timespec::try_from(until.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+        let ready = matches!(poll(&mut fds, Some(&wait)), Ok(n) if n > 0)
+            && fds[0].revents().contains(PollFlags::OUT)
+            && !fds[1].revents().contains(PollFlags::IN);
+        if !ready {
+            break;
+        }
+        match rustix::io::write(fd, piece) {
+            Ok(n) => {
+                done += n;
+                if n < piece.len() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    done
+}
+
+fn signal_waiting(signals: &SignalPipe) -> bool {
+    let fd = signals.fd();
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    matches!(poll(&mut fds, Some(&rustix::event::Timespec::default())), Ok(n) if n > 0)
+}
+
+/// Most bytes of a send a marker shows.
+const MARKER_MAX: usize = 200;
+/// How soon the rest of a marker the terminal did not take is tried again,
+/// at first and at most.
+const MARKER_RETRY: Duration = Duration::from_millis(10);
+const MARKER_RETRY_MAX: Duration = Duration::from_secs(1);
+/// What ends a marker cut short at the end of the session: CAN ends a
+/// sequence it stopped in, and the reset undoes its dim.
+const END_CUT: &[u8] = b"\x18\x1b[0m\r\n";
+/// How long markers wait for the device's output to leave an escape
+/// sequence or a character before they are shown anyway.
+const MARKER_WAIT: Duration = Duration::from_millis(100);
+
+/// Most marker bytes waiting for a terminal that is not being read.
+const MARKERS_MAX: usize = 64 << 10;
+/// How much of the latest device output decides how a marker is shown.
+const MARKER_LOOK: u64 = 64 << 10;
+
+/// Appends `[ctl] <bytes>` on a new line to `out`: C0 controls as `^X`, C1
+/// controls and bytes that are not UTF-8 as `\xNN`, at most MARKER_MAX
+/// bytes of the send, cut between characters.
+fn marker_line(bytes: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\r\n[ctl] ");
+    let hex = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(format!("\\x{v:02x}").as_bytes());
+    let mut shown = 0;
+    'all: for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if shown + c.len_utf8() > MARKER_MAX {
+                break 'all;
+            }
+            shown += c.len_utf8();
+            match c {
+                '\0'..='\x1f' => out.extend_from_slice(&[b'^', c as u8 + 0x40]),
+                '\x7f' => out.extend_from_slice(b"^?"),
+                '\u{80}'..='\u{9f}' => hex(out, c as u32),
+                _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        }
+        for &b in chunk.invalid() {
+            if shown + 1 > MARKER_MAX {
+                break 'all;
+            }
+            shown += 1;
+            hex(out, b.into());
+        }
+    }
+    if shown < bytes.len() {
+        out.extend_from_slice(format!("... ({} bytes)", bytes.len()).as_bytes());
+    }
 }
 
 impl<'a> Live<'a> {
@@ -415,8 +578,12 @@ impl<'a> Live<'a> {
                 Ok(q) => Ok(&mut **q),
                 Err(code) => Err(*code),
             },
+            marker: self.marker,
+            markers: &mut self.markers,
+            unmarked: &mut self.unmarked,
         };
         server.serve(ready, &mut view);
+        self.show_markers();
         if self
             .hold
             .as_ref()
@@ -790,11 +957,12 @@ impl<'a> Live<'a> {
         raw: Option<&'a RawMode>,
         port: Option<&'a Port>,
         opts: &TermOpts,
-        stdout: BorrowedFd<'a>,
+        stdout: Option<BorrowedFd<'a>>,
         stderr: BorrowedFd<'a>,
         signals: &'a SignalPipe,
         kept: Kept,
     ) -> Live<'a> {
+        let screen = stdout.filter(|fd| rustix::termios::isatty(fd));
         Live {
             raw,
             port,
@@ -806,7 +974,15 @@ impl<'a> Live<'a> {
             } else {
                 ""
             },
-            screen: rustix::termios::isatty(stdout).then_some(stdout),
+            screen,
+            marker: kept.marker.filter(|_| screen.is_some()),
+            markers: Vec::new(),
+            markers_since: None,
+            unshown: std::cell::RefCell::new(Vec::new()),
+            unmarked: 0,
+            retry_at: None,
+            retry: MARKER_RETRY,
+            headless: opts.headless,
             signals,
             echo: kept.echo,
             wrap: kept.wrap,
@@ -823,6 +999,7 @@ impl<'a> Live<'a> {
     }
 
     pub(super) fn into_kept(mut self) -> Kept {
+        self.show_markers_now(true);
         self.end_hold(Some((
             ctl::code::DISCONNECTED,
             "the device went away during it".into(),
@@ -835,6 +1012,7 @@ impl<'a> Live<'a> {
             server: self.server,
             names: self.names,
             lines: self.lines,
+            marker: self.marker,
         }
     }
 
@@ -842,6 +1020,7 @@ impl<'a> Live<'a> {
     /// terminal.
     pub(super) fn finish(&mut self) {
         self.end_hold(Some((ctl::code::FAILED, "the session is ending".into())));
+        self.show_markers_now(true);
         if let Some(c) = self.capture.take() {
             let path = c.path().to_path_buf();
             if let Err(e) = c.close() {
@@ -915,30 +1094,126 @@ impl<'a> Live<'a> {
         }
     }
 
-    /// Best effort: a terminal that is gone is noticed by the loop. A signal
-    /// gives up on the rest, so it is acted on without waiting for a
-    /// terminal that is not being read.
-    fn write_to(&self, fd: BorrowedFd<'_>, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            match rustix::io::write(fd, bytes) {
-                Ok(n) => bytes = &bytes[n..],
-                // Non-blocking (set so by another program): wait for room.
-                Err(rustix::io::Errno::AGAIN) => {
-                    let signal_fd = self.signals.fd();
-                    let mut fds = [
-                        PollFd::new(&fd, PollFlags::OUT),
-                        PollFd::new(&signal_fd, PollFlags::IN),
-                    ];
-                    if poll(&mut fds, None).is_err() || fds[1].revents().contains(PollFlags::IN) {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
+    fn write_to(&self, fd: BorrowedFd<'_>, bytes: &[u8]) {
+        let _ = write_all_to(fd, self.signals, bytes);
+    }
+
+    /// Moves the markers waiting to `unshown`, framed, once the device's
+    /// output is between escape sequences and characters (it would take
+    /// them in otherwise), or when `force`d or MARKER_WAIT on, after CAN to
+    /// end what the device left unfinished. They are drawn plain or dim,
+    /// then the device's own attributes are given back: a reset and the
+    /// SGR sequences it sent since its last one.
+    fn frame_markers(&mut self, force: bool) {
+        if self.markers.is_empty() {
+            return;
+        }
+        let from = self
+            .ring
+            .end()
+            .saturating_sub(MARKER_LOOK)
+            .max(self.ring.oldest());
+        let mut tail = Vec::new();
+        if let Ok((a, b)) = self.ring.slices(from, MARKER_LOOK as usize) {
+            tail.reserve_exact(a.len() + b.len());
+            tail.extend_from_slice(a);
+            tail.extend_from_slice(b);
+        }
+        let state = crate::ansi::term_state(&tail);
+        let late = force
+            || self
+                .markers_since
+                .is_some_and(|t| t.elapsed() >= MARKER_WAIT);
+        if state.inside && !late {
+            self.markers_since.get_or_insert_with(Instant::now);
+            return;
+        }
+        self.markers_since = None;
+        let dim = self.marker == Some(true);
+        let out = self.unshown.get_mut();
+        if state.inside {
+            out.extend_from_slice(CANCEL.as_bytes());
+        }
+        out.extend_from_slice(if dim { b"\x1b[0;2m" } else { b"\x1b[0m" });
+        out.append(&mut self.markers);
+        if self.unmarked > 0 {
+            out.extend_from_slice(
+                format!("\r\n[ctl] ({} more sends not shown)", self.unmarked).as_bytes(),
+            );
+            self.unmarked = 0;
+        }
+        out.extend_from_slice(b"\x1b[0m");
+        if dim {
+            out.extend_from_slice(&state.sgr);
+        } else {
+            // Color is off: the device's attributes without their colors.
+            crate::ansi::SgrFilter::new().filter(&state.sgr, out);
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+
+    /// Writes the markers, framed, as far as the terminal takes them now:
+    /// a terminal nobody reads must not stop the session. At the end
+    /// (`force`) a slow one still gets a while, and what it does not take
+    /// gives way to CAN and a reset, so the terminal is not left dim or
+    /// inside a sequence.
+    fn show_markers_now(&mut self, force: bool) {
+        let Some(fd) = self.screen else {
+            self.markers.clear();
+            self.unshown.get_mut().clear();
+            return;
+        };
+        let until = Instant::now()
+            + if force {
+                MARKER_WAIT * 10
+            } else {
+                Duration::ZERO
+            };
+        // What was begun goes first, whole, before the next markers.
+        if self.unshown.get_mut().is_empty() {
+            self.frame_markers(force);
+        }
+        let rest = self.unshown.get_mut();
+        let mut wrote = write_within(fd, self.signals, rest, until);
+        rest.drain(..wrote);
+        if rest.is_empty() && !self.markers.is_empty() {
+            self.frame_markers(force);
+            let rest = self.unshown.get_mut();
+            let n = write_within(fd, self.signals, rest, until);
+            rest.drain(..n);
+            wrote += n;
+        }
+        let rest = self.unshown.get_mut();
+        if rest.is_empty() {
+            self.retry_at = None;
+            self.retry = MARKER_RETRY;
+        } else if force {
+            rest.clear();
+            let _ = write_within(fd, self.signals, END_CUT, until);
+        } else {
+            self.retry = if wrote > 0 {
+                MARKER_RETRY
+            } else {
+                (self.retry * 2).min(MARKER_RETRY_MAX)
+            };
+            self.retry_at = Some(Instant::now() + self.retry);
         }
     }
 
+    fn show_markers(&mut self) {
+        self.show_markers_now(false);
+    }
+
     fn write(&self, bytes: &[u8]) {
+        // Not into the middle of a marker on the same terminal: the rest
+        // goes first, as this write would wait for it.
+        if let Some(fd) = self.screen {
+            let mut rest = self.unshown.borrow_mut();
+            if !rest.is_empty() {
+                let n = write_all_to(fd, self.signals, &rest);
+                rest.drain(..n);
+            }
+        }
         self.write_to(self.ui, bytes);
     }
 
@@ -1179,20 +1454,26 @@ impl<'a> Live<'a> {
     ) -> Result<Result<(bool, String), ExitReason>, SessionError> {
         // Before the program starts: its first line comes at once.
         self.process_output(true);
-        let mut transfer = match Transfer::start(port, run.proto, run.dir, run.files, run.cwd) {
-            Ok(t) => t,
-            Err(e) => {
-                self.process_output(false);
-                let line = format!("transfer failed: {e}");
-                self.say_maybe_after_prompt(run.after_prompt, &line);
-                return Ok(Ok((false, line)));
-            }
-        };
+        // Headless, its progress would fill a pipe no one reads.
+        let progress = !self.headless;
+        let mut transfer =
+            match Transfer::start(port, run.proto, run.dir, run.files, run.cwd, progress) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.process_output(false);
+                    let line = format!("transfer failed: {e}");
+                    self.say_maybe_after_prompt(run.after_prompt, &line);
+                    return Ok(Ok((false, line)));
+                }
+            };
         let key = self.prefix.key.display();
         // With Ctrl-C as the prefix, Ctrl-C alone waits for the command key.
         let ctrl_c_prefix = self.prefix.key.modifier == crate::cli::Modifier::Ctrl
             && self.prefix.key.letter == b'c';
-        let how = if ctrl_c_prefix {
+        // Keys are read only from a terminal in raw mode.
+        let how = if self.raw.is_none() {
+            "closing the client aborts it".to_string()
+        } else if ctrl_c_prefix {
             format!("{key} x aborts")
         } else {
             format!("{key} x or Ctrl-C aborts")
@@ -1698,6 +1979,21 @@ impl Control for Live<'_> {
         if let Some(server) = &mut self.server {
             server.device_output(&self.ring);
         }
+        if !self.markers.is_empty() || !self.unshown.get_mut().is_empty() {
+            self.show_markers();
+        }
+    }
+
+    fn cut_unshown(&mut self) {
+        *self.unshown.get_mut() = END_CUT.to_vec();
+    }
+
+    fn take_unshown(&mut self) -> Vec<u8> {
+        // Markers for sends made before this output come before it too.
+        if self.screen.is_some() {
+            self.frame_markers(false);
+        }
+        std::mem::take(self.unshown.get_mut())
     }
 
     fn may_write(&self) -> bool {
@@ -1727,6 +2023,12 @@ impl Control for Live<'_> {
             .server
             .as_ref()
             .and_then(|server| server.poll_fds(self.ring.end(), out));
+        // A marker the terminal has not all taken goes on as soon as it can.
+        let markers_due = if self.unshown.borrow().is_empty() {
+            self.markers_since.map(|t| t + MARKER_WAIT)
+        } else {
+            self.retry_at
+        };
         let wait_due = self.action_wait.as_ref().map(|w| {
             let stalled = w.since + STALL;
             match w.phase {
@@ -1734,10 +2036,15 @@ impl Control for Live<'_> {
                 WaitPhase::Driver { .. } => stalled.min(Instant::now() + DRIVER_CHECK),
             }
         });
-        [server_due, self.hold.as_ref().map(|h| h.until), wait_due]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            server_due,
+            self.hold.as_ref().map(|h| h.until),
+            wait_due,
+            markers_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn ctl_serve(

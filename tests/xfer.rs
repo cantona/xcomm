@@ -711,3 +711,27 @@ fn closing_the_client_aborts_its_transfer() {
     drop(dev);
     let _ = std::fs::remove_dir_all(&here);
 }
+
+#[test]
+fn a_headless_transfer_names_no_keys() {
+    if need(&["rz"]).is_none() {
+        return;
+    }
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let s = support::spawn_xcomm(&["--headless", &path], &lock_dir("xfer"));
+    read_until(s.host.master.as_fd(), b"headless session on", T);
+    let mut client = ctl(&s, &[&path, "xfer", "recv", "zmodem"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    read_until(
+        s.host.master.as_fd(),
+        b"transfer started for a control client: rz (closing the client aborts it)",
+        T,
+    );
+    client.kill().unwrap();
+    client.wait().unwrap();
+    assert_eq!(outcome(&s), "transfer aborted");
+}

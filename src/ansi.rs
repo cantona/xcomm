@@ -405,6 +405,11 @@ impl EscapeStripper {
         }
     }
 
+    /// Whether the bytes so far end inside an escape sequence.
+    pub fn in_sequence(&self) -> bool {
+        self.state != Strip::Ground
+    }
+
     /// Appends `input` without its escape sequences to `out`: at most
     /// `input.len()` bytes.
     pub fn strip(&mut self, input: &[u8], out: &mut Vec<u8>) {
@@ -523,5 +528,113 @@ impl EscapeStripper {
                 i += 1;
             }
         }
+    }
+}
+
+/// Whether a stream whose latest bytes are `tail` stops inside an escape
+/// sequence or a UTF-8 character, so that text written to the terminal now
+/// would land in it. Only `tail` is looked at.
+pub fn ends_inside(tail: &[u8]) -> bool {
+    if let Some(esc) = memchr::memrchr(ESC, tail) {
+        // Any sequence begun before the last ESC ended at it.
+        let mut s = EscapeStripper::new();
+        let mut text = Vec::with_capacity(tail.len() - esc);
+        s.strip(&tail[esc..], &mut text);
+        if s.in_sequence() {
+            return true;
+        }
+    }
+    let from = tail.len().saturating_sub(3);
+    for (i, &b) in tail[from..].iter().enumerate().rev() {
+        if b & 0xc0 == 0x80 {
+            continue;
+        }
+        let need = match b {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return tail.len() - (from + i) < need;
+    }
+    false
+}
+
+/// Most SGR bytes `TermState` keeps: the latest, whole sequences.
+const SGR_REPLAY_MAX: usize = 16 << 10;
+
+/// What device output has left a terminal in, as far as its latest bytes
+/// tell: an attribute set before them, with no SGR since, is not known.
+pub struct TermState {
+    /// It stops inside an escape sequence or a UTF-8 character.
+    pub inside: bool,
+    /// The SGR sequences since the last reset: written after a reset, they
+    /// give the attributes back.
+    pub sgr: Vec<u8>,
+}
+
+/// The `TermState` after `tail`, the latest bytes of the output.
+pub fn term_state(tail: &[u8]) -> TermState {
+    let mut sgr: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut i = memchr::memchr(ESC, tail).unwrap_or(tail.len());
+    while let Some(p) = memchr::memchr(ESC, &tail[i..]) {
+        let at = i + p;
+        i = at + 1;
+        match tail.get(at + 1) {
+            // RIS resets everything.
+            Some(b'c') => sgr.clear(),
+            Some(b'[') => {
+                let params = at + 2;
+                let mut j = params;
+                while tail.get(j).is_some_and(|b| (0x30..=0x3f).contains(b)) {
+                    j += 1;
+                }
+                let plain = j;
+                while tail.get(j).is_some_and(|b| (0x20..=0x2f).contains(b)) {
+                    j += 1;
+                }
+                // DECSTR, a soft reset, resets the attributes too.
+                if &tail[plain..j] == b"!" && tail.get(j) == Some(&b'p') {
+                    sgr.clear();
+                    i = j + 1;
+                    continue;
+                }
+                if tail.get(j) != Some(&b'm') || plain != j {
+                    continue;
+                }
+                let p = &tail[params..plain];
+                if p.first()
+                    .is_some_and(|b| matches!(b, b'<' | b'=' | b'>' | b'?'))
+                {
+                    continue;
+                }
+                // An empty or zero first parameter resets first.
+                let first = p.split(|&b| b == b';' || b == b':').next().unwrap_or(b"");
+                let reset = first.iter().all(|&b| b == b'0');
+                if reset {
+                    sgr.clear();
+                }
+                // A reset alone adds nothing to replay after one.
+                if !(reset && first.len() == p.len()) {
+                    sgr.push(at..j + 1);
+                }
+                i = j + 1;
+            }
+            _ => {}
+        }
+    }
+    let mut keep = 0;
+    let mut start = sgr.len();
+    while start > 0 && keep + sgr[start - 1].len() <= SGR_REPLAY_MAX {
+        start -= 1;
+        keep += sgr[start].len();
+    }
+    let mut out = Vec::with_capacity(keep);
+    for r in &sgr[start..] {
+        out.extend_from_slice(&tail[r.clone()]);
+    }
+    TermState {
+        inside: ends_inside(tail),
+        sgr: out,
     }
 }

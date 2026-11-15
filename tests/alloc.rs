@@ -281,7 +281,7 @@ fn run_full(
     let reason = {
         let p = Pump {
             stdin: Some(in_r.as_fd()),
-            stdout: out_w.as_fd(),
+            stdout: Some(out_w.as_fd()),
             device: port_fd.as_fd(),
             signals: &signals,
             prefix,

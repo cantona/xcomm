@@ -55,6 +55,8 @@ pub trait Session {
     /// says how much. Fails with a reply code while the device cannot take
     /// any (disconnected, a file transfer running).
     fn send(&mut self, bytes: &[u8]) -> Result<usize, (u8, String)>;
+    /// All of a client's send has been taken for the device.
+    fn sent(&mut self, _bytes: &[u8]) {}
 }
 
 pub struct CtlServer {
@@ -357,6 +359,9 @@ impl Client {
             Ok(n) => {
                 sending.done += n;
                 if sending.done == sending.bytes.len() {
+                    if !sending.bytes.is_empty() {
+                        s.sent(&sending.bytes);
+                    }
                     let offset = sending.offset;
                     self.sending = None;
                     self.reply(proto::ok(serde_json::json!({ "offset": offset })));
