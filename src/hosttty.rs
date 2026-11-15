@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
-use rustix::termios::{InputModes, OptionalActions, Termios, tcgetattr, tcsetattr};
+use rustix::termios::{InputModes, OptionalActions, OutputModes, Termios, tcgetattr, tcsetattr};
 
 /// The terminal state to restore if the process dies in raw mode.
 ///
@@ -286,6 +286,26 @@ impl RawMode {
         self.active.set(true);
         ARMED.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Turns output processing (OPOST, ONLCR) on or off in raw mode, for a
+    /// program that shares the terminal and ends its lines with LF only.
+    /// Nothing while suspended.
+    pub fn process_output(&self, on: bool) -> io::Result<()> {
+        if !self.active.get() {
+            return Ok(());
+        }
+        let mut t = self.raw.clone();
+        if on {
+            t.output_modes
+                .insert(OutputModes::OPOST | OutputModes::ONLCR);
+        }
+        tcsetattr(&self.fd, OptionalActions::Now, &t).map_err(|e| {
+            context(
+                e,
+                format_args!("tcsetattr (output) on fd {}", self.fd.as_raw_fd()),
+            )
+        })
     }
 
     /// Gives the terminal back (a job-control stop). Until `reenter`, the

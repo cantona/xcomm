@@ -142,11 +142,14 @@ const TERMINATE: [i32; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 /// their default action: a session in the background stops when it touches
 /// the terminal, until brought back to the foreground. A signal the parent
 /// set to be ignored stays ignored (`nohup` ignores SIGHUP; a script's
-/// background job ignores SIGINT).
+/// background job ignores SIGINT). SIGCHLD, which ends a file transfer's
+/// wait, is taken even then: ignored, the kernel would reap the transfer
+/// program itself and its exit status would be lost.
 pub fn signals() -> Vec<i32> {
     [TERMINATE[0], TERMINATE[1], TERMINATE[2], libc::SIGTSTP]
         .into_iter()
         .filter(|&sig| !crate::hosttty::ignored(sig))
+        .chain([libc::SIGCHLD])
         .collect()
 }
 

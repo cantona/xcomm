@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
@@ -13,8 +13,9 @@ use super::{CommandIo, CommandOutcome, Control, ExitReason, SessionError, Signal
 use crate::capture::Capture;
 use crate::cli::{LineSettings, PrefixChoice, TermOpts};
 use crate::hosttty::{RawMode, SignalPipe};
-use crate::keys::{self, EscKey, HELD_MAX};
+use crate::keys::{self, EscKey, HELD_MAX, KeyAction, KeyParser};
 use crate::port::{self, Applied, ModemLines, Port};
+use crate::xfer::{Direction, Proto, Transfer, XferError};
 
 const ESC: u8 = 0x1b;
 const BREAK_MS: u32 = 250;
@@ -30,6 +31,15 @@ const BAUD_MAX: usize = 32;
 /// Longest file name answer, in bytes.
 const PATH_MAX: usize = 1024;
 const DEFAULT_CAPTURE: &str = "xcomm.cap";
+/// Longest protocol answer.
+const PROTO_MAX: usize = 8;
+const CTRL_C: u8 = 0x03;
+/// How long an aborted transfer program gets to stop before SIGKILL.
+const ABORT_GRACE: Duration = Duration::from_secs(2);
+/// How often a transfer's end is looked for without a SIGCHLD.
+const CHILD_CHECK: Duration = Duration::from_millis(500);
+/// How long a transfer program gets when the session is ending.
+const EXIT_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 enum Cmd {
@@ -43,6 +53,8 @@ enum Cmd {
     Echo,
     Wrap,
     Capture,
+    Send,
+    Receive,
 }
 
 /// The keys after the prefix, in the order help lists them.
@@ -58,6 +70,8 @@ const COMMANDS: &[(u8, Cmd, &str)] = &[
     (b'e', Cmd::Echo, "toggle local echo"),
     (b'w', Cmd::Wrap, "toggle line wrap"),
     (b'l', Cmd::Capture, "start or stop capture"),
+    (b's', Cmd::Send, "send a file (zmodem, ymodem, xmodem)"),
+    (b'r', Cmd::Receive, "receive files (zmodem, ymodem, xmodem)"),
 ];
 
 enum Key {
@@ -102,6 +116,29 @@ fn pop_char(line: &mut Vec<u8>) -> bool {
     }
 }
 
+/// Asks the transfer program to stop, unless it has already ended (its own
+/// exit status is then the result, not an abort). When it was asked.
+fn start_abort(transfer: &mut Transfer<'_>) -> Option<Instant> {
+    match transfer.try_finish() {
+        Ok(None) => {
+            transfer.abort();
+            Some(Instant::now())
+        }
+        _ => None,
+    }
+}
+
+/// Whether forwarded bytes hold Ctrl-C: the byte, or the key coded as
+/// modifyOtherKeys or CSI-u.
+fn has_ctrl_c(bytes: &[u8]) -> bool {
+    bytes.contains(&CTRL_C)
+        || (0..bytes.len()).any(|i| {
+            bytes[i] == ESC
+                && matches!(keys::escape_key(&bytes[i..]),
+                    EscKey::Done { key, .. } if keys::plain_byte(key) == Some(CTRL_C))
+        })
+}
+
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
@@ -127,6 +164,9 @@ pub(super) struct Live<'a> {
     /// Line wrap as xcomm last set it; terminals start with it on.
     wrap: bool,
     capture: Option<Capture>,
+    /// The last prompt of this command ended on CR: an LF right after it is
+    /// the rest of that Enter (a terminal sending CR LF), not an answer.
+    cr_ended: bool,
 }
 
 impl<'a> Live<'a> {
@@ -155,6 +195,7 @@ impl<'a> Live<'a> {
             echo: false,
             wrap: true,
             capture,
+            cr_ended: false,
         };
         if opts.wrap {
             live.set_wrap(true);
@@ -382,6 +423,228 @@ impl<'a> Live<'a> {
         Ok(CommandOutcome::Continue)
     }
 
+    /// Asks for the protocol and the file, then runs lrzsz on the port
+    /// until it ends. The device is not read meanwhile: its bytes are the
+    /// program's. Keys are dropped, except the prefix and `x` (or `q`) or
+    /// Ctrl-C, which abort the transfer.
+    fn transfer(
+        &mut self,
+        dir: Direction,
+        io: &mut CommandIo<'_>,
+    ) -> Result<CommandOutcome, SessionError> {
+        let line = match self.prompt(
+            "protocol (zmodem, ymodem, xmodem) [zmodem]: ",
+            PROTO_MAX,
+            false,
+            io,
+        )? {
+            Prompt::Line(line) => String::from_utf8_lossy(&line).into_owned(),
+            Prompt::Cancelled => return Ok(CommandOutcome::Continue),
+            Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
+        };
+        let proto = if line.is_empty() {
+            Proto::Zmodem
+        } else {
+            match Proto::parse(&line) {
+                Some(proto) => proto,
+                None => {
+                    self.say_after_prompt(&format!("unknown protocol '{line}'"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            }
+        };
+        // ZMODEM and YMODEM receivers take the names from the sender.
+        let ask = match (dir, proto) {
+            (Direction::Send, _) => Some("file to send: "),
+            (Direction::Receive, Proto::Xmodem) => Some("save as: "),
+            (Direction::Receive, _) => None,
+        };
+        let mut files = Vec::new();
+        if let Some(text) = ask {
+            match self.prompt(text, PATH_MAX, true, io)? {
+                Prompt::Line(line) if line.is_empty() => return Ok(CommandOutcome::Continue),
+                Prompt::Line(line) => files.push(PathBuf::from(OsString::from_vec(line))),
+                Prompt::Cancelled => return Ok(CommandOutcome::Continue),
+                Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
+            }
+        }
+        // Before the program starts: its first line comes at once.
+        self.process_output(true);
+        let mut transfer = match Transfer::start(self.port, proto, dir, &files, Path::new(".")) {
+            Ok(t) => t,
+            Err(e) => {
+                self.process_output(false);
+                self.say_after_prompt(&format!("transfer failed: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
+        };
+        let key = self.prefix.key.display();
+        // With Ctrl-C as the prefix, Ctrl-C alone waits for the command key.
+        let ctrl_c_prefix = self.prefix.key.modifier == crate::cli::Modifier::Ctrl
+            && self.prefix.key.letter == b'c';
+        let how = if ctrl_c_prefix {
+            format!("{key} x aborts")
+        } else {
+            format!("{key} x or Ctrl-C aborts")
+        };
+        self.say_after_prompt(&format!("transfer started: {} ({how})", transfer.program()));
+        let ended = self.wait_transfer(&mut transfer, io);
+        if let Err(e) = transfer.release() {
+            self.say(&format!("after the transfer: port: {e}"));
+        }
+        self.process_output(false);
+        // lrzsz switches the port's modes while it runs; one killed cannot
+        // put them back. Before the result, which means it is all over.
+        let settings = self.port.settings();
+        if let Err(e) = self.port.configure(&settings) {
+            self.say(&format!("after the transfer: {e}"));
+        }
+        match ended? {
+            Ok(result) => {
+                self.say(&result);
+                Ok(CommandOutcome::Continue)
+            }
+            Err(exit) => Ok(CommandOutcome::Exit(exit)),
+        }
+    }
+
+    /// lrzsz ends its progress lines with LF only.
+    fn process_output(&self, on: bool) {
+        if let Some(Err(e)) = self.raw.map(|r| r.process_output(on)) {
+            self.say(&format!("terminal: {e}"));
+        }
+    }
+
+    /// Waits for the transfer program to end. Gives the line saying how it
+    /// went, or why the session ends.
+    fn wait_transfer(
+        &mut self,
+        transfer: &mut Transfer<'_>,
+        io: &mut CommandIo<'_>,
+    ) -> Result<Result<String, ExitReason>, SessionError> {
+        let mut keys = KeyParser::new(self.prefix.key, self.prefix_time);
+        // Keys typed after the command key are dropped too, unless they abort.
+        let mut typed = std::mem::take(&mut io.typed);
+        let mut stdin_open = true;
+        let mut aborted: Option<Instant> = None;
+        let signal_fd = io.signals.fd();
+        let mut buf = [0u8; 256];
+        loop {
+            match transfer.try_finish() {
+                // Done before the abort took effect: done.
+                Ok(Some(_)) => return Ok(Ok(format!("transfer done: {}", transfer.program()))),
+                Err(XferError::Failed { .. }) if aborted.is_some() => {
+                    return Ok(Ok("transfer aborted".into()));
+                }
+                Err(e) => return Ok(Ok(format!("transfer failed: {e}"))),
+                Ok(None) => {}
+            }
+            if aborted.is_some_and(|t| t.elapsed() >= ABORT_GRACE) {
+                transfer.kill();
+                continue;
+            }
+            let mut abort = false;
+            while !typed.is_empty() {
+                let mut command = None;
+                let used = keys.feed(typed, Instant::now(), &mut |a| match a {
+                    KeyAction::Forward(b) => abort |= has_ctrl_c(b),
+                    KeyAction::Command(c) => command = Some(c),
+                });
+                typed = &typed[used..];
+                abort |= matches!(command, Some(b'x' | b'q'));
+            }
+            if abort && aborted.is_none() {
+                aborted = start_abort(transfer);
+            }
+            // SIGCHLD wakes the loop, unless the parent left it blocked:
+            // look now and then anyway.
+            let due = [
+                keys.deadline(),
+                aborted.map(|t| t + ABORT_GRACE),
+                Some(Instant::now() + CHILD_CHECK),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let timeout = due.map(|due| {
+                rustix::event::Timespec::try_from(due.saturating_duration_since(Instant::now()))
+                    .expect("under ABORT_GRACE")
+            });
+            let (stdin_slot, stdin_events) = if stdin_open {
+                (io.stdin, PollFlags::IN)
+            } else {
+                (signal_fd, PollFlags::empty())
+            };
+            let mut fds = [
+                PollFd::new(&signal_fd, PollFlags::IN),
+                PollFd::new(&stdin_slot, stdin_events),
+            ];
+            match poll(&mut fds, timeout.as_ref()) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(SessionError(format!("poll: {e}"))),
+            }
+            // A lone ESC held past its time is a key like any other here.
+            keys.on_deadline(Instant::now(), &mut |a| {
+                if let KeyAction::Forward(b) = a {
+                    abort |= has_ctrl_c(b);
+                }
+            });
+            if fds[0].revents().contains(PollFlags::IN) {
+                // SIGCHLD only wakes the loop; try_finish looks.
+                let bits = io
+                    .signals
+                    .drain()
+                    .map_err(|e| SessionError(e.to_string()))?;
+                let signaled = on_signals(bits, io.signals, self)?;
+                if let Signaled::Resumed = signaled {
+                    // Raw mode came back as it was entered. Readiness seen
+                    // before the stop is stale (the shell may have read the
+                    // key): poll again.
+                    self.process_output(true);
+                    if abort && aborted.is_none() {
+                        aborted = start_abort(transfer);
+                    }
+                    continue;
+                }
+                if let Signaled::Exit(exit) = signaled {
+                    transfer.abort();
+                    let deadline = Instant::now() + EXIT_GRACE;
+                    while matches!(transfer.try_finish(), Ok(None)) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    transfer.kill();
+                    return Ok(Err(exit));
+                }
+            }
+            if stdin_open
+                && fds[1]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+            {
+                match rustix::io::read(io.stdin, &mut buf) {
+                    Ok(0) => stdin_open = false,
+                    Ok(n) => {
+                        let mut rest = &buf[..n];
+                        while !rest.is_empty() {
+                            let mut command = None;
+                            let used = keys.feed(rest, Instant::now(), &mut |a| match a {
+                                KeyAction::Forward(b) => abort |= has_ctrl_c(b),
+                                KeyAction::Command(c) => command = Some(c),
+                            });
+                            rest = &rest[used..];
+                            abort |= matches!(command, Some(b'x' | b'q'));
+                        }
+                    }
+                    Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
+                    Err(_) => stdin_open = false,
+                }
+            }
+            if abort && aborted.is_none() {
+                aborted = start_abort(transfer);
+            }
+        }
+    }
+
     /// Reads a line of up to `max` bytes of printable ASCII (and with
     /// `utf8`, UTF-8 characters, each taken whole or not at all) from the
     /// keyboard: Backspace edits, Enter finishes, Esc or Ctrl-C cancels.
@@ -456,8 +719,11 @@ impl<'a> Live<'a> {
                     continue;
                 }
             }
+            let after_cr = std::mem::take(&mut self.cr_ended);
             match b {
+                b'\n' if after_cr && line.is_empty() => {}
                 b'\r' | b'\n' => {
+                    self.cr_ended = b == b'\r';
                     self.write(b"\r\n");
                     return Ok(Prompt::Line(line));
                 }
@@ -636,6 +902,7 @@ impl Control for Live<'_> {
     }
 
     fn command(&mut self, key: u8, io: &mut CommandIo<'_>) -> Result<CommandOutcome, SessionError> {
+        self.cr_ended = false;
         if key == ESC {
             return Ok(CommandOutcome::Continue);
         }
@@ -665,6 +932,8 @@ impl Control for Live<'_> {
                 self.say(&format!("local echo {}", on_off(self.echo)));
             }
             Cmd::Capture => return self.toggle_capture(io),
+            Cmd::Send => return self.transfer(Direction::Send, io),
+            Cmd::Receive => return self.transfer(Direction::Receive, io),
             Cmd::Wrap if self.screen.is_none() => {
                 self.say("line wrap: the output is not a terminal");
             }
