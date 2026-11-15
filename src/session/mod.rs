@@ -138,6 +138,11 @@ const BUF_SIZE: usize = 64 * 1024;
 
 const TERMINATE: [i32; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
+/// What the keys typed after `key` do, one line each, for `--help`.
+pub fn commands(key: &str) -> String {
+    commands::listed(key, "\n")
+}
+
 /// The signals the session takes on its pipe. SIGTTIN and SIGTTOU keep
 /// their default action: a session in the background stops when it touches
 /// the terminal, until brought back to the foreground. A signal the parent

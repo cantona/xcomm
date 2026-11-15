@@ -57,6 +57,19 @@ enum Cmd {
     Receive,
 }
 
+/// One line per key typed after `key` (the prefix's name) and what it
+/// does, each ended by `eol`: the in-session help and `--help` both.
+pub(super) fn listed(key: &str, eol: &str) -> String {
+    let mut s = String::new();
+    for (letter, _, what) in COMMANDS {
+        s.push_str(&format!("  {key} {}  {what}{eol}", *letter as char));
+    }
+    s.push_str(&format!(
+        "  {key} {key}  send {key} itself{eol}  {key} Esc  cancel{eol}"
+    ));
+    s
+}
+
 /// The keys after the prefix, in the order help lists them.
 const COMMANDS: &[(u8, Cmd, &str)] = &[
     (b'z', Cmd::Help, "help"),
@@ -328,13 +341,8 @@ impl<'a> Live<'a> {
             "{}\r\nxcomm commands, typed after {key}:\r\n",
             self.ui_cancel
         );
-        for (letter, _, what) in COMMANDS {
-            s.push_str(&format!("  {key} {}  {what}\r\n", *letter as char));
-        }
-        s.push_str(&format!(
-            "  {key} {key}  send {key} itself\r\n  {key} Esc  cancel\r\nprefix: {}\r\n",
-            self.prefix.describe()
-        ));
+        s.push_str(&listed(&key, "\r\n"));
+        s.push_str(&format!("prefix: {}\r\n", self.prefix.describe()));
         self.write(s.as_bytes());
     }
 

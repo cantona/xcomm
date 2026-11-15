@@ -247,9 +247,95 @@ pub struct TermOpts {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// `-h`/`--help`, with the prefix a session would use here, and why a
+    /// session would not start if XCOMM_PREFIX is broken.
+    Help(PrefixChoice, Option<String>),
     Version,
     ShowPrefix(PrefixChoice),
     Term(TermOpts),
+}
+
+/// The text for `--help`. `commands` is what the keys after the prefix do,
+/// as the in-session help lists them.
+pub fn help(version: &str, prefix: &PrefixChoice, broken: Option<&str>, commands: &str) -> String {
+    let key = prefix.key.display();
+    let multiplexers = {
+        let names: Vec<&str> = MULTIPLEXERS.iter().map(|(_, name)| *name).collect();
+        match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => names.concat(),
+        }
+    };
+    let mut s = format!(
+        "\
+xcomm {version}: a serial terminal
+
+Usage:
+  xcomm [options] <device>
+  xcomm --show-prefix [--prefix <key> | -m]
+  xcomm -h | --help | -V | --version
+
+<device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
+(/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
+a name that starts with '-'.
+
+Line settings:
+  -b <baud>                  baud rate (default 115200)
+  --databits 5|6|7|8         data bits (default 8)
+  --parity none|even|odd     parity (default none)
+  --stopbits 1|2             stop bits (default 1)
+  --flow none|rts|xon        flow control: RTS/CTS or XON/XOFF (default none)
+
+Port:
+  -o                         leave DTR and RTS alone: xcomm does not raise
+                             them (the kernel may, as the port opens) or
+                             drop DTR on exit
+  --no-lock                  take no UUCP lock file (the port is still
+                             opened exclusively)
+  --low-latency              FTDI adapters on Linux: 1 ms latency timer
+                             (needs write access to its sysfs file)
+
+Display:
+  --color auto|always|never  colors in device output (default auto: kept
+                             on a terminal, removed when piped or with
+                             TERM=dumb)
+  -c on|off                  the same as --color always|never
+  -w                         turn line wrap on
+  -C <file>                  append device output to <file>
+
+Keys:
+  --prefix <key>             the command prefix: ctrl-<letter> (not h, i,
+                             j or m) or alt-<letter> (also -e, --escape)
+  -m, --metakey              the same as --prefix alt-a
+  --prefix-time <ms>         how long a key cut short (Esc, Alt keys, key
+                             sequences) waits for its rest (1 to 1000,
+                             default 25)
+  --show-prefix              print the prefix a session would use, and why
+
+The prefix is the first of: --prefix; XCOMM_PREFIX (which must be valid
+even when --prefix is given); Alt-A inside one of
+{multiplexers}; Ctrl-A.
+Here it is {described}.{broken}
+
+Commands, typed after {key} (with a terminal on stdin; piped input goes
+to the device as it is):
+",
+        described = prefix.describe(),
+        broken = broken
+            .map(|e| {
+                let why = e.strip_prefix("XCOMM_PREFIX: ").unwrap_or(e);
+                format!("\nA session would not start: XCOMM_PREFIX is not usable:\n  {why}")
+            })
+            .unwrap_or_default(),
+    );
+    s.push_str(commands);
+    s.push_str(
+        "\n\
+Exit status: 0 after quit, the end of input, SIGTERM, SIGINT or SIGHUP, or
+when the terminal goes away; 1 on an error or when the device goes away;
+2 on a usage error or when the port is in use.\n",
+    );
+    s
 }
 
 fn text(value: OsString, name: &str) -> Result<String, CliError> {
@@ -348,6 +434,7 @@ pub fn parse(
     let mut capture: Option<PathBuf> = None;
     let mut show_prefix = false;
     let mut version = false;
+    let mut help = false;
     // For --version (alone) and --show-prefix (prefix options only).
     let mut others = usize::from(separator);
     let mut non_prefix = usize::from(separator);
@@ -489,8 +576,21 @@ pub fn parse(
             )?,
             Long("show-prefix") => show_prefix = true,
             Short('V') | Long("version") => version = true,
+            Short('h') | Long("help") => help = true,
             _ => return Err(arg.unexpected().into()),
         }
+    }
+
+    if help {
+        // A broken XCOMM_PREFIX must not keep the help from showing: the
+        // prefix is worked out without it, and the help says what is wrong.
+        return Ok(match resolve_prefix(prefix, env) {
+            Ok(choice) => Command::Help(choice, None),
+            Err(e) => {
+                let without = |name: &str| (name != "XCOMM_PREFIX").then(|| env(name)).flatten();
+                Command::Help(resolve_prefix(prefix, &without)?, Some(e.0))
+            }
+        });
     }
 
     if version {

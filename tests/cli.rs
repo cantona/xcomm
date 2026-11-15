@@ -513,3 +513,41 @@ fn numbers_must_be_plain_digits() {
         Duration::from_millis(25)
     );
 }
+
+#[test]
+fn help_wins_over_the_other_arguments() {
+    for args in [
+        &["-h"][..],
+        &["--help", "-b", "9600", "ttyUSB0"],
+        &["ttyUSB0", "-h"],
+    ] {
+        assert!(
+            matches!(parse_with(args, &[]), Ok(Command::Help(..))),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn help_is_an_option_like_the_others() {
+    // An argument error before it is still reported.
+    assert!(err(&["--help", "-b", "0"], &[]).contains("-b"));
+    // An 'h' inside an attached value is that value, not -h.
+    assert!(matches!(
+        parse_with(&["-Dhvc0"], &[]),
+        Ok(Command::Term(TermOpts { ref device, .. })) if device == "hvc0"
+    ));
+    assert!(matches!(
+        parse_with(&["-Chist.log", "ttyUSB0"], &[]),
+        Ok(Command::Term(TermOpts { ref capture, .. })) if capture.as_deref() == Some(std::path::Path::new("hist.log"))
+    ));
+    // After a clustered option, and after `--` (a device name).
+    assert!(matches!(
+        parse_with(&["-DttyUSB0", "-h"], &[]),
+        Ok(Command::Help(..))
+    ));
+    assert!(!matches!(
+        parse_with(&["--", "-h"], &[]),
+        Ok(Command::Help(..))
+    ));
+}

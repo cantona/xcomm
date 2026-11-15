@@ -22,9 +22,21 @@ fn print(line: &str) -> ExitCode {
 fn main() -> ExitCode {
     match cli::parse(std::env::args_os().skip(1), &env) {
         Err(e) => {
-            out::report(&e.0);
+            out::report(&format!(
+                "{}\nTry 'xcomm --help' for more information.",
+                e.0
+            ));
             ExitCode::from(2)
         }
+        Ok(Command::Help(prefix, broken)) => print(
+            cli::help(
+                env!("CARGO_PKG_VERSION"),
+                &prefix,
+                broken.as_deref(),
+                &session::commands(&prefix.key.display()),
+            )
+            .trim_end(),
+        ),
         Ok(Command::Version) => print(&format!("xcomm {}", env!("CARGO_PKG_VERSION"))),
         Ok(Command::ShowPrefix(p)) => print(&p.describe()),
         Ok(Command::Term(opts)) => match session::run(&opts, &env) {

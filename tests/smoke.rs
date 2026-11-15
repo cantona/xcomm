@@ -39,7 +39,7 @@ fn no_arguments_prints_usage_and_exits_2() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
-        "xcomm: usage: xcomm [options] <device>\n"
+        "xcomm: usage: xcomm [options] <device>\nTry 'xcomm --help' for more information.\n"
     );
 }
 
@@ -50,7 +50,7 @@ fn version_with_extra_argument_is_rejected() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
-        "xcomm: --version takes no other arguments\n"
+        "xcomm: --version takes no other arguments\nTry 'xcomm --help' for more information.\n"
     );
 }
 
@@ -121,4 +121,95 @@ fn version_with_stdout_and_stderr_closed_exits_1() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn help_prints_options_and_every_command_key() {
+    for flag in ["--help", "-h"] {
+        let out = xcomm(&[flag]);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains("Usage:\n  xcomm [options] <device>"),
+            "{text}"
+        );
+        for option in [
+            "-b <baud>",
+            "--flow",
+            "--prefix <key>",
+            "-C <file>",
+            "--color",
+        ] {
+            assert!(text.contains(option), "{option} missing");
+        }
+        for letter in "zxqfhdtpewlsr".chars() {
+            assert!(
+                text.contains(&format!("  Ctrl-A {letter}  ")),
+                "{letter} missing"
+            );
+        }
+        assert!(text.contains("Here it is Ctrl-A (default)."), "{text}");
+        assert!(
+            text.lines().all(|l| l.len() <= 80),
+            "a line is wider than 80"
+        );
+    }
+}
+
+#[test]
+fn help_shows_the_prefix_a_session_would_use() {
+    let out = cmd().arg("--help").env("TMUX", "x").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("Here it is Alt-A (multiplexer: tmux)."),
+        "{text}"
+    );
+    assert!(text.contains("  Alt-A x  quit"), "{text}");
+    // A broken setting does not keep the help from showing, says so, and
+    // leaves the flag and the multiplexer as they would be.
+    let out = cmd()
+        .args(["--help", "--prefix", "alt-b"])
+        .env("XCOMM_PREFIX", "bogus")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(
+            "Here it is Alt-B (command line).\nA session would not start: XCOMM_PREFIX is not usable:\n  invalid prefix key 'bogus'"
+        ),
+        "{text}"
+    );
+    // The longest of those messages still fits 80 columns.
+    let out = cmd()
+        .arg("--help")
+        .env("XCOMM_PREFIX", "ctrl-h")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Backspace"), "{text}");
+    assert!(text.lines().all(|l| l.len() <= 80), "{text}");
+    let out = cmd()
+        .arg("-h")
+        .env("XCOMM_PREFIX", "bogus")
+        .env("TMUX", "x")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("Here it is Alt-A (multiplexer: tmux)."),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_usage_error_points_to_help() {
+    let out = xcomm(&["--frobnicate"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.ends_with("\nTry 'xcomm --help' for more information.\n"),
+        "{err}"
+    );
 }
