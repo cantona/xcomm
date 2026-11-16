@@ -365,6 +365,8 @@ pub enum Command {
     List {
         json: bool,
     },
+    /// `xcomm pick`: the port picker of the herdr popup.
+    Pick,
 }
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
@@ -388,15 +390,18 @@ Usage:
   xcomm ctl [--json] <device> status|send|read|wait|run ...
   xcomm ctl [--json] sessions
   xcomm list [--json]
+  xcomm pick
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
 <device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
 (/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
-a name that starts with '-' (or is ctl or list).
+a name that starts with '-' (or is ctl, list or pick).
 
 xcomm list shows the serial ports: tty, USB VID:PID, product, the lock
 holder, the herdr pane of an xcomm session on it, and the by-id name.
+xcomm pick is that list for herdr's popup: Enter opens the port in a new
+pane (or goes to the pane that has it), b sets the baud, o the placement.
 
 Line settings:
   -b <baud>                  baud rate (default 115200)
@@ -1102,6 +1107,15 @@ pub fn parse(
     }
     if args.first().is_some_and(|a| a == "list") {
         return parse_list(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "pick") {
+        return match args.get(1) {
+            None => Ok(Command::Pick),
+            Some(a) => Err(CliError(format!(
+                "pick: unexpected argument '{}'",
+                a.to_string_lossy()
+            ))),
+        };
     }
     // lexopt consumes a bare `--` without returning it; count it here so
     // `--version --` is rejected like any other extra argument.

@@ -984,3 +984,13 @@ fn list_parses() {
         Command::Term(TermOpts { ref device, .. }) if device == "list"
     ));
 }
+
+#[test]
+fn pick_parses() {
+    assert_eq!(parse_with(&["pick"], &[]).unwrap(), Command::Pick);
+    assert!(err(&["pick", "x"], &[]).contains("unexpected argument 'x'"));
+    assert!(matches!(
+        parse_with(&["--", "pick"], &[]).unwrap(),
+        Command::Term(TermOpts { ref device, .. }) if device == "pick"
+    ));
+}

@@ -269,7 +269,16 @@ fn the_client_needs_both_variables_and_checks_the_reply() {
         _ => None,
     };
     let h = Herdr::from_env(&gone).unwrap();
-    assert_eq!(h.pane_id(), "p");
+    assert_eq!(h.pane_id(), Some("p"));
+    // The popup a picker runs in has the socket but no pane.
+    let socket_only = |k: &str| (k == "HERDR_SOCKET_PATH").then(|| "/x".to_string());
+    assert!(Herdr::from_env(&socket_only).is_none());
+    let server = Herdr::server_from_env(&socket_only).unwrap();
+    assert_eq!(server.pane_id(), None);
+    assert!(matches!(
+        server.report_metadata(Some("t"), &[], None),
+        Err(HerdrError::Io(_))
+    ));
     assert!(matches!(h.notify("t", None), Err(HerdrError::Io(_))));
     let fake = Fake::new(Mode::Ok);
     let sock = fake.sock.to_str().unwrap().to_string();

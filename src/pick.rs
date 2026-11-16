@@ -1,0 +1,641 @@
+//! `xcomm pick`: the port picker herdr shows in a popup. A plain list in
+//! raw mode, no TUI library. Enter opens the port in a new plugin pane, or
+//! focuses the pane already showing it.
+
+use std::io;
+use std::os::fd::BorrowedFd;
+use std::time::{Duration, Instant};
+
+use crate::list::PortInfo;
+
+/// The plugin xcomm installs into herdr.
+pub const PLUGIN_ID: &str = "cantona.herdr-xcomm";
+/// The baud a port opens at unless `b` changes it.
+pub const DEFAULT_BAUD: u32 = 115_200;
+/// How long a lone ESC waits for the rest of a key, as in a session.
+const ESC_WAIT: Duration = Duration::from_millis(25);
+/// How often the list is read again: locks and panes change with no
+/// event in /dev.
+const REFRESH: Duration = Duration::from_secs(1);
+/// Most digits the baud prompt takes.
+const BAUD_DIGITS: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    SplitRight,
+    SplitDown,
+    Tab,
+}
+
+impl Placement {
+    fn next(self) -> Placement {
+        match self {
+            Placement::SplitRight => Placement::SplitDown,
+            Placement::SplitDown => Placement::Tab,
+            Placement::Tab => Placement::SplitRight,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Placement::SplitRight => "split right",
+            Placement::SplitDown => "split down",
+            Placement::Tab => "new tab",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKey {
+    Up,
+    Down,
+    Enter,
+    Baud,
+    Placement,
+    Esc,
+    Digit(u8),
+    Backspace,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickAction {
+    /// Nothing to do but draw again.
+    Redraw,
+    Quit,
+    /// Open the selected port in a new pane.
+    Open,
+    /// The port is open in this herdr pane already.
+    Focus(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickState {
+    pub ports: Vec<PortInfo>,
+    pub selected: usize,
+    pub baud: u32,
+    pub placement: Placement,
+    /// The baud being typed, while `b`'s prompt is open.
+    pub prompt: Option<String>,
+    /// A line for the user: why opening failed, or a bad baud.
+    pub message: Option<String>,
+}
+
+impl PickState {
+    pub fn new(ports: Vec<PortInfo>) -> PickState {
+        PickState {
+            ports,
+            selected: 0,
+            baud: DEFAULT_BAUD,
+            placement: Placement::SplitRight,
+            prompt: None,
+            message: None,
+        }
+    }
+
+    /// A new list, keeping the selection on the same port when it is still
+    /// there.
+    pub fn set_ports(&mut self, ports: Vec<PortInfo>) {
+        let was = self.ports.get(self.selected).map(|p| p.tty.clone());
+        self.ports = ports;
+        self.selected = was
+            .and_then(|tty| self.ports.iter().position(|p| p.tty == tty))
+            .unwrap_or(0)
+            .min(self.ports.len().saturating_sub(1));
+    }
+
+    pub fn apply(&mut self, key: PickKey) -> PickAction {
+        if let Some(typed) = &mut self.prompt {
+            match key {
+                PickKey::Digit(d) if typed.len() < BAUD_DIGITS => typed.push(char::from(d)),
+                PickKey::Backspace => {
+                    typed.pop();
+                }
+                PickKey::Enter => {
+                    match typed.parse::<u32>().ok().filter(|&b| b > 0) {
+                        Some(baud) => {
+                            self.baud = baud;
+                            self.message = None;
+                        }
+                        None => self.message = Some(format!("not a baud rate: '{typed}'")),
+                    }
+                    self.prompt = None;
+                }
+                PickKey::Esc => self.prompt = None,
+                _ => {}
+            }
+            return PickAction::Redraw;
+        }
+        match key {
+            PickKey::Up => self.selected = self.selected.saturating_sub(1),
+            PickKey::Down => {
+                self.selected = (self.selected + 1).min(self.ports.len().saturating_sub(1));
+            }
+            PickKey::Baud => {
+                self.prompt = Some(String::new());
+                self.message = None;
+            }
+            PickKey::Placement => self.placement = self.placement.next(),
+            PickKey::Esc => return PickAction::Quit,
+            PickKey::Enter => {
+                let Some(port) = self.ports.get(self.selected) else {
+                    return PickAction::Redraw;
+                };
+                return match (&port.herdr_pane, port.lock_pid) {
+                    (Some(pane), _) => PickAction::Focus(pane.clone()),
+                    // Held, with no pane known (another program, or a
+                    // session too slow to answer): a new session would
+                    // only fail on the lock.
+                    (None, Some(pid)) => {
+                        self.message = Some(format!("{} is in use by process {pid}", port.tty));
+                        PickAction::Redraw
+                    }
+                    (None, None) => PickAction::Open,
+                };
+            }
+            PickKey::Digit(_) | PickKey::Backspace | PickKey::Other => {}
+        }
+        PickAction::Redraw
+    }
+}
+
+/// The keys in `input`. A trailing ESC that may start a key is the caller's
+/// to hold back (see `incomplete`); here it counts as Esc.
+pub fn decode_keys(input: &[u8]) -> Vec<PickKey> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let (key, used) = match input[i] {
+            0x1b => match (input.get(i + 1), input.get(i + 2)) {
+                (Some(b'[' | b'O'), Some(b'A')) => (PickKey::Up, 3),
+                (Some(b'[' | b'O'), Some(b'B')) => (PickKey::Down, 3),
+                (Some(b'[' | b'O'), Some(_)) => {
+                    // Another key's sequence: up to its final byte.
+                    let rest = &input[i + 2..];
+                    let end = rest
+                        .iter()
+                        .position(|b| (0x40..=0x7e).contains(b))
+                        .map_or(rest.len(), |p| p + 1);
+                    (PickKey::Other, 2 + end)
+                }
+                // Alt with a key: not a lone Esc, which would close.
+                (Some(0x20..=0x7e | b'\r' | b'\n' | 0x7f | 0x08 | 0x80..), _) => {
+                    (PickKey::Other, 2)
+                }
+                // ESC ESC (keys typed while the loop was busy), or ESC and
+                // a control: an Esc, then the next byte as itself.
+                _ => (PickKey::Esc, 1),
+            },
+            // Raw mode: Ctrl-C is a byte, not a signal.
+            0x03 => (PickKey::Esc, 1),
+            b'k' => (PickKey::Up, 1),
+            b'j' => (PickKey::Down, 1),
+            b'\r' | b'\n' => (PickKey::Enter, 1),
+            b'b' => (PickKey::Baud, 1),
+            b'o' => (PickKey::Placement, 1),
+            b'q' => (PickKey::Esc, 1),
+            0x7f | 0x08 => (PickKey::Backspace, 1),
+            d @ b'0'..=b'9' => (PickKey::Digit(d), 1),
+            _ => (PickKey::Other, 1),
+        };
+        keys.push(key);
+        i += used;
+    }
+    keys
+}
+
+/// Whether `input` ends in what may be the start of a key sequence: an
+/// ESC, or ESC [ / ESC O with no final byte yet.
+pub fn incomplete(input: &[u8]) -> bool {
+    let Some(esc) = input.iter().rposition(|&b| b == 0x1b) else {
+        return false;
+    };
+    match &input[esc + 1..] {
+        [] => true,
+        [b'[' | b'O', rest @ ..] => !rest.iter().any(|b| (0x40..=0x7e).contains(b)),
+        _ => false,
+    }
+}
+
+/// The screen, drawn from the top: a title line, one row per port (the
+/// selected one marked), the keys, and any message, wrapped.
+pub fn render(state: &PickState, width: u16, height: u16, out: &mut Vec<u8>) {
+    let width = usize::from(width.max(20));
+    let height = usize::from(height.max(5));
+    out.extend_from_slice(b"\x1b[H\x1b[2J");
+    // A message (a command's error) wraps, and its rows are kept: its end
+    // says what went wrong.
+    let message: Vec<String> = state.message.as_deref().map_or_else(Vec::new, |m| {
+        let chars: Vec<char> = m.chars().map(printable).collect();
+        chars.chunks(width).map(|c| c.iter().collect()).collect()
+    });
+    let keep = message.len().min(height.saturating_sub(4));
+    let message = &message[message.len() - keep..];
+    let room = height.saturating_sub(3 + message.len()).max(1);
+    let first = state.selected.saturating_sub(room - 1);
+    let rows: Vec<[String; 5]> = state
+        .ports
+        .iter()
+        .map(|p| {
+            [
+                p.tty.clone(),
+                p.vid_pid.clone().unwrap_or_else(|| "-".into()),
+                match (&p.herdr_pane, p.lock_pid) {
+                    (Some(pane), _) => format!("pane {pane}"),
+                    (None, Some(pid)) => format!("pid {pid}"),
+                    (None, None) => "-".into(),
+                },
+                // Before the product, which it mostly repeats: its serial
+                // and interface tell two of the same adapter apart, so the
+                // parts every name has go.
+                p.by_id.as_deref().map_or_else(
+                    || p.path.clone(),
+                    |b| {
+                        let name = b.rsplit('/').next().unwrap_or(b);
+                        let name = name.strip_prefix("usb-").unwrap_or(name);
+                        name.strip_suffix("-port0").unwrap_or(name).to_string()
+                    },
+                ),
+                p.product.clone().unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    let mut widths = [0usize; 5];
+    for row in &rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    // A name longer than the room left loses its front, not the serial and
+    // interface at its end.
+    let room_for_name = width.saturating_sub(2 + widths[..3].iter().map(|w| w + 1).sum::<usize>());
+    widths[3] = widths[3].min(room_for_name);
+    let rows: Vec<[String; 5]> = rows
+        .into_iter()
+        .map(|mut row| {
+            let n = row[3].chars().count();
+            if n > widths[3] && widths[3] > 1 {
+                let tail: String = row[3].chars().skip(n - (widths[3] - 1)).collect();
+                row[3] = format!("~{tail}");
+            }
+            row
+        })
+        .collect();
+    let mut lines: Vec<String> = vec![format!(
+        "xcomm: serial ports   baud {}   open in {}",
+        state.baud,
+        state.placement.describe()
+    )];
+    if rows.is_empty() {
+        lines.push("  no serial ports".into());
+    }
+    for (i, row) in rows.iter().enumerate().skip(first).take(room) {
+        let mut line = String::from(if i == state.selected { "> " } else { "  " });
+        for (n, cell) in row.iter().enumerate() {
+            if n + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{cell:<w$} ", w = widths[n]));
+            }
+        }
+        lines.push(line);
+    }
+    lines.push(String::new());
+    lines.push(match &state.prompt {
+        Some(typed) => format!("baud: {typed}_   (Enter sets, Esc cancels)"),
+        None => "Enter open   b baud   o placement   Esc close".into(),
+    });
+    lines.extend(message.iter().cloned());
+    for (n, line) in lines.iter().take(height).enumerate() {
+        if n > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        let shown: String = line.chars().map(printable).take(width).collect();
+        out.extend_from_slice(shown.as_bytes());
+    }
+}
+
+fn printable(c: char) -> char {
+    if c.is_control() { '?' } else { c }
+}
+
+/// The arguments to `herdr` that open the selected port in a new pane.
+pub fn open_command(state: &PickState, plugin_id: &str, target_pane: Option<&str>) -> Vec<String> {
+    let port = &state.ports[state.selected];
+    let mut argv: Vec<String> = [
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        plugin_id,
+        "--entrypoint",
+        "session",
+        "--placement",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match state.placement {
+        Placement::SplitRight => argv.extend(["split", "--direction", "right"].map(String::from)),
+        Placement::SplitDown => argv.extend(["split", "--direction", "down"].map(String::from)),
+        Placement::Tab => argv.push("tab".into()),
+    }
+    if let Some(pane) = target_pane {
+        argv.extend(["--target-pane".to_string(), pane.to_string()]);
+    }
+    let device = port.by_id.as_deref().unwrap_or(&port.path);
+    argv.extend([
+        "--env".to_string(),
+        format!("XCOMM_DEVICE={device}"),
+        "--env".to_string(),
+        format!("XCOMM_BAUD={}", state.baud),
+        "--focus".to_string(),
+    ]);
+    argv
+}
+
+#[derive(Debug)]
+pub struct PickError(pub String);
+
+impl std::fmt::Display for PickError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PickError {}
+
+/// The pane the popup was opened from, as herdr tells a plugin pane.
+fn target_pane(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let json = env("HERDR_PLUGIN_CONTEXT_JSON")?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    v["focused_pane_id"].as_str().map(str::to_string)
+}
+
+/// Runs the picker on the terminal `input`/`output` until it opens a port,
+/// focuses its pane or is closed; returns the exit status.
+pub fn run(
+    input: BorrowedFd<'_>,
+    output: BorrowedFd<'_>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, PickError> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let err = |what: &str, e: io::Error| PickError(format!("{what}: {e}"));
+    let signals = crate::hosttty::SignalPipe::install(&[
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGHUP,
+        libc::SIGWINCH,
+    ])
+    .map_err(|e| err("signals", e))?;
+    let raw = crate::hosttty::RawMode::enter(input).map_err(|e| err("raw mode", e))?;
+    // The popup has the server's socket but no pane of its own.
+    let herdr = crate::herdr::Herdr::server_from_env(env);
+    let target = target_pane(env);
+    let herdr_bin = env("HERDR_BIN_PATH")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "herdr".into());
+    let mut state = PickState::new(crate::list::enumerate(env).map_err(|e| err("ports", e))?);
+    // Listing asks each session for its pane, which a busy one may take
+    // its time over: off the thread that reads keys.
+    let lister = Lister::start(env).map_err(|e| err("lister", e))?;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut pending_since = Instant::now();
+    let mut screen = Vec::new();
+    let draw = |state: &PickState, screen: &mut Vec<u8>| -> Result<(), PickError> {
+        let size = rustix::termios::tcgetwinsize(output).ok();
+        // A terminal that does not say its size (0) is taken as 80x24.
+        let cols = size.map_or(0, |s| s.ws_col);
+        let rows = size.map_or(0, |s| s.ws_row);
+        screen.clear();
+        render(
+            state,
+            if cols == 0 { 80 } else { cols },
+            if rows == 0 { 24 } else { rows },
+            screen,
+        );
+        write_all(output, screen).map_err(|e| err("terminal", e))
+    };
+    draw(&state, &mut screen)?;
+    let outcome = loop {
+        let held = incomplete(&pending);
+        let wait = if held {
+            ESC_WAIT.saturating_sub(pending_since.elapsed())
+        } else {
+            REFRESH
+        };
+        let timeout = Timespec::try_from(wait).unwrap_or_default();
+        let sig_fd = signals.fd();
+        let mut fds = [
+            PollFd::new(&input, PollFlags::IN),
+            PollFd::new(&sig_fd, PollFlags::IN),
+            PollFd::from_borrowed_fd(lister.fd(), PollFlags::IN),
+        ];
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => break Err(err("poll", e.into())),
+        }
+        let input_ready = !fds[0].revents().is_empty();
+        let signal_ready = !fds[1].revents().is_empty();
+        let list_ready = !fds[2].revents().is_empty();
+        if signal_ready {
+            let bits = signals.drain().map_err(|e| err("signals", e))?;
+            if bits & !(1u64 << libc::SIGWINCH) != 0 {
+                break Ok(1);
+            }
+            draw(&state, &mut screen)?;
+        }
+        if list_ready
+            && let Some(ports) = lister.take()
+            && ports != state.ports
+        {
+            state.set_ports(ports);
+            draw(&state, &mut screen)?;
+        }
+        if input_ready {
+            let mut buf = [0u8; 256];
+            match rustix::io::read(input, &mut buf) {
+                Ok(0) => break Ok(1),
+                Ok(n) => {
+                    if pending.is_empty() {
+                        pending_since = Instant::now();
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                }
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {}
+                Err(e) => break Err(err("terminal", e.into())),
+            }
+        }
+        // A key that may still be coming waits its 25 ms, whatever else
+        // woke the loop.
+        if pending.is_empty() || (incomplete(&pending) && pending_since.elapsed() < ESC_WAIT) {
+            continue;
+        }
+        let keys = decode_keys(&pending);
+        pending.clear();
+        let mut done = None;
+        for key in keys {
+            match state.apply(key) {
+                PickAction::Redraw => {}
+                PickAction::Quit => {
+                    done = Some(0);
+                    break;
+                }
+                PickAction::Focus(pane) => match herdr.as_ref().map(|h| h.focus_pane(&pane)) {
+                    Some(Ok(())) => {
+                        done = Some(0);
+                        break;
+                    }
+                    Some(Err(e)) => state.message = Some(format!("cannot focus {pane}: {e}")),
+                    None => state.message = Some("not inside herdr".into()),
+                },
+                PickAction::Open => {
+                    // udev makes the by-id link a little after the node:
+                    // the session should follow the adapter, not the name.
+                    let port = &mut state.ports[state.selected];
+                    if port.by_id.is_none() {
+                        port.by_id = crate::list::by_id_of(&port.tty);
+                    }
+                    let argv = open_command(&state, PLUGIN_ID, target.as_deref());
+                    match std::process::Command::new(&herdr_bin)
+                        .args(&argv)
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                    {
+                        Ok(o) if o.status.success() => {
+                            done = Some(0);
+                            break;
+                        }
+                        Ok(o) => {
+                            let why = String::from_utf8_lossy(&o.stderr);
+                            state.message =
+                                Some(format!("{herdr_bin} failed ({}): {}", o.status, why.trim()));
+                        }
+                        Err(e) => state.message = Some(format!("{herdr_bin}: {e}")),
+                    }
+                }
+            }
+        }
+        if let Some(code) = done {
+            break Ok(code);
+        }
+        draw(&state, &mut screen)?;
+    };
+    let _ = write_all(output, b"\x1b[H\x1b[2J");
+    drop(raw);
+    outcome
+}
+
+fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match rustix::io::write(fd, bytes) {
+            Ok(n) => bytes = &bytes[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Lists the ports on a thread of its own, every REFRESH and soon after a
+/// device node comes or goes, and wakes the picker through a pipe.
+struct Lister {
+    wake: std::os::fd::OwnedFd,
+    latest: std::sync::Arc<std::sync::Mutex<Option<Vec<PortInfo>>>>,
+}
+
+impl Lister {
+    fn start(env: &dyn Fn(&str) -> Option<String>) -> io::Result<Lister> {
+        // What listing reads of the environment, owned by the thread.
+        let vars: Vec<(&str, String)> = ["XCOMM_LOCK_DIR", "XDG_RUNTIME_DIR"]
+            .into_iter()
+            .filter_map(|k| env(k).map(|v| (k, v)))
+            .collect();
+        let (read, write) = rustix::pipe::pipe()?;
+        for end in [&read, &write] {
+            rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
+        }
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let shared = latest.clone();
+        std::thread::spawn(move || {
+            let env = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+            let watch = DevWatch::new();
+            loop {
+                watch.wait(REFRESH);
+                if let Ok(ports) = crate::list::enumerate(&env) {
+                    *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(ports);
+                    // The picker gone: so is the reader.
+                    if rustix::io::write(&write, b"x").is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Lister { wake: read, latest })
+    }
+
+    fn fd(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.wake)
+    }
+
+    /// The latest list, once per wake-up.
+    fn take(&self) -> Option<Vec<PortInfo>> {
+        let mut buf = [0u8; 64];
+        let _ = rustix::io::read(&self.wake, &mut buf);
+        self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Device nodes coming and going (Linux: inotify on /dev and the by-id
+/// directory, watched again after each event, as udev removes it with the
+/// last adapter); elsewhere the periodic listing finds them.
+struct DevWatch {
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl DevWatch {
+    fn new() -> DevWatch {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::inotify::{CreateFlags, init};
+            let w = DevWatch {
+                fd: init(CreateFlags::CLOEXEC).ok(),
+            };
+            w.add();
+            w
+        }
+        #[cfg(not(target_os = "linux"))]
+        DevWatch {}
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add(&self) {
+        use rustix::fs::inotify::{WatchFlags, add_watch};
+        if let Some(fd) = &self.fd {
+            let flags = WatchFlags::CREATE | WatchFlags::DELETE | WatchFlags::MOVED_TO;
+            for dir in ["/dev", "/dev/serial", "/dev/serial/by-id"] {
+                let _ = add_watch(fd, dir, flags);
+            }
+        }
+    }
+
+    /// Waits for a device event or `most`; after an event, a little longer
+    /// for udev to make the links.
+    fn wait(&self, most: Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.fd {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+            let mut fds = [PollFd::new(fd, PollFlags::IN)];
+            let timeout = Timespec::try_from(most).unwrap_or_default();
+            if matches!(poll(&mut fds, Some(&timeout)), Ok(n) if n > 0) {
+                let mut buf = [0u8; 4096];
+                let _ = rustix::io::read(fd, &mut buf);
+                std::thread::sleep(Duration::from_millis(100));
+                self.add();
+            }
+            return;
+        }
+        std::thread::sleep(most);
+    }
+}

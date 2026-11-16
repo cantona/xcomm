@@ -15,7 +15,9 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 /// The herdr server this process runs under, and its pane.
 pub struct Herdr {
     socket: PathBuf,
-    pane: String,
+    /// None for a client of the server alone: herdr starts popups without
+    /// HERDR_PANE_ID.
+    pane: Option<String>,
     next_id: Cell<u64>,
 }
 
@@ -49,13 +51,24 @@ impl Herdr {
         let pane = env("HERDR_PANE_ID").filter(|s| !s.is_empty())?;
         Some(Herdr {
             socket: PathBuf::from(socket),
-            pane,
+            pane: Some(pane),
             next_id: Cell::new(1),
         })
     }
 
-    pub fn pane_id(&self) -> &str {
-        &self.pane
+    /// A client of the herdr server alone (the popup a picker runs in has
+    /// no pane id): `HERDR_SOCKET_PATH` is set.
+    pub fn server_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Herdr> {
+        let socket = env("HERDR_SOCKET_PATH").filter(|s| !s.is_empty())?;
+        Some(Herdr {
+            socket: PathBuf::from(socket),
+            pane: None,
+            next_id: Cell::new(1),
+        })
+    }
+
+    pub fn pane_id(&self) -> Option<&str> {
+        self.pane.as_deref()
     }
 
     /// Sends `method` with `params` and returns the reply's `result`.
@@ -135,7 +148,10 @@ impl Herdr {
         tokens: &[(&str, Option<&str>)],
         ttl: Option<Duration>,
     ) -> Result<(), HerdrError> {
-        let mut params = json!({ "pane_id": self.pane, "source": "xcomm" });
+        let Some(pane) = &self.pane else {
+            return Err(HerdrError::Io("no herdr pane (HERDR_PANE_ID)".into()));
+        };
+        let mut params = json!({ "pane_id": pane, "source": "xcomm" });
         match title {
             Some(title) => params["title"] = title.into(),
             None => params["clear_title"] = true.into(),

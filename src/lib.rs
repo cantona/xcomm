@@ -10,6 +10,7 @@ pub mod keys;
 pub mod list;
 pub mod lock;
 pub mod out;
+pub mod pick;
 pub mod port;
 pub mod reconnect;
 pub mod ring;

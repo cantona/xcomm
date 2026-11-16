@@ -89,6 +89,17 @@ fn main() -> ExitCode {
         }
         Ok(Command::Ctl(args)) => ExitCode::from(xcomm::ctl::client::run(&args, &env)),
         Ok(Command::List { json }) => list(json),
+        Ok(Command::Pick) => {
+            use std::os::fd::AsFd;
+            let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
+            match xcomm::pick::run(stdin.as_fd(), stdout.as_fd(), &env) {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(e) => {
+                    out::report(&format!("pick: {e}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::Term(opts)) => match session::run(&opts, &env) {
             Ok(ExitReason::DeviceGone) => ExitCode::FAILURE,
             Ok(_) => ExitCode::SUCCESS,
