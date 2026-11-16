@@ -1,0 +1,104 @@
+# The herdr plugin of xcomm. Commands run from this directory: build it
+# first with `sh scripts/build.sh` (scripts/install.sh also links it).
+id = "cantona.herdr-xcomm"
+name = "herdr-xcomm"
+version = "0.1.0"
+description = "Serial terminal panes: port picker, line control actions, hotplug notifications, agent control."
+min_herdr_version = "0.9.5"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+# One-shot: starts the hotplug watcher, which ends with this herdr server.
+[[startup]]
+command = ["target/release/xcomm", "watch", "start"]
+
+[[panes]]
+id = "picker"
+title = "xcomm: open port"
+placement = "popup"
+width = "60%"
+height = "60%"
+command = ["target/release/xcomm", "pick"]
+
+[[panes]]
+id = "prompt"
+title = "xcomm"
+placement = "popup"
+width = "60%"
+height = 5
+# Opened by the actions, with both set; opened by hand, it says so and
+# waits, or the popup would only flash.
+command = ["sh", "-c", "if [ -z \"$XCOMM_PROMPT\" ] || [ -z \"$XCOMM_PANE\" ]; then printf 'xcomm: this popup is opened by the xcomm actions\\npress Enter to close'; read x; exit 2; fi; exec target/release/xcomm pick --prompt \"$XCOMM_PROMPT\" --pane \"$XCOMM_PANE\""]
+
+[[panes]]
+id = "session"
+title = "xcomm"
+command = ["sh", "-c", "exec target/release/xcomm -D \"$XCOMM_DEVICE\" -b \"$XCOMM_BAUD\""]
+
+[[actions]]
+id = "open"
+title = "xcomm: open serial port"
+contexts = ["global", "workspace"]
+command = ["sh", "scripts/plugin-action.sh", "open"]
+
+[[actions]]
+id = "break"
+title = "xcomm: send break"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "break"]
+
+[[actions]]
+id = "dtr"
+title = "xcomm: toggle DTR"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "dtr"]
+
+[[actions]]
+id = "rts"
+title = "xcomm: toggle RTS"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "rts"]
+
+[[actions]]
+id = "capture"
+title = "xcomm: toggle capture"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "capture"]
+
+[[actions]]
+id = "baud"
+title = "xcomm: change baud"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "baud"]
+
+[[actions]]
+id = "send-file"
+title = "xcomm: send file (zmodem)"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "send-file"]
+
+[[actions]]
+id = "recv-file"
+title = "xcomm: receive file (zmodem)"
+contexts = ["pane"]
+command = ["sh", "scripts/plugin-action.sh", "recv-file"]
+
+[[actions]]
+id = "watch-start"
+title = "xcomm: start hotplug watcher"
+contexts = ["global"]
+command = ["sh", "scripts/plugin-action.sh", "watch-start"]
+
+[[actions]]
+id = "watch-stop"
+title = "xcomm: stop hotplug watcher"
+contexts = ["global"]
+command = ["sh", "scripts/plugin-action.sh", "watch-stop"]
+
+[[actions]]
+id = "watch-status"
+title = "xcomm: hotplug watcher status"
+contexts = ["global"]
+command = ["sh", "scripts/plugin-action.sh", "watch-status"]

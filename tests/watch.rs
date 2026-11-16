@@ -500,3 +500,23 @@ fn a_late_by_id_link_still_counts_for_ignore() {
     assert!(!text.contains("ttyUSB8"), "{text}");
     assert!(fake.bodies().is_empty(), "{:?}", fake.bodies());
 }
+
+#[test]
+fn the_watcher_ends_with_its_herdr_server() {
+    let env = Env::new();
+    let fake = Fake::new(&env.dir);
+    let o = env.watch(&["start"]);
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    let log = env.dir.join("state/herdr.sock/watch.log");
+    wait_log(&log, "watching", 1);
+    // The server goes, its socket with it; a device event wakes the watcher.
+    drop(fake);
+    std::fs::remove_file(env.dir.join("herdr.sock")).unwrap();
+    std::fs::write(env.dir.join("root/dev/ttyUSB3"), b"").unwrap();
+    wait_log(&log, "the herdr server is gone; stopping", 1);
+    let until = Instant::now() + T;
+    while !out(&env.watch(&["status"])).starts_with("not running") {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -31,11 +31,8 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
         _ => return Err((code::USAGE, "only ctl wait and ctl run come here".into())),
     };
     let mut matcher = matcher(opts, keep)?;
-    let Some(device) = &args.device else {
-        return Err((code::USAGE, "a device is needed".into()));
-    };
     let dirs = Dirs::find(env);
-    let mut conn = Conn::open(&dirs, device)?;
+    let mut conn = Conn::open_for(&dirs, args)?;
     let status = conn.request(&Request::Status)?;
     let path = conn.path.clone();
     let still_there = || session_runs(&path, &dirs, &status["pid"]);

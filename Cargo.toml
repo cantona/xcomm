@@ -27,6 +27,8 @@ regex = { version = "1.13.1", default-features = false, features = ["std", "perf
 unicode = ["regex/unicode-perl", "regex/unicode-case"]
 
 [dev-dependencies]
+# Reads herdr-plugin.toml in tests only: the binary does not link it.
+toml = "1.1.4"
 rustix = { version = "1.1.6", features = ["termios", "pipe", "pty", "fs", "event"] }
 
 [profile.release]

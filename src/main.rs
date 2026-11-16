@@ -96,6 +96,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Command::Prompt { kind, pane }) => {
+            use std::os::fd::AsFd;
+            let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
+            match xcomm::pick::run_prompt(kind, &pane, stdin.as_fd(), stdout.as_fd(), &env) {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(e) => {
+                    out::report(&format!("pick: {e}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::Pick) => {
             use std::os::fd::AsFd;
             let (stdin, stdout) = (std::io::stdin(), std::io::stdout());

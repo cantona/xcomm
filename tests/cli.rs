@@ -1014,3 +1014,29 @@ fn watch_parses() {
     }
     assert!(err(&["watch", "start", "now"], &[]).contains("expected start, stop"));
 }
+
+#[test]
+fn pick_prompt_and_ctl_pane_parse() {
+    use xcomm::pick::PromptKind;
+    assert_eq!(
+        parse_with(&["pick", "--prompt", "baud", "--pane", "w1:p2"], &[]).unwrap(),
+        Command::Prompt {
+            kind: PromptKind::Baud,
+            pane: "w1:p2".into()
+        }
+    );
+    assert!(err(&["pick", "--prompt", "frob", "--pane", "p"], &[]).contains("expected capture"));
+    assert!(err(&["pick", "--prompt", "baud", "--pane", ""], &[]).contains("needs a pane id"));
+    let c = ctl(&["--pane", "w1:p2", "dtr", "toggle"]);
+    assert_eq!((c.device, c.pane.as_deref()), (None, Some("w1:p2")));
+    assert_eq!(ctl(&["--pane-from-context"]).cmd, CtlCmd::PaneFromContext);
+    for v in [
+        &["--pane-from-context", "x"][..],
+        &["--pane-from-context", "--pane", "p"],
+        &["--json", "--pane-from-context"],
+        &["--pane-from-context", "-n"],
+    ] {
+        assert!(ctl_err(v).contains("takes nothing else"), "{v:?}");
+    }
+    assert!(ctl_err(&["--pane", "p", "sessions"]).contains("usage"));
+}

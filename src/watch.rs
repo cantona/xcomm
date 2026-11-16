@@ -621,6 +621,7 @@ fn watch(env: &dyn Fn(&str) -> Option<String>) -> Result<(), WatchError> {
     let signals = crate::hosttty::SignalPipe::install(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP])
         .map_err(|e| WatchError(format!("signals: {e}")))?;
     let herdr = herdr(env)?;
+    let server_socket = PathBuf::from(env("HERDR_SOCKET_PATH").unwrap_or_default());
     // Looked up when wanted: a directory made after the start counts.
     let socket_dirs = || -> Vec<PathBuf> {
         crate::ctl::path::socket_dirs(env)
@@ -665,6 +666,13 @@ fn watch(env: &dyn Fn(&str) -> Option<String>) -> Result<(), WatchError> {
         if signalled {
             let _ = signals.drain();
             say("stopping");
+            return Ok(());
+        }
+        // A plugin's background process ends with its herdr server, whose
+        // socket goes with it: looked at on every wake, a minute apart at
+        // most.
+        if !server_socket.exists() {
+            say("the herdr server is gone; stopping");
             return Ok(());
         }
         if event && devices.take_events() {

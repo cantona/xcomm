@@ -108,6 +108,9 @@ struct Client {
     /// It closed the connection with requests unread: they still run
     /// (`printf ... | socat -u`), with no one to answer.
     unattended: bool,
+    /// Its replies cannot be written any more. No close need ever come,
+    /// so it is dropped once what it sent has run.
+    unwritable: bool,
     dead: bool,
 }
 
@@ -128,6 +131,7 @@ impl Client {
             closing: false,
             eof: false,
             unattended: false,
+            unwritable: false,
             dead: false,
         }
     }
@@ -177,6 +181,11 @@ impl Client {
     /// Sending, or waiting on the session for its action's result.
     fn waiting(&self) -> bool {
         self.sending.is_some() || self.action.is_some() || self.awaiting
+    }
+
+    /// A whole request is in `input`, waiting to be handled.
+    fn has_request(&self) -> bool {
+        self.input[self.scanned..].contains(&b'\n')
     }
 
     /// Where the first request line in `input` ends.
@@ -236,8 +245,13 @@ impl Client {
                 Ok(n) => self.written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // The peer is gone: there is no one to answer, but what it
+                // sent before closing still runs.
                 Err(_) => {
-                    self.dead = true;
+                    self.unattended = true;
+                    self.unwritable = true;
+                    self.output = Vec::new();
+                    self.written = 0;
                     return;
                 }
             }
@@ -305,13 +319,17 @@ impl Client {
             self.eof = true;
         }
         if !self.unattended && (hup || (revents == 0 && was_waiting)) && self.peer_gone() {
-            // What it was waiting for is not wanted now. Requests that came
-            // with the close still run.
-            if was_waiting {
-                self.dead = true;
-                return;
-            }
+            // What it was waiting for is not wanted now; what it sent
+            // before closing still runs, so the rest of its requests are
+            // read first (they are in the socket until then).
             self.unattended = true;
+            if was_waiting {
+                self.sending = None;
+                self.action = None;
+            }
+            if !self.eof && !self.take_input(true) {
+                self.eof = true;
+            }
         }
         loop {
             self.send_more(s);
@@ -333,6 +351,13 @@ impl Client {
             }
         }
         if self.dead {
+            return;
+        }
+        // Nothing can be written to it and it may never close: once what
+        // it sent has run, it is only holding a place. A subscriber runs no
+        // more requests, and nothing it subscribed to can reach it.
+        if self.unwritable && !self.busy() && (self.cursor.is_some() || !self.has_request()) {
+            self.dead = true;
             return;
         }
         // A subscriber that closes even only its writing side is done,
@@ -595,9 +620,16 @@ impl CtlServer {
     pub fn pending_action(&mut self) -> Option<(u64, &Action)> {
         let now = proto::now_ms();
         for c in &mut self.clients {
-            if c.action.is_some() && !c.unattended && c.peer_gone() {
+            let gone = c.action.is_some() && c.peer_gone();
+            if gone && !c.unattended {
                 c.action = None;
                 c.dead = true;
+            } else if gone && matches!(c.action, Some(Action::Xfer { .. })) {
+                // The other requests of a client that closed still run; a
+                // transfer cannot. It takes the port, sends the device a
+                // handshake, and `abandoned` aborts it on the first turn
+                // of the loop.
+                c.action = None;
             } else if c.action.is_some() && c.action_deadline.is_some_and(|d| now > d) {
                 c.action = None;
                 c.reply(expired());
@@ -685,7 +717,14 @@ impl CtlServer {
             };
             out.push(pollfd(fd, c.events(ring_end)));
         }
-        paused
+        // A client that has closed is polled for nothing, so a request of
+        // its own that is already read needs a pass of its own to run in;
+        // so does dropping one that cannot be answered.
+        let ready = self
+            .clients
+            .iter()
+            .any(|c| !c.busy() && (c.unwritable || (c.cursor.is_none() && c.has_request())));
+        if ready { Some(Instant::now()) } else { paused }
     }
 
     /// Acts on what poll found, `ready` being what
@@ -750,8 +789,10 @@ impl CtlServer {
             }
             let mut c = Client::new(self.next_id, stream);
             self.next_id += 1;
-            // A request may already be there.
-            c.step(libc::POLLIN, self.mode, s);
+            // A request may already be there, and the close with it: then
+            // it is unread at the close like any other, not given up on.
+            let hup = if c.peer_gone() { libc::POLLHUP } else { 0 };
+            c.step(libc::POLLIN | hup, self.mode, s);
             if !c.dead {
                 self.clients.push(c);
             }

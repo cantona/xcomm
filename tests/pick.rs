@@ -376,3 +376,121 @@ fn a_failed_open_is_shown_and_the_picker_stays() {
     assert_eq!(s.wait_exit(T).code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn prompt_answers_become_requests() {
+    use std::path::{Path, PathBuf};
+    use xcomm::cli::CtlCmd;
+    use xcomm::pick::{PromptKind, prompt_request};
+    let home = Path::new("/home/u");
+    let req = |kind, answer: &str| prompt_request(kind, answer, "w1:p2", home);
+    let (args, cwd) = req(PromptKind::Capture, " logs/boot.txt ").unwrap();
+    assert_eq!(args.pane.as_deref(), Some("w1:p2"));
+    assert_eq!(args.device, None);
+    assert_eq!(
+        args.cmd,
+        CtlCmd::CaptureStart(PathBuf::from("/home/u/logs/boot.txt"))
+    );
+    assert_eq!(cwd, None);
+    let (args, _) = req(PromptKind::Capture, "/tmp/c.txt").unwrap();
+    assert_eq!(args.cmd, CtlCmd::CaptureStart(PathBuf::from("/tmp/c.txt")));
+    // `~//x` is $HOME/x, as in a shell.
+    let (args, _) = req(PromptKind::Capture, "~//boot.txt").unwrap();
+    assert_eq!(
+        args.cmd,
+        CtlCmd::CaptureStart(PathBuf::from("/home/u/boot.txt"))
+    );
+    let (args, _) = req(PromptKind::Baud, "9600").unwrap();
+    assert!(matches!(args.cmd, CtlCmd::Set { ref patch } if patch.baud == Some(9600)));
+    for bad in ["", "96k", "0", "-1"] {
+        assert!(req(PromptKind::Baud, bad).is_err(), "{bad:?}");
+    }
+    let (args, _) = req(PromptKind::SendFile, "a.bin  ~/fw/b.bin /x/c").unwrap();
+    assert!(matches!(
+        args.cmd,
+        CtlCmd::Xfer { ref files, .. } if *files == [
+            PathBuf::from("/home/u/a.bin"),
+            PathBuf::from("/home/u/fw/b.bin"),
+            PathBuf::from("/x/c"),
+        ]
+    ));
+    assert!(req(PromptKind::SendFile, "  ").is_err());
+    let (args, cwd) = req(PromptKind::RecvFile, "").unwrap();
+    assert!(matches!(args.cmd, CtlCmd::Xfer { ref files, .. } if files.is_empty()));
+    assert_eq!(cwd.as_deref(), Some(home));
+    let (_, cwd) = req(PromptKind::RecvFile, "Downloads").unwrap();
+    assert_eq!(cwd, Some(PathBuf::from("/home/u/Downloads")));
+}
+
+#[test]
+fn a_prompt_that_cannot_run_holds_the_popup_open() {
+    // The popup closes when this exits, so an error has to be shown and
+    // held here, not left on stderr.
+    let dir = lock_dir("pick-prompt");
+    let mut s = spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &["pick", "--prompt", "recv-file", "--pane", "w1:p2"],
+        &dir,
+        &[("HOME", dir.to_str().unwrap())],
+    );
+    read_until(s.host.master.as_fd(), b"receive", T);
+    // A byte that is not UTF-8 (Latin-1 e-acute) is refused, not replaced:
+    // that would name another directory than the one typed.
+    write_all(s.host.master.as_fd(), b"caf\xe9\r");
+    read_until(s.host.master.as_fd(), b"not UTF-", T);
+    // Ctrl-U clears it. UTF-8 reaches the request, and `~//` is $HOME/.
+    write_all(s.host.master.as_fd(), b"\x15");
+    write_all(s.host.master.as_fd(), "~//nope/caf\u{e9}\r".as_bytes());
+    let seen = read_until(s.host.master.as_fd(), b"press Enter to close", T);
+    let seen = String::from_utf8_lossy(&seen).into_owned();
+    assert!(
+        seen.contains(&format!("{}/nope/caf\u{e9}", dir.display())),
+        "{seen}"
+    );
+    write_all(s.host.master.as_fd(), b"\r");
+    assert_eq!(s.wait_exit(T).code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prompt_lines_are_cut_by_columns() {
+    use xcomm::pick::{head_cols, tail_cols};
+    assert_eq!(head_cols("not UTF-8; Ctrl-U clears", 8), "not UTF-");
+    // A wide character takes two columns, and is not split.
+    assert_eq!(head_cols("~/下載/fw.bin", 5), "~/下");
+    assert_eq!(head_cols("~/下載/fw.bin", 6), "~/下載");
+    assert_eq!(tail_cols("~/下載/fw.bin", 9), "載/fw.bin");
+    assert_eq!(tail_cols("~/下載/fw.bin", 8), "/fw.bin");
+    assert_eq!(tail_cols("abc", 10), "abc");
+}
+
+#[test]
+fn an_arrow_key_does_not_cancel_the_prompt() {
+    let dir = lock_dir("pick-arrow");
+    let mut s = spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &["pick", "--prompt", "baud", "--pane", "w9:none"],
+        &dir,
+        &[("HOME", dir.to_str().unwrap())],
+    );
+    read_until(s.host.master.as_fd(), b"> ", T);
+    write_all(s.host.master.as_fd(), b"96");
+    write_all(s.host.master.as_fd(), b"\x1b[D");
+    write_all(s.host.master.as_fd(), b"\x1bOA");
+    // Cut between reads: after the ESC, and after the introducer.
+    write_all(s.host.master.as_fd(), b"\x1b");
+    std::thread::sleep(Duration::from_millis(5));
+    write_all(s.host.master.as_fd(), b"[D");
+    write_all(s.host.master.as_fd(), b"\x1b[");
+    std::thread::sleep(Duration::from_millis(5));
+    write_all(s.host.master.as_fd(), b"D");
+    // More than one read takes, with an ESC where the first one ends.
+    write_all(s.host.master.as_fd(), &b"\x1b[D".repeat(100));
+    write_all(s.host.master.as_fd(), b"00");
+    read_until(s.host.master.as_fd(), b"> 9600", T);
+    assert!(s.child.try_wait().unwrap().is_none(), "it closed");
+    // Esc alone still cancels.
+    write_all(s.host.master.as_fd(), b"\x1b");
+    assert_eq!(s.wait_exit(T).code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}

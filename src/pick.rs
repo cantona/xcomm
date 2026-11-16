@@ -585,3 +585,319 @@ impl Lister {
         self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
+
+/// What a plugin action's prompt asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// A file to capture to.
+    Capture,
+    Baud,
+    /// Files to send with ZMODEM.
+    SendFile,
+    /// The directory ZMODEM files are received into.
+    RecvFile,
+}
+
+impl PromptKind {
+    pub fn parse(s: &str) -> Option<PromptKind> {
+        Some(match s {
+            "capture" => PromptKind::Capture,
+            "baud" => PromptKind::Baud,
+            "send-file" => PromptKind::SendFile,
+            "recv-file" => PromptKind::RecvFile,
+            _ => return None,
+        })
+    }
+
+    /// Short enough for a small popup; the long form goes under it.
+    fn question(self) -> &'static str {
+        match self {
+            PromptKind::Capture => "capture to file",
+            PromptKind::Baud => "baud rate",
+            PromptKind::SendFile => "send files",
+            PromptKind::RecvFile => "receive into",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            PromptKind::Capture => "a path; ~/ is your home",
+            PromptKind::Baud => "digits, as 115200",
+            PromptKind::SendFile => "paths, separated by spaces (ZMODEM)",
+            PromptKind::RecvFile => "a directory; empty is your home (ZMODEM)",
+        }
+    }
+}
+
+/// The `xcomm ctl` request an answer makes, for the session in `pane`.
+/// Paths that are not absolute are from `home` (a plugin's commands run
+/// in the plugin's own directory). Err: what is wrong with the answer.
+pub fn prompt_request(
+    kind: PromptKind,
+    answer: &str,
+    pane: &str,
+    home: &std::path::Path,
+) -> Result<(crate::cli::CtlArgs, Option<std::path::PathBuf>), String> {
+    use crate::cli::{CtlArgs, CtlCmd};
+    use crate::ctl::proto::{SettingsPatch, XferDir, XferProto};
+    let answer = answer.trim();
+    let path = |p: &str| {
+        let p = match p.strip_prefix("~/") {
+            // `~//boot.txt` is $HOME/boot.txt, as in a shell:
+            // `home.join("/boot.txt")` would be `/boot.txt`.
+            Some(rest) => home.join(rest.trim_start_matches('/')),
+            None => std::path::PathBuf::from(p),
+        };
+        if p.is_absolute() { p } else { home.join(p) }
+    };
+    if answer.is_empty() && kind != PromptKind::RecvFile {
+        return Err("nothing given".into());
+    }
+    let mut cwd = None;
+    let cmd = match kind {
+        PromptKind::Capture => CtlCmd::CaptureStart(path(answer)),
+        PromptKind::Baud => {
+            let baud = answer
+                .parse::<u32>()
+                .ok()
+                .filter(|&b| b > 0 && answer.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| format!("not a baud rate: '{answer}'"))?;
+            CtlCmd::Set {
+                patch: SettingsPatch {
+                    baud: Some(baud),
+                    ..SettingsPatch::default()
+                },
+            }
+        }
+        PromptKind::SendFile => CtlCmd::Xfer {
+            dir: XferDir::Send,
+            proto: XferProto::Zmodem,
+            files: answer.split_whitespace().map(path).collect(),
+        },
+        PromptKind::RecvFile => {
+            cwd = Some(if answer.is_empty() {
+                home.to_path_buf()
+            } else {
+                path(answer)
+            });
+            CtlCmd::Xfer {
+                dir: XferDir::Recv,
+                proto: XferProto::Zmodem,
+                files: Vec::new(),
+            }
+        }
+    };
+    Ok((
+        CtlArgs {
+            device: None,
+            pane: Some(pane.to_string()),
+            cmd,
+            json: false,
+        },
+        cwd,
+    ))
+}
+
+/// Columns `c` takes on a terminal: 2 in the East Asian wide and emoji
+/// ranges, 1 otherwise. Close enough to cut a line to a popup's width.
+fn columns(c: char) -> usize {
+    match u32::from(c) {
+        0x1100..=0x115f
+        | 0x2e80..=0x303e
+        | 0x3041..=0x33ff
+        | 0x3400..=0x4dbf
+        | 0x4e00..=0x9fff
+        | 0xa000..=0xa4cf
+        | 0xac00..=0xd7a3
+        | 0xf900..=0xfaff
+        | 0xfe30..=0xfe4f
+        | 0xff00..=0xff60
+        | 0xffe0..=0xffe6
+        | 0x1f300..=0x1f64f
+        | 0x1f900..=0x1f9ff
+        | 0x20000..=0x3fffd => 2,
+        _ => 1,
+    }
+}
+
+/// The start of `text` that fits in `cols` columns.
+pub fn head_cols(text: &str, cols: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|&c| {
+            used += columns(c);
+            used <= cols
+        })
+        .collect()
+}
+
+/// The end of `text` that fits in `cols` columns.
+pub fn tail_cols(text: &str, cols: usize) -> String {
+    let mut used = 0;
+    let mut tail: Vec<char> = text
+        .chars()
+        .rev()
+        .take_while(|&c| {
+            used += columns(c);
+            used <= cols
+        })
+        .collect();
+    tail.reverse();
+    tail.into_iter().collect()
+}
+
+/// The prompt popup: asks for one line, runs the request it makes on the
+/// session in `pane`, and on a failure shows why until a key is pressed.
+pub fn run_prompt(
+    kind: PromptKind,
+    pane: &str,
+    input: BorrowedFd<'_>,
+    output: BorrowedFd<'_>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, PickError> {
+    // The popup pane closes the moment this returns, so what went wrong is
+    // shown here and held: on stderr it would be gone before it was read.
+    let hold = |text: &str| -> Result<i32, PickError> {
+        let _ = write_all(
+            output,
+            format!("\r\nxcomm: {text}\r\npress Enter to close").as_bytes(),
+        );
+        // Keys typed before the message was up must not close it.
+        let _ = rustix::termios::tcflush(input, rustix::termios::QueueSelector::IFlush);
+        let mut buf = [0u8; 16];
+        let _ = rustix::io::read(input, &mut buf);
+        Ok(1)
+    };
+    let Some(home) = env("HOME")
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return hold("HOME is not set");
+    };
+    let raw = match crate::hosttty::RawMode::enter(input) {
+        Ok(raw) => raw,
+        Err(e) => return hold(&format!("raw mode: {e}")),
+    };
+    let mut line: Vec<u8> = Vec::new();
+    let mut message: Option<String> = None;
+    let answer = loop {
+        // A popup is small and herdr draws a border round it: each line
+        // is cut to the width, and the hint goes only where there is room.
+        let size = rustix::termios::tcgetwinsize(output).ok();
+        let cols = usize::from(size.map_or(0, |s| s.ws_col)).max(8);
+        let rows = size.map_or(3, |s| s.ws_row);
+        let cut = |text: &str| head_cols(text, cols);
+        let mut lines = vec![cut(&format!("{} (Esc cancels)", kind.question()))];
+        match (&message, rows >= 3) {
+            (Some(m), _) => lines.push(cut(m)),
+            (None, true) => lines.push(cut(kind.hint())),
+            (None, false) => {}
+        }
+        // The end of the line, where the typing is, stays in view.
+        let typed = String::from_utf8_lossy(&line);
+        lines.push(format!("> {}", tail_cols(&typed, cols.saturating_sub(2))));
+        let screen = format!("\x1b[H\x1b[2J{}", lines.join("\r\n"));
+        // Out of raw mode first, so that it is Enter that closes.
+        if let Err(e) = write_all(output, screen.as_bytes()) {
+            drop(raw);
+            return hold(&format!("terminal: {e}"));
+        }
+        let mut buf = [0u8; 256];
+        let n = match rustix::io::read(input, &mut buf) {
+            Ok(0) => return Ok(1),
+            Ok(n) => n,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                drop(raw);
+                return hold(&format!("terminal: {e}"));
+            }
+        };
+        let mut keys = buf[..n].to_vec();
+        // A key's sequence cut between reads waits its 25 ms for the rest,
+        // as in the picker: a lone ESC is Esc only once none comes.
+        let since = Instant::now();
+        while incomplete(&keys) {
+            let left = ESC_WAIT.saturating_sub(since.elapsed());
+            let timeout = rustix::event::Timespec::try_from(left).unwrap_or_default();
+            let mut fds = [rustix::event::PollFd::new(
+                &input,
+                rustix::event::PollFlags::IN,
+            )];
+            if left.is_zero() || !matches!(rustix::event::poll(&mut fds, Some(&timeout)), Ok(1..)) {
+                break;
+            }
+            match rustix::io::read(input, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => keys.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        let mut done = None;
+        let mut i = 0;
+        while i < keys.len() {
+            let b = keys[i];
+            i += 1;
+            match b {
+                b'\r' | b'\n' => {
+                    done = Some(Some(line.clone()));
+                    break;
+                }
+                // An arrow, Home or F-key: up to its final byte, ignored.
+                0x1b if matches!(keys.get(i), Some(b'[' | b'O')) => {
+                    let rest = &keys[i + 1..];
+                    i += 1 + rest
+                        .iter()
+                        .position(|b| (0x40..=0x7e).contains(b))
+                        .map_or(rest.len(), |p| p + 1);
+                }
+                // Alt with a key: not a lone Esc.
+                0x1b if keys.get(i).is_some_and(|&b| b != 0x1b) => i += 1,
+                0x1b | 0x03 => {
+                    done = Some(None);
+                    break;
+                }
+                0x7f | 0x08 => {
+                    // One character, which UTF-8 spreads over bytes.
+                    while line.pop().is_some_and(|b| (0x80..0xc0).contains(&b)) {}
+                }
+                0x15 => line.clear(),
+                0x20..=0x7e | 0x80.. => line.push(b),
+                _ => {}
+            }
+        }
+        match done {
+            Some(None) => return Ok(0),
+            // Replacing what is not UTF-8 would name another file than
+            // the one typed.
+            Some(Some(answer)) => match String::from_utf8(answer) {
+                Ok(answer) => match prompt_request(kind, &answer, pane, &home) {
+                    Ok(request) => break request,
+                    Err(why) => message = Some(why),
+                },
+                Err(_) => message = Some("not UTF-8; Ctrl-U clears".into()),
+            },
+            None => {}
+        }
+    };
+    let _ = write_all(output, b"\x1b[H\x1b[2J");
+    drop(raw);
+    let (args, cwd) = answer;
+    if let Some(dir) = &cwd
+        && let Err(e) = std::env::set_current_dir(dir)
+    {
+        return hold(&format!("{}: {e}", dir.display()));
+    }
+    if matches!(args.cmd, crate::cli::CtlCmd::Xfer { .. }) {
+        let _ = write_all(output, b"xcomm: transfer running (Ctrl-C aborts it)\r\n");
+    }
+    let status = crate::ctl::client::run(&args, env);
+    if status != 0 {
+        // The error is above, on stderr: leave it in view. Keys typed
+        // while the command ran must not close it.
+        let _ = write_all(output, b"\r\npress Enter to close");
+        let _ = rustix::termios::tcflush(input, rustix::termios::QueueSelector::IFlush);
+        let mut buf = [0u8; 16];
+        let _ = rustix::io::read(input, &mut buf);
+    }
+    Ok(i32::from(status))
+}

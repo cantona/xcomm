@@ -34,14 +34,21 @@ pub(super) type Failed = (u8, String);
 
 fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8, Failed> {
     let dirs = Dirs::find(env);
-    let device = match (&args.cmd, &args.device) {
-        (CtlCmd::Sessions, _) => return sessions(&dirs, args.json),
-        (_, Some(device)) => device,
-        (_, None) => return Err((code::USAGE, "a device is needed".into())),
-    };
-    let mut conn = Conn::open(&dirs, device)?;
     match &args.cmd {
-        CtlCmd::Sessions => unreachable!("handled above"),
+        CtlCmd::Sessions => return sessions(&dirs, args.json),
+        CtlCmd::PaneFromContext => {
+            let pane = context_pane(env).ok_or((
+                code::FAILED,
+                "no pane in HERDR_PLUGIN_CONTEXT_JSON (run from a herdr plugin action)".to_string(),
+            ))?;
+            print_out(format!("{pane}\n").as_bytes())?;
+            return Ok(code::OK);
+        }
+        _ => {}
+    }
+    let mut conn = Conn::open_for(&dirs, args)?;
+    match &args.cmd {
+        CtlCmd::Sessions | CtlCmd::PaneFromContext => unreachable!("handled above"),
         CtlCmd::Status => {
             let reply = conn.request(&Request::Status)?;
             if args.json {
@@ -267,6 +274,16 @@ fn action_timeout(conn: &mut Conn, hold_ms: u32) -> Result<Option<Duration>, Fai
     ))
 }
 
+/// The pane a herdr plugin action was invoked on.
+fn context_pane(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let json = env("HERDR_PLUGIN_CONTEXT_JSON")?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    v["focused_pane_id"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
 /// `file` from this client's directory: the session's is another.
 fn absolute(file: &Path) -> Result<std::path::PathBuf, Failed> {
     std::path::absolute(file).map_err(|e| (code::FAILED, format!("{}: {e}", file.display())))
@@ -372,6 +389,51 @@ impl Conn {
             }
         }
         Err(failed.unwrap_or_else(|| dirs.none(device)))
+    }
+
+    /// The session `args` names: by device, or by herdr pane.
+    pub(super) fn open_for(dirs: &Dirs, args: &CtlArgs) -> Result<Conn, Failed> {
+        match (&args.device, &args.pane) {
+            (Some(device), None) => Conn::open(dirs, device),
+            (None, Some(pane)) => Conn::open_pane(dirs, pane),
+            _ => Err((code::USAGE, "a device or --pane is needed".into())),
+        }
+    }
+
+    /// The session whose status names herdr pane `pane`. Two in one pane
+    /// (a second started there by hand) is an error: which one an action
+    /// reached would depend on how their sockets sort.
+    fn open_pane(dirs: &Dirs, pane: &str) -> Result<Conn, Failed> {
+        let found: Vec<(std::path::PathBuf, String)> = socket_files(&dirs.ok)
+            .into_iter()
+            .filter_map(|sock| {
+                let s = status_of(&sock)?;
+                (s["herdr_pane"] == pane)
+                    .then(|| (sock, s["device"].as_str().unwrap_or("?").to_string()))
+            })
+            .collect();
+        if found.len() > 1 {
+            let devices: Vec<&str> = found.iter().map(|(_, d)| d.as_str()).collect();
+            return Err((
+                code::FAILED,
+                format!(
+                    "{} xcomm sessions in pane {pane} ({}): name the device instead",
+                    found.len(),
+                    devices.join(", ")
+                ),
+            ));
+        }
+        if let Some((sock, _)) = found.first()
+            && let Ok(stream) = UnixStream::connect(sock)
+        {
+            return Conn::new(sock, stream, Some(REPLY_TIMEOUT))
+                .map_err(|e| (code::FAILED, e.to_string()));
+        }
+        let mut msg = format!("no xcomm session in pane {pane}");
+        for why in &dirs.skipped {
+            msg.push_str(&format!(" (not looked in: {why})"));
+        }
+        Err((code::NO_SESSION, msg))
     }
 
     pub(super) fn new(

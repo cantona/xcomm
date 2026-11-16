@@ -923,11 +923,14 @@ fn an_action_given_up_on_is_not_run_later() {
     std::fs::write(&file, vec![b'f'; 200 << 10]).unwrap();
     let filler = ctl_spawn(&s, &[&path, "send", "--file", file.to_str().unwrap()]);
     std::thread::sleep(Duration::from_millis(300));
-    // Asked, then given up on while it waits behind the queue.
+    // Asked, then given up on while it waits behind the queue. The
+    // session has read it and holds it by the time of the close: that is
+    // what a user pressing Ctrl-C leaves behind, and what is given up on.
     let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
     stream
         .write_all(b"{\"cmd\":\"set\",\"baud\":4800}\n")
         .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
     drop(stream);
     // Past the 2 s a waiting action gets.
     std::thread::sleep(Duration::from_secs(3));
@@ -1226,4 +1229,246 @@ fn markers_for_a_terminal_nobody_reads_do_not_stop_the_session() {
     assert!(count < got.find("AFTER").unwrap());
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     device.join().unwrap();
+}
+
+#[test]
+fn a_session_is_found_by_its_herdr_pane() {
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let s = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path],
+        &lock_dir("ctl-pane"),
+        &[("HERDR_PANE_ID", "w9:p7")],
+    );
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    let v = json(&ctl(&s, &["--json", "--pane", "w9:p7", "status"]));
+    assert_eq!(v["device"], path.as_str());
+    assert_eq!(v["herdr_pane"], "w9:p7");
+    let o = ctl(&s, &["--pane", "w9:p7", "send", "-n", "hi"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(read_until(dev.master.as_fd(), b"hi", T), b"hi");
+    let o = ctl(&s, &["--pane", "w9:p8", "status"]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        stderr(&o).contains("no xcomm session in pane w9:p8"),
+        "{}",
+        stderr(&o)
+    );
+    // A second session in the same pane: which one an action reached would
+    // be down to how the sockets sort, so neither is.
+    let dev2 = support::pty();
+    let path2 = dev2.slave_path.to_str().unwrap().to_string();
+    let s2 = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path2],
+        &s.lock_dir,
+        &[("HERDR_PANE_ID", "w9:p7")],
+    );
+    read_until(s2.host.master.as_fd(), b"\r\n", T);
+    let o = ctl(&s, &["--pane", "w9:p7", "status"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let e = stderr(&o);
+    assert!(e.contains("2 xcomm sessions in pane w9:p7"), "{e}");
+    assert!(e.contains(&path) && e.contains(&path2), "{e}");
+    drop(s2);
+}
+
+#[test]
+fn the_pane_of_a_plugin_action() {
+    let run = |json: Option<&str>| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"));
+        c.args(["ctl", "--pane-from-context"]);
+        match json {
+            Some(j) => c.env("HERDR_PLUGIN_CONTEXT_JSON", j),
+            None => c.env_remove("HERDR_PLUGIN_CONTEXT_JSON"),
+        };
+        c.output().unwrap()
+    };
+    let o = run(Some(r#"{"workspace_id":"w1","focused_pane_id":"w1:p3"}"#));
+    assert_eq!((o.status.code(), stdout(&o).as_str()), (Some(0), "w1:p3\n"));
+    for j in [None, Some("{}"), Some("not json")] {
+        let o = run(j);
+        assert_eq!(o.status.code(), Some(1), "{j:?}");
+        assert!(stderr(&o).contains("no pane in HERDR_PLUGIN_CONTEXT_JSON"));
+    }
+}
+
+#[test]
+fn a_request_behind_one_being_served_still_runs_after_the_close() {
+    let (dev, s, path) = start(&[]);
+    let file = s.lock_dir.join("behind.txt");
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    // A send the device cannot take (its terminal is never read), so the
+    // session is still sending when the close comes, and a request behind
+    // it that must run all the same.
+    let big = base64_encode(&vec![b'z'; 256 << 10]);
+    stream
+        .write_all(format!("{{\"cmd\":\"send\",\"data_b64\":\"{big}\"}}\n").as_bytes())
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "{{\"cmd\":\"capture_start\",\"path\":\"{}\"}}\n",
+                file.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    // Long enough for the session to read the send and start it.
+    std::thread::sleep(Duration::from_millis(300));
+    drop(stream);
+    let until = std::time::Instant::now() + T;
+    loop {
+        let v = json(&ctl(&s, &["--json", &path, "status"]));
+        if v["capture"] == file.to_str().unwrap() {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "{v}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(dev);
+}
+
+#[test]
+fn a_transfer_queued_behind_a_cancelled_request_is_dropped() {
+    let (dev, s, path) = start(&[]);
+    let file = s.lock_dir.join("after-xfer.txt");
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    let big = base64_encode(&vec![b'z'; 256 << 10]);
+    let lines = format!(
+        "{{\"cmd\":\"send\",\"data_b64\":\"{big}\"}}\n\
+         {{\"cmd\":\"xfer\",\"dir\":\"recv\",\"proto\":\"zmodem\",\"cwd\":\"{}\"}}\n\
+         {{\"cmd\":\"capture_start\",\"path\":\"{}\"}}\n",
+        s.lock_dir.display(),
+        file.display()
+    );
+    stream.write_all(lines.as_bytes()).unwrap();
+    // Long enough for the session to read the send and start it.
+    std::thread::sleep(Duration::from_millis(300));
+    drop(stream);
+    // The capture is behind the transfer, so it runs once that is settled.
+    let seen = read_until(s.host.master.as_fd(), b"capturing to", T);
+    let seen = String::from_utf8_lossy(&seen);
+    // No one is there to abort it, or to take what it receives: starting
+    // it would send the device a ZMODEM handshake for nothing.
+    assert!(!seen.contains("transfer"), "{seen}");
+    drop(dev);
+}
+
+#[test]
+fn requests_that_are_there_before_the_accept_still_run() {
+    let (dev, s, path) = start(&[]);
+    // A prompt is open: the session accepts no client meanwhile, so the
+    // requests and the close are all there when it does.
+    write_all(s.host.master.as_fd(), b"\x01p");
+    shown(&s, b"baud [");
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    stream
+        .write_all(b"{\"cmd\":\"send\",\"data_b64\":\"QkJC\"}\n{\"cmd\":\"set\",\"baud\":2400}\n")
+        .unwrap();
+    drop(stream);
+    write_all(s.host.master.as_fd(), b"\x1b");
+    assert_eq!(read_until(dev.master.as_fd(), b"BBB", T), b"BBB");
+    // The reply to the send cannot be written: the request behind it must
+    // not go with it.
+    settled(&s, &path, 2400);
+    // A lone action, where nothing is written back: the accept is the only
+    // place that can see the close, and it is unread at the close too.
+    write_all(s.host.master.as_fd(), b"\x01p");
+    shown(&s, b"baud [");
+    let mut stream = UnixStream::connect(socket(&s, &path)).unwrap();
+    stream
+        .write_all(b"{\"cmd\":\"set\",\"baud\":1200}\n")
+        .unwrap();
+    drop(stream);
+    write_all(s.host.master.as_fd(), b"\x1b");
+    settled(&s, &path, 1200);
+}
+
+/// Waits for the session to have taken `baud`.
+fn settled(s: &Spawned, path: &str, baud: u32) {
+    let until = std::time::Instant::now() + T;
+    loop {
+        let v = json(&ctl(s, &["--json", path, "status"]));
+        if v["settings"]["baud"] == baud {
+            return;
+        }
+        assert!(std::time::Instant::now() < until, "{v}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Linux only: on macOS a write to a peer that shut its reading side
+// succeeds, so there such a client is an idle one, and keeps its place.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_that_cannot_be_answered_does_not_keep_its_place() {
+    let (_dev, s, path) = start(&[]);
+    let sock = socket(&s, &path);
+    // Each shuts its reading side and asks: the reply cannot be written,
+    // and no close ever comes. More of them than there are places.
+    let held: Vec<UnixStream> = (0..33)
+        .map(|_| {
+            let c = UnixStream::connect(&sock).unwrap();
+            c.shutdown(std::net::Shutdown::Read).unwrap();
+            (&c).write_all(b"{\"cmd\":\"status\"}\n").unwrap();
+            c
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let o = ctl(&s, &[&path, "status"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    drop(held);
+}
+
+// Linux only, as above; and /proc counts the session's descriptors.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_that_cannot_be_answered_is_dropped_on_a_quiet_session() {
+    let (_dev, s, path) = start(&[]);
+    let fds = || {
+        std::fs::read_dir(format!("/proc/{}/fd", s.child.id()))
+            .unwrap()
+            .count()
+    };
+    let before = fds();
+    let c = UnixStream::connect(socket(&s, &path)).unwrap();
+    c.shutdown(std::net::Shutdown::Read).unwrap();
+    // An action: the client is still waiting on it when its accept ends.
+    // Nothing else may wake the session until the descriptors are counted.
+    (&c).write_all(b"{\"cmd\":\"set\",\"baud\":9600}\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fds(), before, "the client is still held");
+    // It was served, not merely never accepted.
+    let v = json(&ctl(&s, &["--json", &path, "status"]));
+    assert_eq!(v["settings"]["baud"], 9600, "{v}");
+    drop(c);
+}
+
+// Linux only, as above; and /proc gives the session's CPU time.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unanswerable_subscriber_does_not_spin_the_session() {
+    let (_dev, s, path) = start(&[]);
+    let ticks = || -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", s.child.id())).unwrap();
+        // utime and stime: fields 14 and 15, after the ")" of the name.
+        let rest = &stat[stat.rfind(')').unwrap() + 2..];
+        let f: Vec<&str> = rest.split(' ').collect();
+        f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+    };
+    let c = UnixStream::connect(socket(&s, &path)).unwrap();
+    c.shutdown(std::net::Shutdown::Read).unwrap();
+    // A request behind the subscribe: a subscriber never runs it.
+    (&c).write_all(b"{\"cmd\":\"subscribe\"}\n{\"cmd\":\"status\"}\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = ticks();
+    std::thread::sleep(Duration::from_secs(1));
+    let used = ticks() - before;
+    // A spinning session uses about 100 ticks a second.
+    assert!(used < 20, "{used} ticks in 1 s");
+    drop(c);
 }

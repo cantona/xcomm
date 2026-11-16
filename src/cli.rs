@@ -275,6 +275,8 @@ pub enum LineEnding {
 pub enum CtlCmd {
     Status,
     Sessions,
+    /// `--pane-from-context`: the pane herdr's plugin context names.
+    PaneFromContext,
     Send {
         data: SendData,
         ending: LineEnding,
@@ -343,6 +345,9 @@ pub const RUN_MAX_BYTES: u64 = 16 << 20;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtlArgs {
     pub device: Option<String>,
+    /// `--pane <id>`: the session in this herdr pane, not one named by its
+    /// device.
+    pub pane: Option<String>,
     pub cmd: CtlCmd,
     pub json: bool,
 }
@@ -367,6 +372,11 @@ pub enum Command {
     },
     /// `xcomm pick`: the port picker of the herdr popup.
     Pick,
+    /// `xcomm pick --prompt <kind> --pane <id>`: a plugin action's question.
+    Prompt {
+        kind: crate::pick::PromptKind,
+        pane: String,
+    },
     /// `xcomm watch [start|stop|status|run]`, `xcomm watch --daemon`.
     Watch(crate::watch::WatchAction),
 }
@@ -492,6 +502,7 @@ Control socket (for scripts and agents, from another terminal):
                              run lrzsz on the session's port; the reply comes
                              when it ends, and Ctrl-C aborts it
   xcomm ctl sessions         the running sessions
+  xcomm ctl --pane <id> ...  the session in herdr pane <id>, not by device
   --json                     the reply as JSON
 
 Keys:
@@ -645,13 +656,15 @@ fn parse_hex(value: &str) -> Result<Vec<u8>, CliError> {
         .collect()
 }
 
-pub const CTL_USAGE: &str = "usage: xcomm ctl [--json] <device> \
+pub const CTL_USAGE: &str = "usage: xcomm ctl [--json] <device> | --pane <id> \
      status|send|read|wait|run|break|dtr|rts|set|capture|xfer ..., \
      or xcomm ctl [--json] sessions";
 
 fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     let mut p = lexopt::Parser::from_args(args.iter().cloned());
     let mut json = false;
+    let mut pane: Option<String> = None;
+    let mut pane_from_context = false;
     let mut words: Vec<String> = Vec::new();
     let mut ending: Option<LineEnding> = None;
     let mut hex: Option<Vec<u8>> = None;
@@ -677,6 +690,8 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     while let Some(arg) = p.next()? {
         match arg {
             Long("json") => json = true,
+            Long("pane") => set_once(&mut pane, text(p.value()?, "--pane")?, "--pane")?,
+            Long("pane-from-context") => pane_from_context = true,
             Short('n') => {
                 set_once(&mut ending, LineEnding::None, "a line ending")?;
                 given.push(("-n", SEND_RUN));
@@ -779,9 +794,21 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
         }
     }
     let usage = || CliError(CTL_USAGE.into());
-    let (device, cmd, rest) = match words.as_slice() {
-        [cmd, rest @ ..] if cmd == "sessions" => (None, "sessions", rest),
-        [device, cmd, rest @ ..] => (Some(device.clone()), cmd.as_str(), rest),
+    if pane_from_context {
+        if !words.is_empty() || pane.is_some() || json || !given.is_empty() {
+            return Err(CliError("--pane-from-context takes nothing else".into()));
+        }
+        return Ok(Command::Ctl(CtlArgs {
+            device: None,
+            pane: None,
+            cmd: CtlCmd::PaneFromContext,
+            json: false,
+        }));
+    }
+    let (device, cmd, rest) = match (words.as_slice(), &pane) {
+        ([cmd, rest @ ..], None) if cmd == "sessions" => (None, "sessions", rest),
+        ([cmd, rest @ ..], Some(_)) if cmd != "sessions" => (None, cmd.as_str(), rest),
+        ([device, cmd, rest @ ..], None) => (Some(device.clone()), cmd.as_str(), rest),
         _ => return Err(usage()),
     };
     if let Some((o, cmds)) = given.iter().find(|(_, cmds)| !cmds.contains(&cmd)) {
@@ -988,7 +1015,12 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
             )));
         }
     };
-    Ok(Command::Ctl(CtlArgs { device, cmd, json }))
+    Ok(Command::Ctl(CtlArgs {
+        device,
+        pane,
+        cmd,
+        json,
+    }))
 }
 
 /// Seconds, fractions allowed; 0 for none.
@@ -1135,12 +1167,28 @@ pub fn parse(
         };
     }
     if args.first().is_some_and(|a| a == "pick") {
-        return match args.get(1) {
-            None => Ok(Command::Pick),
-            Some(a) => Err(CliError(format!(
-                "pick: unexpected argument '{}'",
-                a.to_string_lossy()
-            ))),
+        let words: Vec<String> = args[1..]
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        return match words.as_slice() {
+            [] => Ok(Command::Pick),
+            ["--prompt", kind, "--pane", pane] | ["--pane", pane, "--prompt", kind] => {
+                let kind = crate::pick::PromptKind::parse(kind).ok_or_else(|| {
+                    CliError(format!(
+                        "pick --prompt: expected capture, baud, send-file or recv-file, got '{kind}'"
+                    ))
+                })?;
+                if pane.is_empty() {
+                    return Err(CliError("pick --pane needs a pane id".into()));
+                }
+                Ok(Command::Prompt {
+                    kind,
+                    pane: pane.to_string(),
+                })
+            }
+            [a, ..] => Err(CliError(format!("pick: unexpected argument '{a}'"))),
         };
     }
     // lexopt consumes a bare `--` without returning it; count it here so
