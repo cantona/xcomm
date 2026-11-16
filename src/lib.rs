@@ -16,6 +16,7 @@ pub mod port;
 pub mod reconnect;
 pub mod ring;
 pub mod session;
+pub mod skill;
 pub mod sock;
 pub mod watch;
 pub mod xfer;

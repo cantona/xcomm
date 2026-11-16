@@ -83,6 +83,27 @@ fn main() -> ExitCode {
             .trim_end(),
         ),
         Ok(Command::Version) => print(&format!("xcomm {}", env!("CARGO_PKG_VERSION"))),
+        Ok(Command::Skill) => match out::stdout(xcomm::skill::SKILL_MD.as_bytes()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                out::report(&format!("cannot write to stdout: {e}"));
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::SkillInstall { dir }) => {
+            let installed = match dir {
+                Some(dir) => Ok(dir),
+                None => xcomm::skill::default_dir(&env),
+            }
+            .and_then(|dir| xcomm::skill::install(&dir));
+            match installed {
+                Ok(path) => print(&format!("installed {}", path.display())),
+                Err(e) => {
+                    out::report(&format!("skill: {e}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::ShowPrefix(p)) => print(&p.describe()),
         Ok(Command::Ctl(args)) if matches!(args.cmd, CtlCmd::Wait { .. } | CtlCmd::Run { .. }) => {
             exec_wait()

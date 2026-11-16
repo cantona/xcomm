@@ -1040,3 +1040,34 @@ fn pick_prompt_and_ctl_pane_parse() {
     }
     assert!(ctl_err(&["--pane", "p", "sessions"]).contains("usage"));
 }
+
+#[test]
+fn skill_commands() {
+    assert!(matches!(parse_with(&["--skill"], &[]), Ok(Command::Skill)));
+    assert!(err(&["--skill", "x"], &[]).contains("takes nothing else"));
+    assert!(matches!(
+        parse_with(&["skill", "install"], &[]),
+        Ok(Command::SkillInstall { dir: None })
+    ));
+    match parse_with(&["skill", "install", "--dir", "/x/y"], &[]) {
+        Ok(Command::SkillInstall { dir: Some(d) }) => assert_eq!(d, std::path::Path::new("/x/y")),
+        other => panic!("{other:?}"),
+    }
+    for v in [
+        &["skill"][..],
+        &["skill", "add"],
+        &["skill", "install", "--dir"],
+        &["skill", "install", "--dir", ""],
+        &["skill", "install", "--dir", "a", "b"],
+        &["skill", "install", "x"],
+    ] {
+        assert!(parse_with(v, &[]).is_err(), "{v:?}");
+    }
+    match parse_with(&["skill", "install", "--dir=/x/z"], &[]) {
+        Ok(Command::SkillInstall { dir: Some(d) }) => assert_eq!(d, std::path::Path::new("/x/z")),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse_with(&["skill", "install", "--dir="], &[]).is_err());
+    // A device named skill still opens, after --.
+    assert_eq!(term(&["--", "skill"], &[]).device, "skill");
+}

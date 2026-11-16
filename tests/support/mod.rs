@@ -1,6 +1,8 @@
 //! Shared helpers for integration tests. Not every test file uses every helper.
 #![allow(dead_code)]
 
+pub mod remote;
+
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

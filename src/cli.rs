@@ -379,6 +379,12 @@ pub enum Command {
     },
     /// `xcomm watch [start|stop|status|run]`, `xcomm watch --daemon`.
     Watch(crate::watch::WatchAction),
+    /// `xcomm --skill`: the agent skill, printed.
+    Skill,
+    /// `xcomm skill install [--dir <dir>]`.
+    SkillInstall {
+        dir: Option<PathBuf>,
+    },
 }
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
@@ -404,12 +410,14 @@ Usage:
   xcomm list [--json]
   xcomm pick
   xcomm watch [start|stop|status|run]
+  xcomm --skill
+  xcomm skill install [--dir <dir>]
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
 <device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
 (/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
-a name that starts with '-' (or is ctl, list, pick or watch).
+a name that starts with '-' (or is ctl, list, pick, watch or skill).
 
 xcomm list shows the serial ports: tty, USB VID:PID, product, the lock
 holder, the herdr pane of an xcomm session on it, and the by-id name.
@@ -420,6 +428,15 @@ the background, as the plugin does; --daemon is the same). It reads
 notify = true|false and ignore = [\"0403:6001\", \"usb-FTDI_*\"] from
 $HERDR_PLUGIN_CONFIG_DIR/config.toml; its pid file and log are under
 $HERDR_PLUGIN_STATE_DIR.
+
+xcomm --skill prints the agent skill: how an agent drives a session with
+xcomm ctl. xcomm skill install writes it as SKILL.md in --dir, by default
+~/.agents/skills/xcomm, and replaces only a copy it wrote. The default is
+refused where a dotfiles repository may own it: in a git work tree, with
+GIT_DIR or GIT_WORK_TREE set, or when a repository in $HOME (or yadm's or
+vcsh's) has $HOME as its work tree or is bare and hides untracked files,
+as the usual recipe sets it; give --dir to install there anyway. Other
+setups are not recognised.
 
 Line settings:
   -b <baud>                  baud rate (default 115200)
@@ -487,8 +504,8 @@ Control socket (for scripts and agents, from another terminal):
                              send <text> as send does, then wait as wait
                              does from the offset of the send (or --idle
                              instead of --until); prints the output between
-                             the echoed line and the match, at most
-                             --max-bytes <n> (default 16 MiB)
+                             the echoed line and the match; more than
+                             --max-bytes <n> of it (default 16 MiB) exits 2
   xcomm ctl <device> break [ms]
                              send a break (default 250 ms, at most 5000)
   xcomm ctl <device> dtr|rts on|off|toggle|pulse [ms]
@@ -1165,6 +1182,32 @@ pub fn parse(
                 words.join(" ")
             ))),
         };
+    }
+    if args.first().is_some_and(|a| a == "--skill") {
+        return match args.len() {
+            1 => Ok(Command::Skill),
+            _ => Err(CliError("--skill takes nothing else".into())),
+        };
+    }
+    if args.first().is_some_and(|a| a == "skill") {
+        let mut words = args[1..].iter();
+        if words.next().is_none_or(|w| w != "install") {
+            return Err(CliError("skill: expected install".into()));
+        }
+        let dir = match (words.next(), words.next(), words.next()) {
+            (None, ..) => None,
+            (Some(o), Some(d), None) if o == "--dir" && !d.is_empty() => Some(PathBuf::from(d)),
+            (Some(o), None, None)
+                if o.as_encoded_bytes().starts_with(b"--dir=") && o.len() > "--dir=".len() =>
+            {
+                use std::os::unix::ffi::OsStrExt;
+                Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+                    &o.as_encoded_bytes()["--dir=".len()..],
+                )))
+            }
+            _ => return Err(CliError("usage: xcomm skill install [--dir <dir>]".into())),
+        };
+        return Ok(Command::SkillInstall { dir });
     }
     if args.first().is_some_and(|a| a == "pick") {
         let words: Vec<String> = args[1..]
