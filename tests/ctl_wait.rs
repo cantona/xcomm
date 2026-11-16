@@ -504,11 +504,22 @@ fn without_xcomm_wait_beside_it_wait_exits_2() {
     let dir = lock_dir("ctlw-alone");
     let alone = dir.join("xcomm");
     std::fs::copy(env!("CARGO_BIN_EXE_xcomm"), &alone).unwrap();
-    let o = Command::new(&alone)
-        .args(["ctl", "ttyNONE", "wait", "x"])
-        .env("XDG_RUNTIME_DIR", &dir)
-        .output()
-        .unwrap();
+    // A child another test forks meanwhile holds the copy open for writing
+    // until it execs: running the copy then fails with ETXTBSY for a moment.
+    let mut tries = 0;
+    let o = loop {
+        match Command::new(&alone)
+            .args(["ctl", "ttyNONE", "wait", "x"])
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            r => break r.unwrap(),
+        }
+    };
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(stderr(&o).contains("xcomm-wait"), "{}", stderr(&o));
     let _ = std::fs::remove_dir_all(&dir);
