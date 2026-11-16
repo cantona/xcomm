@@ -321,6 +321,9 @@ pub fn spawn_with(
     for v in [
         "XCOMM_PREFIX",
         "HERDR_ENV",
+        // A session would rename the pane the tests run in.
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
         "HC_TERMINAL_ID",
         "TMUX",
         "STY",

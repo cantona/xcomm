@@ -1036,7 +1036,18 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         tty: tty.clone(),
         herdr_pane: env("HERDR_PANE_ID").filter(|p| !p.is_empty()),
     };
-    let mut kept = commands::Kept::new(capture, ring, server, names, marker);
+    // Only the session the pane shows: not one in the background or
+    // headless, which would take over the name of the pane it was started
+    // from.
+    // Nor one in a multiplexer inside the pane (herdr removes these
+    // variables from its panes, so they are set only below it), where many
+    // sessions would share the pane.
+    let nested = ["TMUX", "STY", "ZELLIJ"]
+        .iter()
+        .any(|v| env(v).is_some_and(|s| !s.is_empty()));
+    let herdr =
+        commands::PaneLabel::new(crate::herdr::Herdr::from_env(env).filter(|_| keys_on && !nested));
+    let mut kept = commands::Kept::new(capture, ring, server, names, marker, herdr);
     let mut port_tty = port.tty_name().to_string();
     // Taken at the open: a descriptor revoked by a hangup cannot be asked
     // (macOS fstat fails on it).
@@ -1054,6 +1065,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             &signals,
             kept,
         );
+        live.update_herdr();
         if std::mem::take(&mut first) && opts.wrap {
             live.set_wrap(true);
         }
@@ -1093,6 +1105,7 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
             &signals,
             kept,
         );
+        live.update_herdr();
         let notice = if keys_on {
             format!(
                 "{} disconnected; waiting for it to come back ({} x quits)",

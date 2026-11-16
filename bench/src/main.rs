@@ -68,7 +68,10 @@ impl Kind {
             .env("LC_ALL", "C")
             .env("TERM", "xterm")
             .env("XCOMM_PREFIX", "ctrl-a")
-            .env_remove("MINICOM");
+            .env_remove("MINICOM")
+            // xcomm would rename the herdr pane the bench runs in.
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_PANE_ID");
         c
     }
 }

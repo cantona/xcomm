@@ -3,6 +3,8 @@
 # Benchmarks xcomm at BASE-REV and in the working tree on the same machine
 # and inputs, and fails if any metric is more than THRESHOLD percent worse.
 set -eu
+# Run inside herdr, the benchmarked sessions would rename this pane.
+unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_ENV
 CDPATH= cd -- "$(dirname -- "$0")/.."
 
 if [ $# -ne 1 ]; then

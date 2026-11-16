@@ -3,7 +3,6 @@
 //! opened but sysfs files, lock files and session sockets.
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,6 +113,15 @@ fn lock_holder(dirs: &[PathBuf], tty: &str) -> (Option<i32>, Option<String>) {
     (None, error)
 }
 
+/// The /dev/serial/by-id link to `tty`, if there is one.
+pub fn by_id_of(tty: &str) -> Option<String> {
+    by_id_links(Path::new("/dev"))
+        .ok()?
+        .into_iter()
+        .find(|(_, t)| t == tty)
+        .map(|(link, _)| format!("/dev/serial/by-id/{link}"))
+}
+
 /// (link name, tty) for each link in `dev/serial/by-id` that leads to a
 /// name directly in `dev`, sorted by link name.
 fn by_id_links(dev: &Path) -> io::Result<Vec<(String, String)>> {
@@ -194,7 +202,7 @@ fn usb_attrs(root: &Path, tty: &str) -> Usb {
 fn herdr_pane(dirs: &[PathBuf], tty: &str) -> Option<String> {
     dirs.iter().find_map(|dir| {
         let sock = crate::ctl::path::socket_path(dir, tty);
-        let stream = connect_now(&sock)?;
+        let stream = crate::sock::connect_now(&sock).ok()?;
         stream.set_read_timeout(Some(STATUS_TIMEOUT)).ok()?;
         stream.set_write_timeout(Some(STATUS_TIMEOUT)).ok()?;
         (&stream).write_all(b"{\"cmd\":\"status\"}\n").ok()?;
@@ -206,35 +214,6 @@ fn herdr_pane(dirs: &[PathBuf], tty: &str) -> Option<String> {
         }
         v["herdr_pane"].as_str().map(str::to_string)
     })
-}
-
-/// Connects without waiting: a session that is not accepting (stopped,
-/// its queue full) must not hold up the list.
-fn connect_now(path: &Path) -> Option<UnixStream> {
-    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect};
-    // Close-on-exec: a program another thread starts must not keep the
-    // session's client open.
-    #[cfg(not(target_os = "macos"))]
-    let fd = rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
-        None,
-    )
-    .ok()?;
-    // macOS has neither flag for socket(2); set as std sets them there.
-    #[cfg(target_os = "macos")]
-    let fd = {
-        let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).ok()?;
-        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC).ok()?;
-        let flags = rustix::fs::fcntl_getfl(&fd).ok()?;
-        rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK).ok()?;
-        fd
-    };
-    connect(&fd, &SocketAddrUnix::new(path).ok()?).ok()?;
-    let stream = UnixStream::from(fd);
-    stream.set_nonblocking(false).ok()?;
-    Some(stream)
 }
 
 /// `s` with control characters (from a device's own descriptors) as `?`.

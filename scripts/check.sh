@@ -3,6 +3,8 @@
 # check.sh --staged check exactly what is staged (the tree the next commit will contain)
 set -eu
 CDPATH= cd -- "$(dirname -- "$0")/.."
+# Run inside herdr, the sessions the tests start would rename this pane.
+unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_ENV
 
 case $# in
 0) ;;

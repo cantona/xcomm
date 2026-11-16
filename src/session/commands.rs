@@ -210,6 +210,7 @@ pub(super) struct Live<'a> {
     retry: Duration,
     /// No terminal at all (`--headless`).
     headless: bool,
+    herdr: PaneLabel,
     signals: &'a SignalPipe,
     echo: bool,
     /// Line wrap as xcomm last set it; terminals start with it on.
@@ -245,6 +246,38 @@ pub(super) struct Kept {
     lines: (Option<bool>, Option<bool>),
     /// Show what control clients send, dim when true.
     marker: Option<bool>,
+    herdr: PaneLabel,
+}
+
+/// This session's herdr pane, named after the port and its state.
+pub(super) struct PaneLabel {
+    herdr: Option<crate::herdr::Herdr>,
+    /// A request failed: said once, and no more are made.
+    failed: bool,
+    shown: Option<PaneState>,
+    /// When to report again, before the last report expires.
+    renew_at: Option<Instant>,
+}
+
+/// What the pane's name and labels were last set from.
+#[derive(Clone, PartialEq, Eq)]
+struct PaneState {
+    tty: String,
+    baud: u32,
+    connected: bool,
+    xfer: bool,
+    cap: bool,
+}
+
+impl PaneLabel {
+    pub(super) fn new(herdr: Option<crate::herdr::Herdr>) -> PaneLabel {
+        PaneLabel {
+            herdr,
+            failed: false,
+            shown: None,
+            renew_at: None,
+        }
+    }
 }
 
 impl Kept {
@@ -254,6 +287,7 @@ impl Kept {
         server: Option<CtlServer>,
         names: Names,
         marker: Option<bool>,
+        herdr: PaneLabel,
     ) -> Kept {
         Kept {
             echo: false,
@@ -264,6 +298,7 @@ impl Kept {
             names,
             lines: (None, None),
             marker,
+            herdr,
         }
     }
 }
@@ -503,6 +538,14 @@ fn signal_waiting(signals: &SignalPipe) -> bool {
     matches!(poll(&mut fds, Some(&rustix::event::Timespec::default())), Ok(n) if n > 0)
 }
 
+/// How long herdr keeps the pane's title and tokens unless they are
+/// reported again (at half this): a session killed outright leaves none
+/// for long.
+const HERDR_TTL: Duration = Duration::from_secs(600);
+/// Longest token value herdr keeps whole. Tokens are the pane's, shared
+/// with every other reporter, hence xcomm's own names for them.
+const HERDR_TOKEN_MAX: usize = 80;
+
 /// Most bytes of a send a marker shows.
 const MARKER_MAX: usize = 200;
 /// How soon the rest of a marker the terminal did not take is tried again,
@@ -565,6 +608,8 @@ impl<'a> Live<'a> {
         mut queue: Result<&mut OutQueue, u8>,
         stdin: Option<BorrowedFd<'_>>,
     ) -> Result<CommandOutcome, SessionError> {
+        // Here, as this runs on every pass: connected, waiting, transferring.
+        self.update_herdr();
         let Some(server) = &mut self.server else {
             return Ok(CommandOutcome::Continue);
         };
@@ -983,6 +1028,7 @@ impl<'a> Live<'a> {
             retry_at: None,
             retry: MARKER_RETRY,
             headless: opts.headless,
+            herdr: kept.herdr,
             signals,
             echo: kept.echo,
             wrap: kept.wrap,
@@ -1013,12 +1059,109 @@ impl<'a> Live<'a> {
             names: self.names,
             lines: self.lines,
             marker: self.marker,
+            herdr: self.herdr,
+        }
+    }
+
+    /// Titles the herdr pane after the port and its state, when that has
+    /// changed: `xcomm ttyUSB0 115200`, then `[gone]`, `[xfer]`, `[cap]`;
+    /// and reports port, baud and by-id name as tokens. The report expires
+    /// unless renewed, so one a crash leaves goes away. A failure is said
+    /// once; the session goes on without herdr.
+    pub(super) fn update_herdr(&mut self) {
+        let Some(h) = self.herdr.herdr.as_ref().filter(|_| !self.herdr.failed) else {
+            return;
+        };
+        let last = self.herdr.shown.as_ref();
+        let baud = self
+            .port
+            .map(|p| p.settings().baud)
+            .or(last.map(|s| s.baud))
+            .unwrap_or(0);
+        let (connected, xfer, cap) = (
+            self.port.is_some(),
+            self.transferring,
+            self.capture.is_some(),
+        );
+        let same = last.is_some_and(|s| {
+            s.tty == self.names.tty
+                && s.baud == baud
+                && s.connected == connected
+                && s.xfer == xfer
+                && s.cap == cap
+        });
+        if same && self.herdr.renew_at.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        let tty = self.names.tty.clone();
+        let mut title = format!("xcomm {tty} {baud}");
+        for (on, tag) in [(!connected, " [gone]"), (xfer, " [xfer]"), (cap, " [cap]")] {
+            if on {
+                title.push_str(tag);
+            }
+        }
+        let baud_text = baud.to_string();
+        let by_id = crate::list::by_id_of(&tty);
+        // herdr keeps 80 characters of a token: a longer name would name
+        // no link.
+        let link = by_id
+            .as_deref()
+            .map(|p| p.rsplit('/').next().unwrap_or(p))
+            .filter(|l| l.chars().count() <= HERDR_TOKEN_MAX);
+        let result = h.report_metadata(
+            Some(&title),
+            &[
+                ("xcomm_port", Some(&tty)),
+                ("xcomm_baud", Some(&baud_text)),
+                ("xcomm_by_id", link),
+            ],
+            Some(HERDR_TTL),
+        );
+        self.herdr.shown = Some(PaneState {
+            tty,
+            baud,
+            connected,
+            xfer,
+            cap,
+        });
+        self.herdr.renew_at = Some(Instant::now() + HERDR_TTL / 2);
+        if let Err(e) = result {
+            self.herdr.failed = true;
+            self.say(&format!("herdr: {e}"));
+        }
+    }
+
+    /// Drops xcomm's title and tokens from the pane, even after a failure:
+    /// what was reported should not outlive the session.
+    fn clear_herdr(&mut self) {
+        let Some(h) = self.herdr.herdr.as_ref() else {
+            return;
+        };
+        if self.herdr.shown.take().is_none() {
+            return;
+        }
+        self.herdr.renew_at = None;
+        let result = h.report_metadata(
+            None,
+            &[
+                ("xcomm_port", None),
+                ("xcomm_baud", None),
+                ("xcomm_by_id", None),
+            ],
+            None,
+        );
+        if let Err(e) = result
+            && !self.herdr.failed
+        {
+            self.herdr.failed = true;
+            self.say(&format!("herdr: {e}"));
         }
     }
 
     /// Writes out the capture, and puts back what commands changed on the
     /// terminal.
     pub(super) fn finish(&mut self) {
+        self.clear_herdr();
         self.end_hold(Some((ctl::code::FAILED, "the session is ending".into())));
         self.show_markers_now(true);
         if let Some(c) = self.capture.take() {
@@ -1488,8 +1631,10 @@ impl<'a> Live<'a> {
             &format!("transfer started{by}: {} ({how})", transfer.program()),
         );
         self.transferring = true;
+        self.update_herdr();
         let ended = self.wait_transfer(&mut transfer, run.stdin, run.typed, run.requester);
         self.transferring = false;
+        self.update_herdr();
         if let Err(e) = transfer.release() {
             self.say(&format!("after the transfer: port: {e}"));
         }
@@ -2036,11 +2181,13 @@ impl Control for Live<'_> {
                 WaitPhase::Driver { .. } => stalled.min(Instant::now() + DRIVER_CHECK),
             }
         });
+        let herdr_due = self.herdr.renew_at.filter(|_| !self.herdr.failed);
         [
             server_due,
             self.hold.as_ref().map(|h| h.until),
             wait_due,
             markers_due,
+            herdr_due,
         ]
         .into_iter()
         .flatten()
