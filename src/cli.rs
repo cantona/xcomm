@@ -385,6 +385,10 @@ pub enum Command {
     SkillInstall {
         dir: Option<PathBuf>,
     },
+    /// `xcomm uninstall`.
+    Uninstall,
+    /// `xcomm doctor`.
+    Doctor,
 }
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
@@ -412,12 +416,15 @@ Usage:
   xcomm watch [start|stop|status|run]
   xcomm --skill
   xcomm skill install [--dir <dir>]
+  xcomm uninstall
+  xcomm doctor
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
 <device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
 (/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
-a name that starts with '-' (or is ctl, list, pick, watch or skill).
+a name that starts with '-' (or is ctl, list, pick, watch, skill,
+uninstall or doctor).
 
 xcomm list shows the serial ports: tty, USB VID:PID, product, the lock
 holder, the herdr pane of an xcomm session on it, and the by-id name.
@@ -437,6 +444,18 @@ GIT_DIR or GIT_WORK_TREE set, or when a repository in $HOME (or yadm's or
 vcsh's) has $HOME as its work tree or is bare and hides untracked files,
 as the usual recipe sets it; give --dir to install there anyway. Other
 setups are not recognised.
+
+xcomm uninstall takes away what an install made, in order, saying how
+each step went: the hotplug watchers, the skill in ~/.agents/skills/xcomm
+(left alone when xcomm did not write it, it is a link, or a dotfiles
+repository has it), the herdr plugin (herdr plugin uninstall or unlink),
+then the binaries (cargo uninstall from ~/.local, CARGO_INSTALL_ROOT and
+CARGO_HOME). It stops at the first failure and says what is left, and
+names an xcomm on PATH that cargo did not install. Use it rather than
+herdr plugin uninstall, which leaves the binaries and the skill. xcomm
+doctor reports what is installed and what is left over (stale sockets
+and locks, a skill or watcher with no binary); it exits 1 when something
+needs attention.
 
 Line settings:
   -b <baud>                  baud rate (default 115200)
@@ -1188,6 +1207,17 @@ pub fn parse(
             1 => Ok(Command::Skill),
             _ => Err(CliError("--skill takes nothing else".into())),
         };
+    }
+    for (word, command) in [
+        ("uninstall", Command::Uninstall),
+        ("doctor", Command::Doctor),
+    ] {
+        if args.first().is_some_and(|a| a == word) {
+            return match args.len() {
+                1 => Ok(command),
+                _ => Err(CliError(format!("{word} takes nothing else"))),
+            };
+        }
     }
     if args.first().is_some_and(|a| a == "skill") {
         let mut words = args[1..].iter();

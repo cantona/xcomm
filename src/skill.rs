@@ -39,12 +39,20 @@ fn split_front_matter(md: &str) -> Option<(&str, &str)> {
     Some((&rest[..end + 1], &rest[end + 5..]))
 }
 
-fn has_marker(md: &str) -> bool {
-    split_front_matter(md).is_some_and(|(front, _)| {
-        front
-            .lines()
-            .any(|l| l.trim_start().starts_with(&format!("{MARKER} ")))
+/// The xcomm version that installed `md`, from the marker in its front
+/// matter; None when it has none.
+pub fn marker_version(md: &str) -> Option<String> {
+    let (front, _) = split_front_matter(md)?;
+    front.lines().find_map(|l| {
+        l.trim_start()
+            .strip_prefix(MARKER)?
+            .strip_prefix(' ')
+            .map(|v| v.trim().to_string())
     })
+}
+
+fn has_marker(md: &str) -> bool {
+    marker_version(md).is_some()
 }
 
 /// Writes `dir/SKILL.md`. A SKILL.md already there is replaced only when
@@ -119,29 +127,37 @@ pub fn default_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, Skil
     let home = env("HOME")
         .filter(|h| h.starts_with('/'))
         .ok_or_else(|| SkillError("HOME is not set to an absolute path: give --dir".into()))?;
-    let home = Path::new(&home);
-    let dir = home.join(".agents/skills/xcomm");
-    let refuse = |why: String| {
-        Err(SkillError(format!(
+    let dir = Path::new(&home).join(".agents/skills/xcomm");
+    match dotfiles_owner(&dir, Path::new(&home), env) {
+        Some(why) => Err(SkillError(format!(
             "{} {why} (dotfiles?): give --dir to install there anyway",
             dir.display()
-        )))
-    };
+        ))),
+        None => Ok(dir),
+    }
+}
+
+/// Why `dir`, under `home`, may belong to a dotfiles repository; None when
+/// nothing says so.
+pub fn dotfiles_owner(
+    dir: &Path,
+    home: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
     for var in ["GIT_DIR", "GIT_WORK_TREE"] {
         if env(var).is_some_and(|v| !v.is_empty()) {
-            return refuse(format!("may be in the repository {var} names"));
+            return Some(format!("may be in the repository {var} names"));
         }
     }
-    if let Some(repo) = git_work_tree(&dir, home) {
-        return refuse(format!("is in the git work tree {}", repo.display()));
+    if let Some(repo) = git_work_tree(dir, home) {
+        return Some(format!("is in the git work tree {}", repo.display()));
     }
-    if let Some(repo) = home_repo(home, env) {
-        return refuse(format!(
+    home_repo(home, env).map(|repo| {
+        format!(
             "is under $HOME, which the repository {} may manage",
             repo.display()
-        ));
-    }
-    Ok(dir)
+        )
+    })
 }
 
 /// The git work tree `path` is in, looked for from its nearest existing

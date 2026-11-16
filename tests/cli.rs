@@ -1071,3 +1071,15 @@ fn skill_commands() {
     // A device named skill still opens, after --.
     assert_eq!(term(&["--", "skill"], &[]).device, "skill");
 }
+
+#[test]
+fn uninstall_and_doctor_commands() {
+    assert!(matches!(
+        parse_with(&["uninstall"], &[]),
+        Ok(Command::Uninstall)
+    ));
+    assert!(matches!(parse_with(&["doctor"], &[]), Ok(Command::Doctor)));
+    assert!(err(&["uninstall", "-y"], &[]).contains("takes nothing else"));
+    assert!(err(&["doctor", "x"], &[]).contains("takes nothing else"));
+    assert_eq!(term(&["--", "doctor"], &[]).device, "doctor");
+}

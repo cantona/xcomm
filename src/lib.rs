@@ -7,6 +7,7 @@ pub mod ctl;
 pub mod devwatch;
 pub mod herdr;
 pub mod hosttty;
+pub mod install;
 pub mod keys;
 pub mod list;
 pub mod lock;

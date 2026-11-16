@@ -90,6 +90,33 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Command::Uninstall) => {
+            let mut stdout = std::io::stdout();
+            match xcomm::install::Env::from_env(&env)
+                .and_then(|e| xcomm::install::uninstall(&e, &mut stdout))
+            {
+                Ok(true) => ExitCode::SUCCESS,
+                // The failed step said why.
+                Ok(false) => ExitCode::FAILURE,
+                Err(e) => {
+                    out::report(&format!("uninstall: {e}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Ok(Command::Doctor) => {
+            let mut stdout = std::io::stdout();
+            match xcomm::install::Env::from_env(&env)
+                .and_then(|e| xcomm::install::doctor(&e, &mut stdout))
+            {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(e) => {
+                    out::report(&format!("doctor: {e}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::SkillInstall { dir }) => {
             let installed = match dir {
                 Some(dir) => Ok(dir),
