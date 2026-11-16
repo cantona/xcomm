@@ -1,0 +1,508 @@
+.TH XCOMM 1 "2026-11-16" "xcomm 0.1.0" "User Commands"
+.ad l
+.nh
+.SH NAME
+xcomm \- a fast serial terminal with a control socket for scripts and agents
+.SH SYNOPSIS
+.B xcomm
+.RI [ options ]
+.I device
+.br
+.B xcomm \-\-headless
+.RI [ options ]
+.I device
+.br
+.B xcomm ctl
+.RB [ \-\-json ]
+.I device
+\fBstatus\fR|\fBsend\fR|\fBread\fR|\fBwait\fR|\fBrun\fR|\fBbreak\fR|\fBdtr\fR|\fBrts\fR|\fBset\fR|\fBcapture\fR|\fBxfer\fR
+.RI ...
+.br
+.B xcomm ctl
+.RB [ \-\-json ]
+.B sessions
+.br
+.B xcomm ctl \-\-pane
+.I id
+.RI ...
+.br
+.B xcomm list
+.RB [ \-\-json ]
+.br
+.B xcomm pick
+.br
+.B xcomm watch
+.RB [ start | stop | status | run ]
+.br
+.B xcomm \-\-skill
+.br
+.B xcomm skill install
+.RB [ \-\-dir
+.IR dir ]
+.br
+.B xcomm uninstall
+.br
+.B xcomm doctor
+.br
+.B xcomm \-\-show\-prefix
+[\fB\-\-prefix\fR \fIkey\fR | \fB\-m\fR]
+.br
+.B xcomm
+.BR \-h " | " \-\-help " | " \-V " | " \-\-version
+.SH DESCRIPTION
+.B xcomm
+connects the terminal to a serial device: what is typed goes to the device,
+what the device sends is shown. Its options and keys follow
+.BR minicom (1),
+with a command prefix that stays out of the way of terminal multiplexers.
+.PP
+A running session keeps the last part of the device's output in memory and
+listens on a control socket, so that another program \(em a script, a test
+harness or a coding agent \(em can send to the device, wait for output, read
+it, change line settings or transfer files, while the user watches the same
+console.
+.PP
+.I device
+is a name in
+.I /dev
+(for example
+.BR ttyUSB0 )
+or, with a
+.B /
+in it, a path (for example
+.IR /dev/serial/by\-id/... ).
+.B \-D
+.I device
+gives it as an option. Put
+.B \-\-
+before a name that starts with
+.B \-
+or is one of the command words
+.BR ctl ", " list ", " pick ", " watch ", " skill ", " uninstall " or " doctor .
+.SH OPTIONS
+.SS Line settings
+.TP
+.BI \-b " baud"
+Baud rate, default 115200. Any rate the driver accepts, not only the standard
+ones.
+.TP
+.BR \-\-databits " 5|6|7|8"
+Data bits, default 8.
+.TP
+.BR \-\-parity " none|even|odd"
+Parity, default none.
+.TP
+.BR \-\-stopbits " 1|2"
+Stop bits, default 1.
+.TP
+.BR \-\-flow " none|rts|xon"
+Flow control: RTS/CTS or XON/XOFF, default none.
+.SS Port
+.TP
+.B \-o
+Leave DTR and RTS alone: xcomm does not raise them (the kernel may, as the
+port opens) or drop DTR on exit.
+.TP
+.B \-\-no\-lock
+Take no UUCP lock file. The port is still opened exclusively.
+.TP
+.B \-\-low\-latency
+FTDI adapters on Linux: set the 1 ms latency timer (needs write access to its
+sysfs file).
+.SS Display
+.TP
+.BR \-\-color " auto|always|never"
+Colours in device output. With
+.B auto
+(the default) they are kept on a terminal and removed when the output is
+piped or
+.BR TERM=dumb .
+.TP
+.BR \-c " on|off"
+The same as
+.BR "\-\-color always|never" .
+.TP
+.B \-w
+Turn line wrap on.
+.TP
+.BI \-C " file"
+Append device output to
+.IR file .
+.TP
+.BI \-\-ring\-size " bytes"
+Device output kept in memory for the control socket: 4k to 1g, default 1m
+(k, m and g are KiB, MiB and GiB).
+.SS Control socket
+.TP
+.BR \-\-ctl " rw|ro|off"
+What the session's socket allows: everything (the default), status and
+reading only, or no socket at all.
+.TP
+.B \-\-headless
+No terminal: device output goes only to the socket's clients and to
+.BR \-C .
+The session runs until SIGTERM, SIGINT or SIGHUP. Not with
+.BR "\-\-ctl off" .
+.TP
+.B \-\-no\-ctl\-marker
+Do not show what clients send as a dim
+.B [ctl]
+line in the terminal.
+.SS Keys
+.TP
+.BI \-\-prefix " key"
+The command prefix:
+.BI ctrl\- letter
+(not h, i, j or m) or
+.BI alt\- letter\fR.
+Also
+.BR \-e ", " \-\-escape .
+.TP
+.BR \-m ", " \-\-metakey
+The same as
+.BR "\-\-prefix alt\-a" .
+.TP
+.BI \-\-prefix\-time " ms"
+How long a key cut short (Esc, Alt keys, key sequences) waits for the rest of
+it: 1 to 1000, default 25.
+.TP
+.B \-\-show\-prefix
+Print the prefix a session would use here, and why.
+.SS Other
+.TP
+.BR \-h ", " \-\-help
+Print the help, with the prefix in effect here.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+.SH PREFIX KEY
+The prefix is the first of:
+.BR \-\-prefix ;
+.B XCOMM_PREFIX
+(which must be valid even when
+.B \-\-prefix
+is given); Alt\-A inside herdr, the Herdr app, tmux, screen or zellij;
+otherwise Ctrl\-A, as in
+.BR minicom .
+The banner says which key is in effect and why.
+.PP
+Alt is recognised as Esc followed by the letter in the same read, and in the
+CSI\-u form sent by terminals using the kitty keyboard protocol or xterm's
+modifyOtherKeys. A lone Esc goes to the device after
+.BR \-\-prefix\-time .
+.PP
+Multiplexer variables do not cross
+.BR ssh (1)
+and are removed by
+.BR sudo (8),
+so inside a multiplexer on another host the automatic rule picks Ctrl\-A.
+Set
+.B XCOMM_PREFIX=alt\-a
+in the remote profile.
+.SH COMMANDS
+Typed after the prefix, with a terminal on standard input (piped input goes
+to the device as it is):
+.TP
+.B z
+Help.
+.TP
+.BR x ", " q
+Quit.
+.TP
+.B f
+Send a break.
+.TP
+.B h
+Hang up: drop DTR for 500 ms.
+.TP
+.BR d ", " t
+Toggle DTR, toggle RTS.
+.TP
+.B p
+Change the baud rate.
+.TP
+.B e
+Toggle local echo.
+.TP
+.B w
+Toggle line wrap.
+.TP
+.B l
+Start or stop capturing to a file.
+.TP
+.BR s ", " r
+Send or receive files with zmodem, ymodem or xmodem (through lrzsz).
+.TP
+The prefix twice
+Sends the prefix key itself.
+.TP
+.B Esc
+Cancel.
+.SH CONTROL SOCKET
+Each session listens on
+.IB $XDG_RUNTIME_DIR /xcomm/ tty .sock
+(or
+.IB /tmp/xcomm\- uid / tty .sock
+when there is no usable runtime directory), reachable only by the same user.
+.B xcomm ctl
+talks to it:
+.TP
+.BI "xcomm ctl " device " status"
+Port, line settings, modem lines and output offsets.
+.TP
+.BI "xcomm ctl " device " send " text
+Send
+.I text
+and Enter (CR);
+.B \-n
+for no line ending,
+.B \-\-lf
+or
+.B \-\-crlf
+for another;
+.BI \-\-hex " hex"
+or
+.BI \-\-file " path"
+send bytes as they are.
+.TP
+.BI "xcomm ctl " device " read"
+The device output the session keeps (escape sequences removed when piped, see
+.BR \-\-color ),
+from
+.BI \-\-since " offset"
+or the last
+.BI \-\-last " bytes" \fR,
+at most
+.BI \-\-max\-bytes " n" \fR;
+.B \-\-from\-oldest
+starts at the oldest byte kept. The next offset goes to standard error as
+.BI next= offset .
+.TP
+.BI "xcomm ctl " device " wait " regex
+Wait for device output to match
+.IR regex ,
+from
+.BI \-\-since " offset"
+or from now on, and print the match; the offset after it goes to standard
+error as
+.BI end= offset .
+Escape sequences are removed first unless
+.BR \-\-raw .
+A match spans at most 64 KiB.
+.BI \-\-timeout " s"
+(default 10, 0 for none) exits 1;
+.BI \-\-fail\-on " regex"
+(repeatable) exits 7 when it matches first;
+.BI \-\-idle " ms"
+ends the wait once the device has been that quiet.
+.BR \ew ", " \ed ", " \es " and " (?i)
+are ASCII;
+.B \-\-unicode
+makes them Unicode\-aware in a build with
+.BR "\-\-features unicode" .
+.TP
+.BI "xcomm ctl " device " run " text " \-\-until " regex
+Send
+.I text
+as
+.B send
+does, then wait as
+.B wait
+does from the offset of the send (or
+.B \-\-idle
+instead of
+.BR \-\-until ),
+and print the output between the echoed line and the match. More than
+.BI \-\-max\-bytes " n"
+(default 16 MiB) of it exits 2.
+.TP
+.BI "xcomm ctl " device " break " \fR[\fIms\fR]
+Send a break: default 250 ms, at most 5000.
+.TP
+\fBxcomm ctl\fR \fIdevice\fR \fBdtr\fR|\fBrts on\fR|\fBoff\fR|\fBtoggle\fR|\fBpulse\fR [\fIms\fR]
+Set a modem line;
+.B pulse
+holds the other state for
+.I ms
+(default 500), then puts it back.
+.TP
+.BI "xcomm ctl " device " set " name = value ...
+Change line settings:
+.BR baud ", " databits ", " parity ", " stopbits ", " flow .
+.TP
+.BI "xcomm ctl " device " capture start " file " \fR|\fB capture stop"
+Start or stop capturing on the session.
+.TP
+\fBxcomm ctl\fR \fIdevice\fR \fBxfer send\fR|\fBrecv zmodem\fR|\fBymodem\fR|\fBxmodem\fR [\fIfile\fR...]
+Run lrzsz on the session's port. The reply comes when it ends; Ctrl\-C
+aborts it.
+.TP
+.B xcomm ctl sessions
+The running sessions.
+.TP
+.BI "xcomm ctl \-\-pane " id " ..."
+The session in herdr pane
+.IR id ,
+instead of naming the device.
+.TP
+.B \-\-json
+The reply as JSON.
+.SH OTHER COMMANDS
+.TP
+.B xcomm list
+The serial ports: tty, USB VID:PID, product, the lock holder, the herdr pane
+of an xcomm session on it, and the by\-id name.
+.TP
+.B xcomm pick
+That list for herdr's popup: Enter opens the port in a new pane (or goes to
+the pane that has it),
+.B b
+sets the baud,
+.B o
+the placement.
+.TP
+.BR "xcomm watch " [ start | stop | status | run ]
+Tell herdr when a serial port comes or goes.
+.B start
+runs it in the background, as the herdr plugin does
+.RB ( \-\-daemon
+is the same). It reads
+.B notify
+and
+.B ignore
+from
+.IR $HERDR_PLUGIN_CONFIG_DIR/config.toml ;
+its pid file and log are under
+.BR $HERDR_PLUGIN_STATE_DIR .
+.TP
+.B xcomm \-\-skill
+Print the agent skill: how an agent drives a session with
+.BR "xcomm ctl" .
+.TP
+.BI "xcomm skill install " \fR[\fB\-\-dir\fI " dir" \fR]
+Write the skill as
+.I SKILL.md
+in
+.IR dir ,
+by default
+.IR ~/.agents/skills/xcomm ,
+replacing only a copy xcomm wrote. The default is refused where a dotfiles
+repository may own it.
+.TP
+.B xcomm uninstall
+Take away what an install made, in order, saying how each step went: the
+hotplug watchers, the skill, the herdr plugin, then the binaries
+.RB ( "cargo uninstall" ).
+It stops at the first failure and says what is left.
+.TP
+.B xcomm doctor
+Report what is installed and what is left over (stale sockets and locks, a
+skill or watcher with no binary); exit 1 when something needs attention.
+.SH EXIT STATUS
+A session exits 0 after quit, the end of input, SIGTERM, SIGINT or SIGHUP,
+or when the terminal goes away; 1 on an error or when the device goes away;
+2 on a usage error or when the port is in use.
+.PP
+.B xcomm ctl
+exits:
+.TP
+.B 0
+ok
+.TP
+.B 1
+.BR wait / run
+timed out, or another error
+.TP
+.B 2
+usage error
+.TP
+.B 3
+no session for the device
+.TP
+.B 4
+port disconnected
+.TP
+.B 5
+busy (a file transfer)
+.TP
+.B 6
+offset evicted from the ring
+.TP
+.B 7
+a
+.B \-\-fail\-on
+pattern matched
+.TP
+.B 8
+permission denied
+.RB ( "\-\-ctl ro" ,
+or a socket that is not the user's)
+.TP
+.B 9
+subscriber dropped (fell behind)
+.PP
+Every other command exits 0 on success, 1 on an error and 2 on a usage
+error.
+.SH ENVIRONMENT
+.TP
+.B XCOMM_PREFIX
+The command prefix, as for
+.BR \-\-prefix .
+.TP
+.B TERM
+.B dumb
+removes colours with
+.BR "\-\-color auto" .
+.TP
+.BR HERDR_ENV ", " HC_TERMINAL_ID ", " TMUX ", " STY ", " ZELLIJ
+A multiplexer: the automatic prefix is Alt\-A.
+.TP
+.BR HERDR_SOCKET_PATH ", " HERDR_PANE_ID
+Inside herdr, the session gives its pane a title and metadata (port and
+baud).
+.TP
+.B XDG_RUNTIME_DIR
+Where the control sockets go, when it is a directory of the user's.
+.TP
+.BR HERDR_PLUGIN_STATE_DIR ", " HERDR_PLUGIN_CONFIG_DIR
+Set by herdr for
+.BR "xcomm watch" .
+.TP
+.BR HOME ", " XDG_STATE_HOME ", " CARGO_HOME ", " CARGO_INSTALL_ROOT
+Where
+.BR "skill install" ", " uninstall " and " doctor
+look.
+.TP
+.BR GIT_DIR ", " GIT_WORK_TREE
+When set,
+.B skill install
+refuses its default directory: it may be a dotfiles repository's.
+.TP
+.BR XDG_CONFIG_HOME ", " XDG_DATA_HOME
+Where
+.B skill install
+looks for the yadm and vcsh repositories that may manage
+.BR $HOME .
+.SH FILES
+.TP
+\fB$XDG_RUNTIME_DIR/xcomm/\fItty\fB.sock\fR, \fB/tmp/xcomm\-\fIuid\fB/\fItty\fB.sock\fR
+Control sockets.
+.TP
+\fI/run/lock/lockdev\fR, \fI/var/lock/lockdev\fR, \fI/run/lock\fR, \fI/var/lock\fR, \fI/var/spool/lock\fR (Linux); \fI/var/spool/lock\fR, \fI/var/lock\fR, \fI/tmp\fR (macOS)
+UUCP lock files,
+.BI LCK.. tty\fR,
+in the first of these that can be written. On Linux they are shared with
+.BR minicom ", " picocom
+and the like; stock macOS has no shared lock directory, so there they keep
+xcomm sessions apart and the exclusive open does the rest.
+.TP
+.I ~/.agents/skills/xcomm/SKILL.md
+The agent skill, as
+.B xcomm skill install
+writes it.
+.SH SEE ALSO
+.BR minicom (1),
+.BR picocom (1),
+.BR tio (1),
+.BR sz (1),
+.BR rz (1)
