@@ -210,6 +210,9 @@ const KEYS_ROOM: usize = HELD_ROOM + BUF_SIZE / 4;
 /// input is read anyway, so that the commands (quit) still work. Keys that
 /// do not fit are dropped then.
 const STALL: Duration = Duration::from_secs(2);
+/// How often a waiting session on macOS polls anew (see pump_with).
+#[cfg(target_os = "macos")]
+const DEVICE_CHECK: Duration = Duration::from_secs(1);
 /// Longest time device output waits in the capture buffer.
 const CAPTURE_FLUSH: Duration = Duration::from_millis(50);
 /// How long quitting waits for queued keys to reach the device.
@@ -451,6 +454,10 @@ fn drain_queue(
                 return Ok(Some(exit));
             }
         }
+        // Revoked: nothing more can reach it, as with `gone` below.
+        if fds[0].revents().contains(PollFlags::NVAL) {
+            break;
+        }
         if fds[0]
             .revents()
             .intersects(PollFlags::OUT | PollFlags::ERR | PollFlags::HUP)
@@ -560,7 +567,14 @@ fn pump_with(
         let held_due = keys.as_ref().and_then(|k| k.deadline());
         let stall_due = full_since.filter(|_| !stalled).map(|t| t + STALL);
         let capture_due = capture_since.map(|t| t + CAPTURE_FLUSH);
-        let due = [held_due, stall_due, capture_due, ctl_due]
+        // macOS does not wake a poll already waiting on a device fd that is
+        // revoked (a hangup); a new poll sees it at once, so poll anew now
+        // and then.
+        #[cfg(target_os = "macos")]
+        let device_due = Some(Instant::now() + DEVICE_CHECK);
+        #[cfg(not(target_os = "macos"))]
+        let device_due = None;
+        let due = [held_due, stall_due, capture_due, ctl_due, device_due]
             .into_iter()
             .flatten()
             .min();
@@ -631,6 +645,11 @@ fn pump_with(
             }
         }
 
+        // Revoked (macOS, a hangup): the fd is no longer the device's, and
+        // poll would report it again and again.
+        if dev_ready.contains(PollFlags::NVAL) {
+            return Ok(ExitReason::DeviceGone);
+        }
         if dev_ready.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match rustix::io::read(p.device, &mut buf[..]) {
                 Ok(0) => return Ok(ExitReason::DeviceGone),
