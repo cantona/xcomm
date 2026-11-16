@@ -42,6 +42,28 @@ fn exec_wait() -> ExitCode {
     ExitCode::from(2)
 }
 
+fn list(json: bool) -> ExitCode {
+    let ports = match xcomm::list::enumerate(&env) {
+        Ok(ports) => ports,
+        Err(e) => {
+            out::report(&format!("cannot list ports: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = if json {
+        let mut line = serde_json::to_string(&ports).expect("ports serialize");
+        line.push('\n');
+        line
+    } else {
+        xcomm::list::table(&ports)
+    };
+    if let Err(e) = out::stdout(text.as_bytes()) {
+        out::report(&format!("cannot write to stdout: {e}"));
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     match cli::parse(std::env::args_os().skip(1), &env) {
         Err(e) => {
@@ -66,6 +88,7 @@ fn main() -> ExitCode {
             exec_wait()
         }
         Ok(Command::Ctl(args)) => ExitCode::from(xcomm::ctl::client::run(&args, &env)),
+        Ok(Command::List { json }) => list(json),
         Ok(Command::Term(opts)) => match session::run(&opts, &env) {
             Ok(ExitReason::DeviceGone) => ExitCode::FAILURE,
             Ok(_) => ExitCode::SUCCESS,

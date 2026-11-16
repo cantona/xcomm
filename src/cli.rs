@@ -361,6 +361,10 @@ pub enum Command {
     ShowPrefix(PrefixChoice),
     Term(TermOpts),
     Ctl(CtlArgs),
+    /// `xcomm list [--json]`.
+    List {
+        json: bool,
+    },
 }
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
@@ -383,12 +387,16 @@ Usage:
   xcomm --headless [options] <device>
   xcomm ctl [--json] <device> status|send|read|wait|run ...
   xcomm ctl [--json] sessions
+  xcomm list [--json]
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
 <device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
 (/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
-a name that starts with '-'.
+a name that starts with '-' (or is ctl or list).
+
+xcomm list shows the serial ports: tty, USB VID:PID, product, the lock
+holder, the herdr pane of an xcomm session on it, and the by-id name.
 
 Line settings:
   -b <baud>                  baud rate (default 115200)
@@ -985,6 +993,24 @@ fn parse_timeout(value: &str) -> Result<Option<Duration>, CliError> {
     Ok((!secs.is_zero()).then_some(secs))
 }
 
+fn parse_list(args: &[OsString]) -> Result<Command, CliError> {
+    let mut p = lexopt::Parser::from_args(args.iter().cloned());
+    let mut json = false;
+    while let Some(arg) = p.next()? {
+        match arg {
+            Long("json") => json = true,
+            Value(v) => {
+                return Err(CliError(format!(
+                    "list: unexpected argument '{}'",
+                    v.to_string_lossy()
+                )));
+            }
+            _ => return Err(arg.unexpected().into()),
+        }
+    }
+    Ok(Command::List { json })
+}
+
 /// A break's or pulse's length in ms.
 fn parse_hold(value: &str, what: &str) -> Result<u32, CliError> {
     let max = crate::ctl::proto::HOLD_MAX;
@@ -1073,6 +1099,9 @@ pub fn parse(
     let args: Vec<OsString> = args.into_iter().collect();
     if args.first().is_some_and(|a| a == "ctl") {
         return parse_ctl(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "list") {
+        return parse_list(&args[1..]);
     }
     // lexopt consumes a bare `--` without returning it; count it here so
     // `--version --` is rejected like any other extra argument.

@@ -99,6 +99,20 @@ pub fn default_lock_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf,
         })
 }
 
+/// Where a lock may be, to read it: `XCOMM_LOCK_DIR` (test-only) or every
+/// standard directory there is. Reading needs no write access, and the
+/// holder may have used a directory this user cannot write.
+pub fn lock_dirs_to_read(env: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    if let Some(dir) = env("XCOMM_LOCK_DIR").filter(|d| !d.is_empty()) {
+        return vec![PathBuf::from(dir)];
+    }
+    LOCK_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .collect()
+}
+
 fn writable(dir: &Path) -> bool {
     dir.is_dir() && rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_ok()
 }

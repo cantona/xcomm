@@ -6,6 +6,7 @@ pub mod cli;
 pub mod ctl;
 pub mod hosttty;
 pub mod keys;
+pub mod list;
 pub mod lock;
 pub mod out;
 pub mod port;

@@ -965,3 +965,22 @@ fn headless_and_marker_options() {
     assert!(term(&["--headless", "--ctl", "ro", "x"], &[]).headless);
     assert!(err(&["--headless", "--ctl", "off", "x"], &[]).contains("--headless needs"));
 }
+
+#[test]
+fn list_parses() {
+    assert_eq!(
+        parse_with(&["list"], &[]).unwrap(),
+        Command::List { json: false }
+    );
+    assert_eq!(
+        parse_with(&["list", "--json"], &[]).unwrap(),
+        Command::List { json: true }
+    );
+    assert!(err(&["list", "x"], &[]).contains("unexpected argument 'x'"));
+    assert!(err(&["list", "--color"], &[]).contains("--color"));
+    // A device named list is still reachable.
+    assert!(matches!(
+        parse_with(&["--", "list"], &[]).unwrap(),
+        Command::Term(TermOpts { ref device, .. }) if device == "list"
+    ));
+}
