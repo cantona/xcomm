@@ -559,7 +559,7 @@ impl Lister {
         let shared = latest.clone();
         std::thread::spawn(move || {
             let env = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
-            let watch = DevWatch::new();
+            let watch = crate::devwatch::DevWatch::new(std::path::Path::new("/"));
             loop {
                 watch.wait(REFRESH);
                 if let Ok(ports) = crate::list::enumerate(&env) {
@@ -583,59 +583,5 @@ impl Lister {
         let mut buf = [0u8; 64];
         let _ = rustix::io::read(&self.wake, &mut buf);
         self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
-}
-
-/// Device nodes coming and going (Linux: inotify on /dev and the by-id
-/// directory, watched again after each event, as udev removes it with the
-/// last adapter); elsewhere the periodic listing finds them.
-struct DevWatch {
-    #[cfg(target_os = "linux")]
-    fd: Option<std::os::fd::OwnedFd>,
-}
-
-impl DevWatch {
-    fn new() -> DevWatch {
-        #[cfg(target_os = "linux")]
-        {
-            use rustix::fs::inotify::{CreateFlags, init};
-            let w = DevWatch {
-                fd: init(CreateFlags::CLOEXEC).ok(),
-            };
-            w.add();
-            w
-        }
-        #[cfg(not(target_os = "linux"))]
-        DevWatch {}
-    }
-
-    #[cfg(target_os = "linux")]
-    fn add(&self) {
-        use rustix::fs::inotify::{WatchFlags, add_watch};
-        if let Some(fd) = &self.fd {
-            let flags = WatchFlags::CREATE | WatchFlags::DELETE | WatchFlags::MOVED_TO;
-            for dir in ["/dev", "/dev/serial", "/dev/serial/by-id"] {
-                let _ = add_watch(fd, dir, flags);
-            }
-        }
-    }
-
-    /// Waits for a device event or `most`; after an event, a little longer
-    /// for udev to make the links.
-    fn wait(&self, most: Duration) {
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = &self.fd {
-            use rustix::event::{PollFd, PollFlags, Timespec, poll};
-            let mut fds = [PollFd::new(fd, PollFlags::IN)];
-            let timeout = Timespec::try_from(most).unwrap_or_default();
-            if matches!(poll(&mut fds, Some(&timeout)), Ok(n) if n > 0) {
-                let mut buf = [0u8; 4096];
-                let _ = rustix::io::read(fd, &mut buf);
-                std::thread::sleep(Duration::from_millis(100));
-                self.add();
-            }
-            return;
-        }
-        std::thread::sleep(most);
     }
 }

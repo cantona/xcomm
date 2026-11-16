@@ -89,6 +89,13 @@ fn main() -> ExitCode {
         }
         Ok(Command::Ctl(args)) => ExitCode::from(xcomm::ctl::client::run(&args, &env)),
         Ok(Command::List { json }) => list(json),
+        Ok(Command::Watch(action)) => match xcomm::watch::act(action, &env) {
+            Ok(line) => print(&line),
+            Err(e) => {
+                out::report(&format!("watch: {e}"));
+                ExitCode::FAILURE
+            }
+        },
         Ok(Command::Pick) => {
             use std::os::fd::AsFd;
             let (stdin, stdout) = (std::io::stdin(), std::io::stdout());

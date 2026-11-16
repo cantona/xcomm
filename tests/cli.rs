@@ -994,3 +994,23 @@ fn pick_parses() {
         Command::Term(TermOpts { ref device, .. }) if device == "pick"
     ));
 }
+
+#[test]
+fn watch_parses() {
+    use xcomm::watch::WatchAction;
+    for (args, want) in [
+        (&["watch"][..], WatchAction::Run),
+        (&["watch", "run"], WatchAction::Run),
+        (&["watch", "--daemon"], WatchAction::Start),
+        (&["watch", "start"], WatchAction::Start),
+        (&["watch", "stop"], WatchAction::Stop),
+        (&["watch", "status"], WatchAction::Status),
+    ] {
+        assert_eq!(
+            parse_with(args, &[]).unwrap(),
+            Command::Watch(want),
+            "{args:?}"
+        );
+    }
+    assert!(err(&["watch", "start", "now"], &[]).contains("expected start, stop"));
+}

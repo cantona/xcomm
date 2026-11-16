@@ -367,6 +367,8 @@ pub enum Command {
     },
     /// `xcomm pick`: the port picker of the herdr popup.
     Pick,
+    /// `xcomm watch [start|stop|status|run]`, `xcomm watch --daemon`.
+    Watch(crate::watch::WatchAction),
 }
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
@@ -391,17 +393,23 @@ Usage:
   xcomm ctl [--json] sessions
   xcomm list [--json]
   xcomm pick
+  xcomm watch [start|stop|status|run]
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
 <device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
 (/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
-a name that starts with '-' (or is ctl, list or pick).
+a name that starts with '-' (or is ctl, list, pick or watch).
 
 xcomm list shows the serial ports: tty, USB VID:PID, product, the lock
 holder, the herdr pane of an xcomm session on it, and the by-id name.
 xcomm pick is that list for herdr's popup: Enter opens the port in a new
 pane (or goes to the pane that has it), b sets the baud, o the placement.
+xcomm watch tells herdr when a serial port comes or goes (start runs it in
+the background, as the plugin does; --daemon is the same). It reads
+notify = true|false and ignore = [\"0403:6001\", \"usb-FTDI_*\"] from
+$HERDR_PLUGIN_CONFIG_DIR/config.toml; its pid file and log are under
+$HERDR_PLUGIN_STATE_DIR.
 
 Line settings:
   -b <baud>                  baud rate (default 115200)
@@ -1107,6 +1115,24 @@ pub fn parse(
     }
     if args.first().is_some_and(|a| a == "list") {
         return parse_list(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "watch") {
+        use crate::watch::WatchAction;
+        let words: Vec<String> = args[1..]
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        return match words.as_slice() {
+            [] | ["run"] => Ok(Command::Watch(WatchAction::Run)),
+            ["--daemon"] | ["start"] => Ok(Command::Watch(WatchAction::Start)),
+            ["stop"] => Ok(Command::Watch(WatchAction::Stop)),
+            ["status"] => Ok(Command::Watch(WatchAction::Status)),
+            _ => Err(CliError(format!(
+                "watch: expected start, stop, status, run or --daemon, got '{}'",
+                words.join(" ")
+            ))),
+        };
     }
     if args.first().is_some_and(|a| a == "pick") {
         return match args.get(1) {

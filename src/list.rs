@@ -200,6 +200,13 @@ fn usb_attrs(root: &Path, tty: &str) -> Usb {
 /// name it had, which may be another device's now: only one connected to
 /// `tty` counts.
 fn herdr_pane(dirs: &[PathBuf], tty: &str) -> Option<String> {
+    session_pane(dirs, tty, true)
+}
+
+/// The herdr pane of the session that has `tty`'s socket; with
+/// `connected`, only one connected to it now (one waiting for its device
+/// keeps the socket of the name it had, which may be another device's).
+pub fn session_pane(dirs: &[PathBuf], tty: &str, connected: bool) -> Option<String> {
     dirs.iter().find_map(|dir| {
         let sock = crate::ctl::path::socket_path(dir, tty);
         let stream = crate::sock::connect_now(&sock).ok()?;
@@ -209,7 +216,7 @@ fn herdr_pane(dirs: &[PathBuf], tty: &str) -> Option<String> {
         let mut line = Vec::new();
         BufReader::new(&stream).read_until(b'\n', &mut line).ok()?;
         let v: serde_json::Value = serde_json::from_slice(&line).ok()?;
-        if v["connected"] != true || v["tty"] != tty {
+        if (connected && v["connected"] != true) || v["tty"] != tty {
             return None;
         }
         v["herdr_pane"].as_str().map(str::to_string)
