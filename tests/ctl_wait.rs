@@ -568,13 +568,25 @@ fn a_bad_pattern_is_a_usage_error_before_anything_is_sent() {
 
 #[test]
 fn the_session_ending_ends_a_wait_with_3() {
-    let (_dev, s, path) = start(&[]);
-    let child = spawn_ctl(&s, &[&path, "wait", "never", "--timeout", "0"]);
-    std::thread::sleep(Duration::from_millis(500));
-    let mut s = s;
-    write_all(s.host.master.as_fd(), b"\x01x");
-    s.wait_exit(T);
-    let o = child.wait_with_output().unwrap();
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(stderr(&o).contains("session ended"), "{}", stderr(&o));
+    // The wait gets 500 ms to connect before the session quits. Under load
+    // it can start later and find no session at all, which tests nothing:
+    // that try is run again, and only a wait that connected is judged.
+    let mut last = String::new();
+    for _ in 0..3 {
+        let (_dev, s, path) = start(&[]);
+        let child = spawn_ctl(&s, &[&path, "wait", "never", "--timeout", "0"]);
+        std::thread::sleep(Duration::from_millis(500));
+        let mut s = s;
+        write_all(s.host.master.as_fd(), b"\x01x");
+        s.wait_exit(T);
+        let o = child.wait_with_output().unwrap();
+        if stderr(&o).contains("no session for") {
+            last = stderr(&o);
+            continue;
+        }
+        assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+        assert!(stderr(&o).contains("session ended"), "{}", stderr(&o));
+        return;
+    }
+    panic!("the wait never found the session in three tries: {last}");
 }
