@@ -144,17 +144,14 @@ impl Root {
         )
         .unwrap();
         let fake = |path: PathBuf, log: &str, body: &str| {
-            std::fs::write(
+            support::write_exe(
                 &path,
-                format!(
+                &format!(
                     "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho >> '{}'\n{body}\n",
                     dir.join(log).display(),
                     dir.join(log).display()
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
+            );
         };
         fake(dir.join("target/release/xcomm"), "xcomm.log", xcomm_script);
         fake(dir.join("herdr"), "herdr.log", "exit ${HERDR_RC:-0}");

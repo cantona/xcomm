@@ -311,10 +311,7 @@ fn a_program_ignoring_sigterm_is_killed_and_the_port_restored() {
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("sz");
     // stty works on its stdin, which is the port.
-    std::fs::write(&fake, "#!/bin/sh\ntrap '' TERM\nstty 1200\nexec sleep 30\n").unwrap();
-    let mut perm = std::fs::metadata(&fake).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-    std::fs::set_permissions(&fake, perm).unwrap();
+    support::write_exe(&fake, "#!/bin/sh\ntrap '' TERM\nstty 1200\nexec sleep 30\n");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let (dev, s) = start_in(&here, &[("PATH", &path)]);
     let before = rustix::termios::tcgetattr(&dev.slave)
@@ -423,19 +420,15 @@ fn the_zmodem_receiver_cannot_write_outside_the_working_directory() {
     };
     #[cfg(not(target_os = "linux"))]
     let shm = outside.join("no-shm");
-    std::fs::write(
+    support::write_exe(
         &fake,
-        format!(
+        &format!(
             "#!/bin/sh\necho in > inside.txt\necho out > '{}/outside.txt'\necho injected >> '{}'\necho injected >> '{}'\necho null > /dev/null || exit 9\nexit 0\n",
             outside.display(),
             victim.slave_path.display(),
             shm.display(),
         ),
-    )
-    .unwrap();
-    let mut perm = std::fs::metadata(&fake).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-    std::fs::set_permissions(&fake, perm).unwrap();
+    );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let script = format!(
         "cd '{}' && PATH='{path}' exec '{}' '{}'",

@@ -4,7 +4,6 @@
 mod support;
 
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -269,15 +268,13 @@ fn the_screen() {
 fn fake_herdr(dir: &Path, status: u8) -> std::path::PathBuf {
     let bin = dir.join("herdr");
     let log = dir.join("args");
-    std::fs::write(
+    support::write_exe(
         &bin,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho 'no such plugin' >&2\nexit {status}\n",
             log.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     bin
 }
 

@@ -435,3 +435,32 @@ pub fn wait_blocked_writing_stdout(pid: i32, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// Writes an executable through a child process. One the test process
+/// writes itself is open for writing in any child another test thread
+/// forks meanwhile, until that child execs, and running it then fails with
+/// ETXTBSY ("Text file busy"). A writer that is its own process is gone
+/// when it exits.
+pub fn write_exe(path: &std::path::Path, content: &str) {
+    let mut sh = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut sh.stdin.take().unwrap(), content.as_bytes()).unwrap();
+    assert!(sh.wait().unwrap().success(), "writing {}", path.display());
+}
+
+/// Copies an executable (mode 0755) through `cp`, for the reason in
+/// [`write_exe`].
+pub fn copy_exe(from: &std::path::Path, to: &std::path::Path) {
+    let ok = std::process::Command::new("sh")
+        .args(["-c", "cp \"$1\" \"$2\" && chmod 755 \"$2\"", "sh"])
+        .arg(from)
+        .arg(to)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "copying {} to {}", from.display(), to.display());
+}

@@ -76,17 +76,15 @@ impl Home {
     fn fake(&self, name: &str) {
         let up = name.to_uppercase();
         let path = self.root.join("bin").join(name);
-        std::fs::write(
+        support::write_exe(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s|' \"$@\" >> '{log}'\necho >> '{log}'\n\
                  case \"$*\" in \"plugin list\"*) printf '%s\\n' \"$FAKE_LIST\"; exit 0 ;; esac\n\
                  [ -n \"${{{up}_ERR:-}}\" ] && echo \"${{{up}_ERR}}\" >&2\nexit ${{{up}_RC:-0}}\n",
                 log = self.root.join(format!("{name}.log")).display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
     }
 
     fn log(&self, name: &str) -> String {
@@ -280,7 +278,7 @@ fn binaries_cargo_did_not_install_here_are_named() {
     // A copy on PATH that no cargo record names: uninstall says so.
     let h = Home::new("copied");
     let bin = h.root.join("bin");
-    std::fs::copy(env!("CARGO_BIN_EXE_xcomm"), bin.join("xcomm")).unwrap();
+    support::copy_exe(Path::new(env!("CARGO_BIN_EXE_xcomm")), &bin.join("xcomm"));
     let o = h.run("uninstall", &[]);
     assert_eq!(o.status.code(), Some(1));
     let out = stdout(&o);
@@ -295,12 +293,10 @@ fn binaries_cargo_did_not_install_here_are_named() {
     // Another program that happens to be called xcomm is not this one.
     let h = Home::new("other");
     let other = h.root.join("bin/xcomm");
-    std::fs::write(
+    support::write_exe(
         &other,
         "#!/bin/sh\necho 'xcomm-unrelated serial tool 3.2'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let o = h.run("uninstall", &[]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     let o = h.run("doctor", &[]);
@@ -515,7 +511,7 @@ fn doctor_reports_an_install_and_a_broken_link() {
     std::fs::create_dir_all(&bin).unwrap();
     let built = Path::new(env!("CARGO_BIN_EXE_xcomm"));
     for name in ["xcomm", "xcomm-wait"] {
-        std::fs::copy(built.with_file_name(name), bin.join(name)).unwrap();
+        support::copy_exe(&built.with_file_name(name), &bin.join(name));
     }
     h.install_skill();
     let path = format!(
@@ -578,9 +574,7 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
     h.fake("herdr");
     let bin = h.root.join("bin");
     // First on PATH, and broken: the shell would run this one.
-    std::fs::write(bin.join("xcomm"), "#!/bin/sh\nkill -SEGV $$\n").unwrap();
-    std::fs::set_permissions(bin.join("xcomm"), std::fs::Permissions::from_mode(0o755))
-        .unwrap();
+    support::write_exe(&bin.join("xcomm"), "#!/bin/sh\nkill -SEGV $$\n");
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     assert!(
@@ -594,14 +588,13 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
     // One that never answers is given up on, and what it started goes
     // with it.
     let pid_file = h.root.join("child.pid");
-    std::fs::write(
-        bin.join("xcomm"),
-        format!(
+    support::write_exe(
+        &bin.join("xcomm"),
+        &format!(
             "#!/bin/sh\nsleep 47 &\necho $! > '{}'\nwait\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
+    );
     let started = std::time::Instant::now();
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -627,20 +620,18 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
     // answers at length, one that refuses the option. None is a problem,
     // and none holds doctor up.
     // One whose loader fails (a missing library): 127, not "another program".
-    std::fs::write(
-        bin.join("xcomm"),
+    support::write_exe(
+        &bin.join("xcomm"),
         "#!/bin/sh\necho 'xcomm: error while loading shared libraries: libgone.so' >&2\nexit 127\n",
-    )
-    .unwrap();
+    );
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     assert!(stdout(&o).contains("cannot be run"), "{}", stdout(&o));
     // One that answers, but leaves a child outside its group holding the
     // output: the answer still counts, and doctor does not wait for it.
-    std::fs::write(
-        bin.join("xcomm"),
+    support::write_exe(
+        &bin.join("xcomm"),
         "#!/bin/sh\nsetsid sleep 9 >&1 &\necho 'xcomm 0.0.1'\n",
-    )
-    .unwrap();
+    );
     let started = std::time::Instant::now();
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -650,7 +641,7 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
         "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' x\n",
         "#!/bin/sh\necho 'usage: xcomm [-q] host' >&2\nexit 1\n",
     ] {
-        std::fs::write(bin.join("xcomm"), script).unwrap();
+        support::write_exe(&bin.join("xcomm"), script);
         let started = std::time::Instant::now();
         let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
         assert!(
