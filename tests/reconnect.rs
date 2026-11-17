@@ -95,6 +95,35 @@ fn hangup_then_return_reconnects() {
 }
 
 #[test]
+fn a_break_cut_by_the_device_going_says_only_that() {
+    let dir = temp_dir();
+    let (d1, link, s) = start(&dir);
+    let client = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
+        .args(["ctl", link.to_str().unwrap(), "break", "4000"])
+        .env("XDG_RUNTIME_DIR", &s.lock_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The break is on (the session says so when it ends: not yet).
+    std::thread::sleep(Duration::from_millis(500));
+    drop(d1);
+    let out = read_until(s.host.master.as_fd(), b"waiting", T);
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.contains("disconnected"), "{out:?}");
+    assert!(
+        !out.contains("Input/output") && !out.contains("break"),
+        "{out:?}"
+    );
+    let o = client.wait_with_output().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+}
+
+#[test]
 fn quit_while_disconnected() {
     let dir = temp_dir();
     let (d1, _link, mut s) = start(&dir);

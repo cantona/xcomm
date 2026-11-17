@@ -1150,10 +1150,11 @@ pub fn run(
         // that can come back, so tests can take the path of a real one.
         let pty =
             reconnect::is_pty(&resolved) && env("XCOMM_TEST_PTY_AS_DEVICE").is_none();
-        if !matches!(reason, Ok(ExitReason::DeviceGone))
-            || piped
-            || (pty && link.is_none())
-        {
+        let gone = matches!(reason, Ok(ExitReason::DeviceGone));
+        if !gone || piped || (pty && link.is_none()) {
+            if gone {
+                live.device_gone();
+            }
             live.finish();
             break (reason, Some(port));
         }

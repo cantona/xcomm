@@ -984,6 +984,44 @@ fn each_client_gets_its_own_poll_result_when_one_is_dropped_in_between() {
 }
 
 #[test]
+fn a_break_cut_by_the_device_going_ends_the_session_saying_only_that() {
+    // A pty by its own name does not come back: the session ends.
+    let (dev, mut s, path) = start(&[]);
+    let client = std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
+        .args(["ctl", &path, "break", "4000"])
+        .env("XDG_RUNTIME_DIR", &s.lock_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    drop(dev);
+    // The hold ends (the client answered) before the session does: what
+    // was said of it is on the terminal by then.
+    let o = client.wait_with_output().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let fd = s.host.master.as_fd();
+    let fl = rustix::fs::fcntl_getfl(fd).unwrap();
+    rustix::fs::fcntl_setfl(fd, fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n @ 1..) = rustix::io::read(fd, &mut buf) {
+        out.extend_from_slice(&buf[..n]);
+    }
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        !out.contains("Input/output") && !out.contains("break"),
+        "{out:?}"
+    );
+    let _ = s.wait_exit(T);
+}
+
+#[test]
 fn break_on_a_pty_succeeds_and_the_session_goes_on() {
     let (dev, s, path) = start(&[]);
     let o = ctl(&s, &[&path, "break"]);

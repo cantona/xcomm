@@ -14,6 +14,8 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- A client's break or DTR/RTS pulse cut short by the device going away no
+  longer prints an I/O error (or "DTR is left on") before "disconnected".
 - Control socket: a client dropped between two looks at the clients (a
   subscriber left behind) no longer makes the clients after it act on each
   other's events for a pass.

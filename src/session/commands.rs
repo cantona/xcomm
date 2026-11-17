@@ -1079,12 +1079,20 @@ impl<'a> Live<'a> {
         }
     }
 
-    pub(super) fn into_kept(mut self) -> Kept {
-        self.show_markers_now(true);
+    /// The device is gone: a client's break or pulse ends with it. There
+    /// is no break to end on it, and the error trying would say (EIO, "DTR
+    /// is left on") only misleads.
+    pub(super) fn device_gone(&mut self) {
+        self.port = None;
         self.end_hold(Some((
             ctl::code::DISCONNECTED,
             "the device went away during it".into(),
         )));
+    }
+
+    pub(super) fn into_kept(mut self) -> Kept {
+        self.show_markers_now(true);
+        self.device_gone();
         Kept {
             echo: self.echo,
             wrap: self.wrap,
