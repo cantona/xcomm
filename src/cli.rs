@@ -397,6 +397,8 @@ pub enum Command {
     },
     /// `xcomm uninstall`.
     Uninstall,
+    /// `xcomm man`.
+    Man,
     /// `xcomm doctor`.
     Doctor,
 }
@@ -435,13 +437,14 @@ Usage:
   xcomm skill install [--dir <dir>]
   xcomm uninstall
   xcomm doctor
+  xcomm man
   xcomm --show-prefix [--prefix <key> | -m]
   xcomm -h | --help | -V | --version
 
 <device> is a name in /dev (ttyUSB0) or, with a '/' in it, a path
 (/dev/serial/by-id/...); -D <device> gives it as an option. Put -- before
 a name that starts with '-' (or is ctl, list, pick, watch, skill,
-uninstall or doctor).
+uninstall, doctor or man).
 
 xcomm list shows the serial ports: tty, USB VID:PID, product, the lock
 holder, the herdr pane of an xcomm session on it, and the by-id name.
@@ -473,7 +476,8 @@ names an xcomm on PATH that cargo did not install. Use it rather than
 herdr plugin uninstall, which leaves the binaries and the skill. xcomm
 doctor reports what is installed and what is left over (stale sockets
 and locks, a skill, man page or watcher with no binary); it exits 1 when
-something needs attention.
+something needs attention. xcomm man shows the manual page, which is
+built in (piped, it writes the page's source: xcomm man > xcomm.1).
 
 Line settings:
   -b <baud>                  baud rate (default 115200)
@@ -1270,6 +1274,7 @@ pub fn parse(
     for (word, command) in [
         ("uninstall", Command::Uninstall),
         ("doctor", Command::Doctor),
+        ("man", Command::Man),
     ] {
         if args.first().is_some_and(|a| a == word) {
             return match args.len() {

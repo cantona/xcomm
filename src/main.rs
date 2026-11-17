@@ -93,6 +93,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Command::Man) => match xcomm::man::show() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                out::report(&e);
+                ExitCode::FAILURE
+            }
+        },
         Ok(Command::Uninstall) => {
             let mut stdout = std::io::stdout();
             match xcomm::install::Env::from_env(&env)

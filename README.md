@@ -81,7 +81,7 @@ xcomm skill install        # the agent skill, if you use one
 
 For what is on master but not released yet:
 `cargo install --locked --git https://github.com/cantona/xcomm xcomm`.
-cargo installs no man page: `xcomm --help` has the full text.
+cargo installs no man page: `xcomm man` shows the one built in.
 
 **As a herdr plugin** (builds and installs the binaries, the man page and the
 agent skill):
@@ -207,7 +207,7 @@ ttyUSB2  0403:6015  FT231X USB UART  locked by 51877  -           /dev/serial/by
 | `-D <device>` | the device, as an option |
 | `-h`, `--help` / `-V`, `--version` | help, version |
 
-`xcomm --help` and `man ./xcomm.1` have the full text.
+`xcomm --help` and `xcomm man` have the full text.
 
 ## Keys
 

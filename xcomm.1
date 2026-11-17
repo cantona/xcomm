@@ -46,6 +46,8 @@ xcomm \- a fast serial terminal with a control socket for scripts and agents
 .br
 .B xcomm doctor
 .br
+.B xcomm man
+.br
 .B xcomm \-\-show\-prefix
 [\fB\-\-prefix\fR \fIkey\fR | \fB\-m\fR]
 .br
@@ -80,7 +82,7 @@ gives it as an option. Put
 before a name that starts with
 .B \-
 or is one of the command words
-.BR ctl ", " list ", " pick ", " watch ", " skill ", " uninstall " or " doctor .
+.BR ctl ", " list ", " pick ", " watch ", " skill ", " uninstall ", " doctor " or " man .
 .SH OPTIONS
 .SS Line settings
 .TP
@@ -453,6 +455,12 @@ It stops at the first failure and says what is left.
 .B xcomm doctor
 Report what is installed and what is left over (stale sockets and locks, a
 skill, man page or watcher with no binary); exit 1 when something needs attention.
+.TP
+.B xcomm man
+Show this page, which is built into xcomm, in
+.BR man (1).
+Piped, write its source instead:
+.BR "xcomm man > xcomm.1" .
 .SH EXIT STATUS
 A session exits 0 after quit, the end of input, SIGTERM, SIGINT or SIGHUP,
 or when the terminal goes away; 1 on an error or when the device goes away;

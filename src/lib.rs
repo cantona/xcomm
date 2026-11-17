@@ -14,6 +14,7 @@ pub mod install;
 pub mod keys;
 pub mod list;
 pub mod lock;
+pub mod man;
 pub mod out;
 pub mod pick;
 pub mod port;

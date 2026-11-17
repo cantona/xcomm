@@ -11,6 +11,9 @@ What changed in each release of xcomm.
 - `xcomm ctl read|wait|run -q` (`--quiet`): no `next=`/`end=` line on stderr,
   for output piped on to a program that shows it on the same terminal (`tee`,
   `less`).
+- `xcomm man`: the manual page, built into xcomm, shown in `man` (piped, its
+  source: `xcomm man > xcomm.1`), for installs that have no man page, such as
+  `cargo install`.
 
 ### Changed
 - `xcomm uninstall` and `xcomm doctor` recognise a Homebrew install: uninstall
