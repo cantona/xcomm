@@ -185,7 +185,17 @@ fn wait_times_out_exit_1() {
     assert!(stderr(&o).ends_with("end=3\n"), "{}", stderr(&o));
     assert!(o.stdout.is_empty());
     assert!(took >= Duration::from_millis(300), "{took:?}");
-    assert!(took < Duration::from_secs(3), "{took:?}");
+    // Starting the client takes part of the wall clock (a loaded macOS
+    // runner took 3.35 s); what the client says it waited does not.
+    assert!(took < T, "{took:?}");
+    let err = stderr(&o);
+    let waited: f64 = err
+        .split("timed out after ")
+        .nth(1)
+        .and_then(|r| r.split(" s").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no wait time in {err:?}"));
+    assert!((0.3..2.0).contains(&waited), "{err}");
     let v = json_of(&ctl(
         &s,
         &["--json", &path, "wait", "never", "--timeout", "0.1"],
@@ -641,6 +651,27 @@ fn run_reports_fail_on_and_idle() {
 
 #[test]
 fn a_subscriber_that_falls_behind_exits_9() {
+    // Nothing says when the client has subscribed. One that had not yet
+    // when the ring went round asks for an offset already gone (6,
+    // "evicted"): the setup lost the race, so it goes again; anything else
+    // is the answer.
+    for attempt in 1..=3 {
+        let o = falls_behind();
+        if attempt < 3 && o.status.code() == Some(6) && stderr(&o).contains("evicted") {
+            continue;
+        }
+        assert_eq!(o.status.code(), Some(9), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains("subscriber too slow at offset"),
+            "{}",
+            stderr(&o)
+        );
+        return;
+    }
+}
+
+/// A `ctl wait` stopped while 2 MiB go through a 4 KiB ring, then let go.
+fn falls_behind() -> Output {
     let (dev, s, path) = start(&["--ring-size", "4k"]);
     let (stop_term, term) = drain(&s.host.master);
     let from = offset(&s, &path).to_string();
@@ -666,14 +697,9 @@ fn a_subscriber_that_falls_behind_exits_9() {
     }
     rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
     let o = child.wait_with_output().unwrap();
-    assert_eq!(o.status.code(), Some(9), "{}", stderr(&o));
-    assert!(
-        stderr(&o).contains("subscriber too slow at offset"),
-        "{}",
-        stderr(&o)
-    );
     stop_term.store(true, Ordering::Relaxed);
     term.join().unwrap();
+    o
 }
 
 #[test]
