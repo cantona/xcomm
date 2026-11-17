@@ -66,6 +66,7 @@ cargo test --locked --workspace
 cargo clippy --locked --all-targets --features unicode -- -D warnings
 cargo test --locked --features unicode --lib --test cli --test ctl_wait
 cargo "+$toolchain" check --locked --workspace --all-targets
+cargo "+$toolchain" check --locked --all-targets --features unicode
 cargo clippy --locked --workspace --all-targets --target "$macos_target" -- -D warnings
 RUSTFLAGS="${RUSTFLAGS:-} -D warnings" cargo "+$toolchain" check --locked --workspace --all-targets --target "$macos_target"
 cargo build --locked --release
