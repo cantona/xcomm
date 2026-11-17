@@ -5,6 +5,9 @@ What changed in each release of xcomm.
 ## [Unreleased]
 
 ### Added
+- `XCOMM_NO_LOCK=1`: the same as `--no-lock`, for where no option can be given,
+  such as the herdr plugin's session pane on a system where no lock directory
+  is the user's to write.
 - `xcomm ctl read|wait|run -q` (`--quiet`): no `next=`/`end=` line on stderr,
   for output piped on to a program that shows it on the same terminal (`tee`,
   `less`).

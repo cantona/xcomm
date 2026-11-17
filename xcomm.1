@@ -501,6 +501,16 @@ error.
 The command prefix, as for
 .BR \-\-prefix .
 .TP
+.B XCOMM_NO_LOCK
+.B 1
+is the same as
+.BR \-\-no\-lock ,
+for where options cannot be given (the herdr plugin's session pane, on a
+system where no lock directory is the user's to write: set it before herdr
+starts);
+.B 0
+or unset takes the lock.
+.TP
 .B TERM
 .B dumb
 removes colours with

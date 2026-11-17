@@ -189,7 +189,7 @@ ttyUSB2  0403:6015  FT231X USB UART  locked by 51877  -           /dev/serial/by
 | `--stopbits 1\|2` | stop bits (default 1) |
 | `--flow none\|rts\|xon` | flow control: RTS/CTS or XON/XOFF (default none) |
 | `-o` | leave DTR and RTS alone |
-| `--no-lock` | take no UUCP lock file (the port is still opened exclusively) |
+| `--no-lock` | take no UUCP lock file (the port is still opened exclusively); `XCOMM_NO_LOCK=1` does the same where no option can be given, as in the herdr plugin |
 | `--low-latency` | FTDI adapters on Linux: 1 ms latency timer |
 | `--color auto\|always\|never` | colours in device output, and the dim of the `[ctl]` line (`-c on\|off` is the same); `NO_COLOR` takes the dim off, not the device's colours |
 | `-w` | turn line wrap on |

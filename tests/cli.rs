@@ -211,6 +211,16 @@ fn boolean_flags() {
 }
 
 #[test]
+fn xcomm_no_lock_is_no_lock_where_no_option_can_be_given() {
+    assert!(term(&["x"], &[("XCOMM_NO_LOCK", "1")]).no_lock);
+    assert!(!term(&["x"], &[("XCOMM_NO_LOCK", "0")]).no_lock);
+    assert!(!term(&["x"], &[("XCOMM_NO_LOCK", "")]).no_lock);
+    assert!(term(&["--no-lock", "x"], &[("XCOMM_NO_LOCK", "0")]).no_lock);
+    let e = err(&["x"], &[("XCOMM_NO_LOCK", "yes")]);
+    assert!(e.contains("XCOMM_NO_LOCK must be 1 or 0, not 'yes'"), "{e}");
+}
+
+#[test]
 fn metakey8_is_rejected_with_reason() {
     for flag in ["-M", "--metakey8"] {
         let e = err(&[flag, "x"], &[]);

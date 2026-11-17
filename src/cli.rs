@@ -1558,6 +1558,17 @@ pub fn parse(
     }
     let prefix = resolve_prefix(prefix, env)?;
     let defaults = LineSettings::default();
+    // The same as --no-lock, for where options cannot be given: the herdr
+    // plugin's session pane, on a system with no lock directory the user
+    // may write.
+    let no_lock = no_lock
+        || match env("XCOMM_NO_LOCK").as_deref() {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(v) => {
+                return Err(CliError(format!("XCOMM_NO_LOCK must be 1 or 0, not '{v}'")));
+            }
+        };
     Ok(Command::Term(TermOpts {
         device,
         line: LineSettings {
