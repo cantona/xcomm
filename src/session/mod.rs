@@ -1077,7 +1077,16 @@ pub fn run(
     let strip_color = !color;
     // What control clients send, shown in the terminal the user watches.
     let marker =
-        (opts.ctl_marker && shown.is_some_and(rustix::termios::isatty)).then_some(color);
+        (opts.ctl_marker && shown.is_some_and(rustix::termios::isatty)).then(|| {
+            commands::MarkerStyle {
+                dim: crate::ansi::color_enabled(
+                    opts.color,
+                    rustix::termios::isatty(stdout.as_fd()),
+                    env,
+                ),
+                device_color: color,
+            }
+        });
     let names = commands::Names {
         device: path.display().to_string(),
         stable: stable.display().to_string(),

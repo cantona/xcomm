@@ -195,8 +195,8 @@ pub(super) struct Live<'a> {
     ui_cancel: &'static str,
     /// stdout when it is a terminal: where line wrap is switched.
     screen: Option<BorrowedFd<'a>>,
-    /// Show what control clients send on `screen`, dim when true.
-    marker: Option<bool>,
+    /// Show what control clients send on `screen`, and how.
+    marker: Option<MarkerStyle>,
     /// Markers not shown yet: the device's output stopped inside an escape
     /// sequence or a character. Since when, to show them anyway later.
     markers: Vec<u8>,
@@ -245,8 +245,8 @@ pub(super) struct Kept {
     server: Option<CtlServer>,
     names: Names,
     lines: (Option<bool>, Option<bool>),
-    /// Show what control clients send, dim when true.
-    marker: Option<bool>,
+    /// Show what control clients send, and how.
+    marker: Option<MarkerStyle>,
     herdr: PaneLabel,
 }
 
@@ -287,7 +287,7 @@ impl Kept {
         ring: Ring,
         server: Option<CtlServer>,
         names: Names,
-        marker: Option<bool>,
+        marker: Option<MarkerStyle>,
         herdr: PaneLabel,
     ) -> Kept {
         Kept {
@@ -395,9 +395,8 @@ struct View<'v> {
     transferring: bool,
     /// Where sent bytes go, or the reply code why they cannot.
     queue: Result<&'v mut OutQueue, u8>,
-    /// Whether to show sent bytes, dim when true, and where they wait to
-    /// be shown.
-    marker: Option<bool>,
+    /// Whether to show sent bytes, how, and where they wait to be shown.
+    marker: Option<MarkerStyle>,
     markers: &'v mut Vec<u8>,
     unmarked: &'v mut usize,
 }
@@ -572,6 +571,15 @@ const MARKER_WAIT: Duration = Duration::from_millis(100);
 const MARKERS_MAX: usize = 64 << 10;
 /// How much of the latest device output decides how a marker is shown.
 const MARKER_LOOK: u64 = 64 << 10;
+
+/// How what control clients send is shown: dim when xcomm's own messages
+/// may use color (NO_COLOR turns that off), and the device's attributes
+/// given back after it with their colors when device color is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkerStyle {
+    pub dim: bool,
+    pub device_color: bool,
+}
 
 /// Appends `[ctl] <bytes>` on a new line to `out`: C0 controls as `^X`, C1
 /// controls and bytes that are not UTF-8 as `\xNN`, at most MARKER_MAX
@@ -1296,12 +1304,12 @@ impl<'a> Live<'a> {
             return;
         }
         self.markers_since = None;
-        let dim = self.marker == Some(true);
+        let style = self.marker.unwrap_or_default();
         let out = self.unshown.get_mut();
         if state.inside {
             out.extend_from_slice(CANCEL.as_bytes());
         }
-        out.extend_from_slice(if dim { b"\x1b[0;2m" } else { b"\x1b[0m" });
+        out.extend_from_slice(if style.dim { b"\x1b[0;2m" } else { b"\x1b[0m" });
         out.append(&mut self.markers);
         if self.unmarked > 0 {
             out.extend_from_slice(
@@ -1310,7 +1318,7 @@ impl<'a> Live<'a> {
             self.unmarked = 0;
         }
         out.extend_from_slice(b"\x1b[0m");
-        if dim {
+        if style.device_color {
             out.extend_from_slice(&state.sgr);
         } else {
             // Color is off: the device's attributes without their colors.

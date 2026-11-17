@@ -156,7 +156,7 @@ xcomm ctl --json ttyUSB0 status
   and file transfers, each ordered against the bytes queued before it.
 - A 1 MiB ring of device output (`--ring-size`) to look back through.
 - `--headless` sessions for CI and agents, with no terminal at all.
-- What a client sends shows in your terminal as a dim `[ctl]` line.
+- What a client sends shows in your terminal as a `[ctl]` line (dim, unless `--color never` or `NO_COLOR`).
 
 **For agents**
 - `xcomm --skill` and `xcomm skill install`: a skill for Claude Code and
@@ -191,13 +191,13 @@ ttyUSB2  0403:6015  FT231X USB UART  locked by 51877  -           /dev/serial/by
 | `-o` | leave DTR and RTS alone |
 | `--no-lock` | take no UUCP lock file (the port is still opened exclusively) |
 | `--low-latency` | FTDI adapters on Linux: 1 ms latency timer |
-| `--color auto\|always\|never` | colours in device output (`-c on\|off` is the same) |
+| `--color auto\|always\|never` | colours in device output, and the dim of the `[ctl]` line (`-c on\|off` is the same); `NO_COLOR` takes the dim off, not the device's colours |
 | `-w` | turn line wrap on |
 | `-C <file>` | append device output to `<file>` |
 | `--ring-size <bytes>` | device output kept for the control socket (4k to 1g, default 1m) |
 | `--ctl rw\|ro\|off` | what the session's socket allows (default rw) |
 | `--headless` | no terminal: output only to the socket's clients and `-C` |
-| `--no-ctl-marker` | do not show what clients send as a dim `[ctl]` line |
+| `--no-ctl-marker` | do not show what clients send as a `[ctl]` line |
 | `--prefix <key>` | the command prefix: `ctrl-<letter>` (not h, i, j or m) or `alt-<letter>` (also `-e`, `--escape`) |
 | `-m`, `--metakey` | the same as `--prefix alt-a` |
 | `--prefix-time <ms>` | how long a key cut short waits for its rest (1 to 1000, default 25) |

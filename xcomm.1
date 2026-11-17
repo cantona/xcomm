@@ -112,11 +112,15 @@ sysfs file).
 .SS Display
 .TP
 .BR \-\-color " auto|always|never"
-Colours in device output. With
+Colours in device output, and the dim style of xcomm's
+.B [ctl]
+line. With
 .B auto
 (the default) they are kept on a terminal and removed when the output is
 piped or
-.BR TERM=dumb .
+.BR TERM=dumb ;
+.B NO_COLOR
+also takes the dim style off, but not the device's colours.
 .TP
 .BR \-c " on|off"
 The same as
@@ -145,9 +149,10 @@ The session runs until SIGTERM, SIGINT or SIGHUP. Not with
 .BR "\-\-ctl off" .
 .TP
 .B \-\-no\-ctl\-marker
-Do not show what clients send as a dim
+Do not show what clients send as a
 .B [ctl]
-line in the terminal.
+line in the terminal (dim while colour is on, see
+.BR \-\-color " and " NO_COLOR ).
 .SS Keys
 .TP
 .BI \-\-prefix " key"
@@ -481,6 +486,14 @@ The command prefix, as for
 .B dumb
 removes colours with
 .BR "\-\-color auto" .
+.TP
+.B NO_COLOR
+Set and not empty, with
+.BR "\-\-color auto" :
+the
+.B [ctl]
+line is not dim. The device's output keeps its colours: it is the board's,
+not xcomm's.
 .TP
 .BR HERDR_ENV ", " HC_TERMINAL_ID ", " TMUX ", " STY ", " ZELLIJ
 A multiplexer: the automatic prefix is Alt\-A.

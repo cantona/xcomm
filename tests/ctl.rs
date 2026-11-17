@@ -1156,6 +1156,27 @@ fn marker_shown_in_terminal() {
 }
 
 #[test]
+fn no_color_takes_the_dim_off_the_marker_but_not_the_devices_color() {
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let s = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path],
+        &lock_dir("ctl"),
+        &[("NO_COLOR", "1")],
+    );
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    write_all(dev.master.as_fd(), b"\x1b[1;31mred");
+    shown(&s, b"\x1b[1;31mred");
+    let o = ctl(&s, &[&path, "send", "x"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // Not dim (xcomm's own message); the device's bold red given back whole,
+    // since NO_COLOR is not about the board's output (--color never would
+    // give back the bold alone).
+    shown(&s, b"\x1b[0m\r\n[ctl] x^M\x1b[0m\x1b[1;31m\r\n");
+}
+
+#[test]
 fn no_ctl_marker_suppresses_it() {
     let (dev, s, path) = start(&["--no-ctl-marker"]);
     let o = ctl(&s, &[&path, "send", "ls"]);
