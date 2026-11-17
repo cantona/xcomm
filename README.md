@@ -255,6 +255,7 @@ by your user.
 | `xcomm ctl sessions` | the running sessions |
 | `xcomm ctl --pane <id> …` | the session in a herdr pane, not by device |
 | `--json` | the reply as JSON |
+| `-q`, `--quiet` | `read`, `wait`, `run`: no `next=`/`end=` line on stderr (for `\| tee` and the like) |
 
 A `wait` match spans at most 64 KiB, and escape sequences are removed before
 matching unless `--raw`. `\w`, `\d`, `\s` and `(?i)` are ASCII; `--unicode`

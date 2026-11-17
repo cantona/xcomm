@@ -51,7 +51,7 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                 .ok_or((code::FAILED, "the session sent a bad reply".to_string()))?;
             let outcome =
                 watch(&mut conn, &mut matcher, start, opts, None, &still_there)?;
-            finish(args.json, &outcome, started, start, None)
+            finish(args.json, args.quiet, &outcome, started, start, None)
         }
         CtlCmd::Run {
             text,
@@ -81,7 +81,14 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                 &still_there,
             )?;
             let output = matcher.output(text.as_bytes());
-            finish(args.json, &outcome, started, offset, Some(output))
+            finish(
+                args.json,
+                args.quiet,
+                &outcome,
+                started,
+                offset,
+                Some(output),
+            )
         }
         _ => unreachable!("checked above"),
     }
@@ -261,6 +268,7 @@ fn closed_next(reader: &mut BufReader<UnixStream>) -> Result<bool, Failed> {
 /// Prints how a wait ended and returns its exit status.
 fn finish(
     json: bool,
+    quiet: bool,
     outcome: &Outcome,
     started: Instant,
     offset: u64,
@@ -311,7 +319,18 @@ fn finish(
         print_json(&v)?;
     } else {
         match (output, outcome) {
-            (Some(output), _) => print_device_output(output)?,
+            (Some(output), _) => {
+                // The offset line follows, or a message saying why it ended.
+                let message = matches!(
+                    outcome,
+                    Outcome::Timeout { .. }
+                        | Outcome::Matched {
+                            which: Which::FailOn(_),
+                            ..
+                        }
+                );
+                print_device_output(output, !quiet || message)?
+            }
             (None, Outcome::Matched { text, .. }) => {
                 print_out(format!("{text}\n").as_bytes())?
             }
@@ -331,7 +350,7 @@ fn finish(
         )),
         _ => {}
     }
-    if !json {
+    if !json && !quiet {
         eprintln!("end={end}");
     }
     Ok(status)

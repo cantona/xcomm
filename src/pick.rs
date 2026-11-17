@@ -723,6 +723,7 @@ pub fn prompt_request(
             pane: Some(pane.to_string()),
             cmd,
             json: false,
+            quiet: false,
         },
         cwd,
     ))

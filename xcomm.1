@@ -384,6 +384,17 @@ instead of naming the device.
 .B \-\-json
 The reply as one JSON object (see
 .BR EXAMPLES ).
+.TP
+.BR \-q ", " \-\-quiet
+For
+.BR read ", " wait " and " run :
+no
+.B next=
+or
+.B end=
+line on standard error, for output piped on (into
+.BR tee ,
+say) that stderr would otherwise run into on the terminal.
 .SH OTHER COMMANDS
 .TP
 .B xcomm list

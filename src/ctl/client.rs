@@ -108,13 +108,15 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                     ColorMode::Auto => rustix::termios::isatty(std::io::stdout()),
                 };
                 if keep {
-                    print_device_output(&data)?;
+                    print_device_output(&data, !args.quiet)?;
                 } else {
                     let mut plain = Vec::with_capacity(data.len());
                     crate::ansi::EscapeStripper::new().strip(&data, &mut plain);
-                    print_device_output(&plain)?;
+                    print_device_output(&plain, !args.quiet)?;
                 }
-                eprintln!("next={}", reply["next"]);
+                if !args.quiet {
+                    eprintln!("next={}", reply["next"]);
+                }
             }
         }
         CtlCmd::Break { ms } => {
@@ -582,9 +584,11 @@ pub(super) fn print_out(bytes: &[u8]) -> Result<(), Failed> {
 /// next (end=, next=, a message) would run on from output that does not
 /// end its line (`6.1+end=70`), so a line break goes to stderr first.
 /// stdout itself is never changed.
-pub(super) fn print_device_output(bytes: &[u8]) -> Result<(), Failed> {
+/// `more`: something is written to stderr after it; with nothing to keep
+/// apart (`-q`), no line break is added.
+pub(super) fn print_device_output(bytes: &[u8], more: bool) -> Result<(), Failed> {
     print_out(bytes)?;
-    if !bytes.is_empty() && stdout_is_stderr() && !ends_line(bytes) {
+    if more && !bytes.is_empty() && stdout_is_stderr() && !ends_line(bytes) {
         let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\n");
     }
     Ok(())

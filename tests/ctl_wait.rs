@@ -505,6 +505,54 @@ fn run_and_read_keep_the_offset_line_apart() {
     let got = std::fs::read_to_string(&f).unwrap();
     assert_eq!(offset_line(&got, "end="), "6.1+\n");
     std::fs::remove_dir_all(&dir).unwrap();
+    // -q: no end= line at all, and stdout as it was.
+    let q = [
+        path.as_str(),
+        "run",
+        "-q",
+        "uname -r",
+        "--until",
+        "\\r?\\n[^\\n]*# $",
+    ];
+    let (got, err) = ctl_to(&s, &q, false, false);
+    assert_eq!((got.as_str(), err.as_str()), ("6.1+", ""));
+    let (got, err) = ctl_to(&s, &[&path, "read", "-q", "--last", "2"], false, false);
+    assert_eq!((got.as_str(), err.as_str()), ("# ", ""));
+    // Nor a line break, where stderr is stdout's stream: nothing follows it.
+    for terminal in [true, false] {
+        let (got, _) = ctl_to(&s, &q, terminal, true);
+        assert_eq!(got, "6.1+", "terminal {terminal}");
+        let (got, _) = ctl_to(&s, &[&path, "read", "-q", "--last", "2"], terminal, true);
+        assert_eq!(got, "# ", "terminal {terminal}");
+    }
+    // Unless a message follows: why the wait ended.
+    let (r, w) = cloexec_pipe();
+    let o = ctl_cmd(
+        &s.lock_dir,
+        &[
+            &path,
+            "run",
+            "-q",
+            "uname -r",
+            "--until",
+            "never",
+            "--fail-on",
+            "\\r?\\n[^\\n]*# $",
+        ],
+    )
+    .stdout(Stdio::from(w.try_clone().unwrap()))
+    .stderr(Stdio::from(w.try_clone().unwrap()))
+    .output()
+    .unwrap();
+    assert_eq!(o.status.code(), Some(7));
+    drop(w);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n @ 1..) = rustix::io::read(&r, &mut buf) {
+        got.extend_from_slice(&buf[..n]);
+    }
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.starts_with("6.1+\nxcomm: --fail-on "), "{got:?}");
     // read: the same, here for the prompt, which does not end its line.
     let read = [path.as_str(), "read", "--last", "2"];
     let (got, _) = ctl_to(&s, &read, true, true);

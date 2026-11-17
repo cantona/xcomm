@@ -355,6 +355,8 @@ pub struct CtlArgs {
     pub pane: Option<String>,
     pub cmd: CtlCmd,
     pub json: bool,
+    /// `-q`: no next= or end= line on stderr (read, wait, run).
+    pub quiet: bool,
 }
 
 /// `--ring-size` when not given.
@@ -554,6 +556,8 @@ Control socket (for scripts and agents, from another terminal):
   xcomm ctl sessions         the running sessions
   xcomm ctl --pane <id> ...  the session in herdr pane <id>, not by device
   --json                     the reply as JSON
+  -q, --quiet                read, wait, run: no next= or end= line on
+                             stderr (for output piped on, as to tee)
 
 Keys:
   --prefix <key>             the command prefix: ctrl-<letter> (not h, i,
@@ -743,6 +747,7 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     let mut fail_on: Vec<String> = Vec::new();
     let mut raw = false;
     let mut unicode = false;
+    let mut quiet = false;
     // Each option given, and the commands it belongs to, for the check
     // below.
     const SEND: &[&str] = &["send"];
@@ -753,6 +758,10 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     while let Some(arg) = p.next()? {
         match arg {
             Long("json") => json = true,
+            Short('q') | Long("quiet") => {
+                quiet = true;
+                given.push(("-q", &["read", "wait", "run"]));
+            }
             Long("pane") => set_once(&mut pane, text(p.value()?, "--pane")?, "--pane")?,
             Long("pane-from-context") => pane_from_context = true,
             Short('n') => {
@@ -866,6 +875,7 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
             pane: None,
             cmd: CtlCmd::PaneFromContext,
             json: false,
+            quiet: false,
         }));
     }
     let (device, cmd, rest) = match (words.as_slice(), &pane) {
@@ -1095,6 +1105,7 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
         pane,
         cmd,
         json,
+        quiet,
     }))
 }
 

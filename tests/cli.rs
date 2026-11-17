@@ -610,6 +610,17 @@ fn ctl_commands_parse() {
     );
     let c = ctl(&["--json", "sessions"]);
     assert_eq!((c.device, c.cmd, c.json), (None, CtlCmd::Sessions, true));
+    for cmd in [
+        &["d", "read"][..],
+        &["d", "wait", "x"],
+        &["d", "run", "x", "--idle", "9"],
+    ] {
+        let mut args = vec!["-q"];
+        args.extend_from_slice(cmd);
+        assert!(ctl(&args).quiet, "{cmd:?}");
+        assert!(!ctl(cmd).quiet, "{cmd:?}");
+    }
+    assert!(ctl(&["--quiet", "d", "read"]).quiet);
     assert_eq!(
         ctl(&["ttyUSB1", "status", "offset"]).cmd,
         CtlCmd::Status {
@@ -937,6 +948,10 @@ fn ctl_usage_errors() {
             "no field 'nope' (one of device,",
         ),
         (&["--json", "ttyUSB1", "status", "pid"], "not with --json"),
+        (
+            &["-q", "ttyUSB1", "send", "x"],
+            "-q is for ctl read or ctl wait or ctl run",
+        ),
         (&["ttyUSB1", "send"], "needs <text>"),
         (&["ttyUSB1", "send", "a", "b"], "unexpected argument 'b'"),
         (&["ttyUSB1", "send", "a", "--hex", "00"], "one of"),
