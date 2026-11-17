@@ -12,8 +12,12 @@ use crate::list::PortInfo;
 pub const PLUGIN_ID: &str = "cantona.herdr-xcomm";
 /// The baud a port opens at unless `b` changes it.
 pub const DEFAULT_BAUD: u32 = 115_200;
-/// How long a lone ESC waits for the rest of a key, as in a session.
-const ESC_WAIT: Duration = Duration::from_millis(25);
+/// How long a lone ESC waits for the rest of a key, from its latest bytes.
+/// Longer than a session's 25 ms: closing a popup gains nothing from it,
+/// and a loaded machine can deliver an arrow key's bytes further apart
+/// than that. The cost: Esc and the next key within it can be read as one
+/// key (an Alt key, or the start of an arrow key) rather than as Esc.
+const ESC_WAIT: Duration = Duration::from_millis(100);
 /// How often the list is read again: locks and panes change with no
 /// event in /dev.
 const REFRESH: Duration = Duration::from_secs(1);
@@ -457,17 +461,17 @@ pub fn run(
             match rustix::io::read(input, &mut buf) {
                 Ok(0) => break Ok(1),
                 Ok(n) => {
-                    if pending.is_empty() {
-                        pending_since = Instant::now();
-                    }
+                    // From the latest bytes: a key cut in two, then another
+                    // cut, each get the whole wait.
+                    pending_since = Instant::now();
                     pending.extend_from_slice(&buf[..n]);
                 }
                 Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {}
                 Err(e) => break Err(err("terminal", e.into())),
             }
         }
-        // A key that may still be coming waits its 25 ms, whatever else
-        // woke the loop.
+        // A key that may still be coming waits ESC_WAIT, whatever else woke
+        // the loop.
         if pending.is_empty() || (incomplete(&pending) && pending_since.elapsed() < ESC_WAIT) {
             continue;
         }
@@ -816,9 +820,10 @@ pub fn run_prompt(
             }
         };
         let mut keys = buf[..n].to_vec();
-        // A key's sequence cut between reads waits its 25 ms for the rest,
-        // as in the picker: a lone ESC is Esc only once none comes.
-        let since = Instant::now();
+        // A key's sequence cut between reads waits ESC_WAIT for the rest,
+        // from the latest bytes, as in the picker: a lone ESC is Esc only
+        // once none comes.
+        let mut since = Instant::now();
         while incomplete(&keys) {
             let left = ESC_WAIT.saturating_sub(since.elapsed());
             let timeout = rustix::event::Timespec::try_from(left).unwrap_or_default();
@@ -831,7 +836,10 @@ pub fn run_prompt(
             }
             match rustix::io::read(input, &mut buf) {
                 Ok(0) => break,
-                Ok(n) => keys.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    keys.extend_from_slice(&buf[..n]);
+                    since = Instant::now();
+                }
                 Err(_) => break,
             }
         }
