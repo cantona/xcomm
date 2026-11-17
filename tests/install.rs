@@ -49,8 +49,9 @@ impl Home {
         // The system's tools the fakes run, and nothing else from /usr/bin:
         // an xcomm installed there (a distribution package) would otherwise
         // be on PATH too, and doctor and uninstall would report it.
-        // (macOS has no setsid; the fake that runs it does without.)
-        for tool in ["sleep", "setsid", "head", "tr"] {
+        // (macOS has no setsid; the fake that runs it does without. perl's
+        // POSIX::setsid is on both.)
+        for tool in ["sleep", "setsid", "head", "tr", "perl", "touch"] {
             if let Some(found) = ["/usr/bin", "/bin"]
                 .iter()
                 .map(|d| Path::new(d).join(tool))
@@ -718,6 +719,124 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
             "{script}"
         );
         assert_eq!(o.status.code(), Some(0), "{script}: {}", stdout(&o));
+    }
+}
+
+#[test]
+fn an_installed_xcomm_that_does_not_run_is_reported() {
+    // What glibc's loader says, and its exit status, when the binary needs
+    // a newer glibc: the same 1 another program refusing --version gives.
+    let loader = "#!/bin/sh\necho \"xcomm: /lib/libc.so.6: version \\`GLIBC_2.39' not found \
+                  (required by xcomm)\" >&2\nexit 1\n";
+    let said = "exit status 1: xcomm: /lib/libc.so.6: version `GLIBC_2.39' not found \
+                (required by xcomm)";
+    // Homebrew's: doctor reports it, and uninstall names it as Homebrew's.
+    let h = Home::new("brokenbrew");
+    let brew = h.root.join("brew");
+    let keg = brew.join("Cellar/xcomm/0.1.2/bin");
+    std::fs::create_dir_all(&keg).unwrap();
+    std::fs::create_dir_all(brew.join("bin")).unwrap();
+    support::write_exe(&brew.join("bin/brew"), "#!/bin/sh\nexit 0\n");
+    support::write_exe(&keg.join("xcomm"), loader);
+    let on_path = h.root.join("bin/xcomm");
+    std::os::unix::fs::symlink(keg.join("xcomm"), &on_path).unwrap();
+    // Its skill is not a leftover: the binary is there, only broken.
+    h.install_skill();
+    let o = h.run("doctor", &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains(&format!(
+            "problem: {} does not run ({said})",
+            on_path.display()
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert!(!stdout(&o).contains("no xcomm"), "{}", stdout(&o));
+    let o = h.run("uninstall", &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains(&format!(
+            "binaries: FAILED: still on PATH, installed by Homebrew: {}; remove it with \
+             {} uninstall xcomm\n",
+            on_path.display(),
+            brew.canonicalize().unwrap().join("bin/brew").display()
+        )),
+        "{}",
+        stdout(&o)
+    );
+    // Where cargo's record says it installed xcomm: doctor reports it too.
+    let h = Home::new("brokencargo");
+    h.cargo_record();
+    let bin = h.home().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    support::write_exe(&bin.join("xcomm"), loader);
+    let path = format!("{}:{}", bin.display(), h.root.join("tools").display());
+    let o = h.run("doctor", &[("PATH", &path)]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains(&format!(
+            "problem: {} does not run ({said})",
+            bin.join("xcomm").display()
+        )),
+        "{}",
+        stdout(&o)
+    );
+    // Anywhere else it may be another program: not a problem.
+    let h = Home::new("brokenelse");
+    support::write_exe(&h.root.join("bin/xcomm"), loader);
+    let o = h.run("doctor", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("binary: no xcomm on PATH"),
+        "{}",
+        stdout(&o)
+    );
+    // And one there that cannot even start (a missing interpreter) is not
+    // taken for xcomm either: a skill left from an install is still one.
+    support::write_exe(&h.root.join("bin/xcomm"), "#!/nonexistent/python2\n");
+    h.install_skill();
+    let o = h.run("doctor", &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let out = stdout(&o);
+    assert!(out.contains("binary: no xcomm on PATH"), "{out}");
+    assert!(out.contains("does not run"), "{out}");
+    assert!(
+        out.contains("is left from an install: no xcomm is on PATH"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_daemon_an_xcomm_starts_keeps_its_stderr_after_doctor() {
+    // Another program named xcomm that answers, and starts a daemon of its
+    // own session that writes to stderr later: doctor's probe must not
+    // leave it a pipe that is gone by then.
+    let h = Home::new("daemon");
+    let mark = h.root.join("mark");
+    let ready = h.root.join("ready");
+    // It answers only once the daemon is out of its group, which doctor
+    // takes down.
+    support::write_exe(
+        &h.root.join("bin/xcomm"),
+        &format!(
+            "#!/bin/sh\nperl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/sh -c \
+             'touch \"$1\"; sleep 1; echo log >&2; touch \"$0\"' '{}' '{}' \
+             </dev/null >/dev/null &\n\
+             while [ ! -e '{1}' ]; do sleep 0.05; done\necho 'xcomm 0.0.1'\n",
+            mark.display(),
+            ready.display()
+        ),
+    );
+    let o = h.run("doctor", &[]);
+    assert!(stdout(&o).contains("(xcomm 0.0.1)"), "{}", stdout(&o));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !mark.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the daemon died writing to stderr"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

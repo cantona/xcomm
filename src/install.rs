@@ -400,10 +400,18 @@ fn remove_binary(env: &Env) -> Result<Step, InstallError> {
     // is brew's, and the rest is the user's.
     let mut brewed: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut left: Vec<PathBuf> = Vec::new();
-    for (p, _) in binaries(env) {
+    let (ours, broken) = binaries_and_broken(env);
+    for (p, _) in ours {
         match homebrew_prefix(&p) {
             Some(prefix) => brewed.push((p, prefix)),
             None => left.push(p),
+        }
+    }
+    // One that does not run is still Homebrew's to take away; any other
+    // may be another program.
+    for (p, _) in broken {
+        if let Some(prefix) = homebrew_prefix(&p) {
+            brewed.push((p, prefix));
         }
     }
     let list = |ps: &[PathBuf]| {
@@ -510,8 +518,11 @@ pub fn uninstall(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
 /// What a program named xcomm answers to `--version`.
 enum Probe {
     Answered(String),
-    /// It ran and refused the option: another program.
-    Refused,
+    /// It ran and refused the option, with its exit status and the start
+    /// of what it said: another program, unless where it is says it was
+    /// installed as xcomm (a loader that cannot resolve a symbol version
+    /// exits 1, the same as a refusal).
+    Refused(String),
     /// It could not run, died of a signal, or did not answer in time.
     Broken(String),
 }
@@ -521,7 +532,7 @@ enum Probe {
 /// program or a daemon, and it must not hold doctor up. (A child that
 /// leaves the group, with setsid, is out of reach: it is only not waited
 /// for.)
-fn version_of(p: &Path) -> Probe {
+fn version_of(p: &Path, stderr: bool) -> Probe {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     let limit = std::time::Duration::from_secs(3);
@@ -529,7 +540,13 @@ fn version_of(p: &Path) -> Probe {
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        // Piped only when asked: a daemon it starts would keep the pipe,
+        // and die writing to it once doctor is gone.
+        .stderr(if stderr {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .process_group(0)
         .spawn()
     {
@@ -545,17 +562,21 @@ fn version_of(p: &Path) -> Probe {
     // Read as it comes, so a long answer does not fill the pipe; the start
     // of it is passed on as it is read, not at the end, which a child
     // holding the pipe may put off for good.
-    let mut stdout = child.stdout.take().expect("piped");
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let (mut sent, mut buf) = (0, [0u8; 4096]);
-        while let Ok(n @ 1..) = stdout.read(&mut buf) {
-            if sent < 4096 && tx.send(buf[..n].to_vec()).is_err() {
-                return;
+    let drain = |mut from: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let (mut sent, mut buf) = (0, [0u8; 4096]);
+            while let Ok(n @ 1..) = from.read(&mut buf) {
+                if sent < 4096 && tx.send(buf[..n].to_vec()).is_err() {
+                    return;
+                }
+                sent += n;
             }
-            sent += n;
-        }
-    });
+        });
+        rx
+    };
+    let rx = drain(Box::new(child.stdout.take().expect("piped")));
+    let rx_err = child.stderr.take().map(|e| drain(Box::new(e)));
     let until = std::time::Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
@@ -574,13 +595,17 @@ fn version_of(p: &Path) -> Probe {
     };
     // What it wrote is in the pipe by now: take it until the pipe closes,
     // or briefly if something outside the group holds it open.
-    let mut out = Vec::new();
     let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
-    while let Ok(chunk) =
-        rx.recv_timeout(settle.saturating_duration_since(std::time::Instant::now()))
-    {
-        out.extend_from_slice(&chunk);
-    }
+    let take = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        let mut got = Vec::new();
+        while let Ok(chunk) =
+            rx.recv_timeout(settle.saturating_duration_since(std::time::Instant::now()))
+        {
+            got.extend_from_slice(&chunk);
+        }
+        got
+    };
+    let out = take(rx);
     use std::os::unix::process::ExitStatusExt;
     match (status.code(), status.signal()) {
         (Some(0), _) => Probe::Answered(String::from_utf8_lossy(&out).trim().to_string()),
@@ -590,7 +615,16 @@ fn version_of(p: &Path) -> Probe {
         (Some(code @ (126 | 127)), _) => {
             Probe::Broken(format!("exit status {code}: it cannot be run"))
         }
-        _ => Probe::Refused,
+        (code, _) => {
+            let err = rx_err.map(take).unwrap_or_default();
+            let said = String::from_utf8_lossy(&err);
+            let first = said.lines().map(str::trim).find(|l| !l.is_empty());
+            let code = code.map_or("?".to_string(), |c| c.to_string());
+            Probe::Refused(match first {
+                Some(line) => format!("exit status {code}: {line}"),
+                None => format!("exit status {code}"),
+            })
+        }
     }
 }
 
@@ -600,7 +634,8 @@ type Found = (PathBuf, String);
 /// The xcomm binaries on PATH with their versions, and those named xcomm
 /// that do not run (a broken install, or another program: no telling).
 /// One that runs and answers as something else, or refuses `--version`,
-/// is another program.
+/// is another program, unless it is where Homebrew or cargo installed
+/// xcomm: then it is a broken one.
 fn binaries_and_broken(env: &Env) -> (Vec<Found>, Vec<Found>) {
     let mut seen: Vec<PathBuf> = Vec::new();
     let (mut ours, mut broken) = (Vec::new(), Vec::new());
@@ -614,17 +649,33 @@ fn binaries_and_broken(env: &Env) -> (Vec<Found>, Vec<Found>) {
             continue;
         }
         seen.push(real);
-        match version_of(&p) {
+        match version_of(&p, false) {
             Probe::Answered(v) if v.starts_with("xcomm ") => ours.push((p, v)),
-            Probe::Answered(_) | Probe::Refused => {}
+            // Asked again for what it says, which only a broken install
+            // is worth the pipe for.
+            Probe::Refused(why) if installed_as_xcomm(env, &p) => {
+                let why = match version_of(&p, true) {
+                    Probe::Refused(said) | Probe::Broken(said) => said,
+                    Probe::Answered(_) => why,
+                };
+                broken.push((p, why))
+            }
+            Probe::Answered(_) | Probe::Refused(_) => {}
             Probe::Broken(why) => broken.push((p, why)),
         }
     }
     (ours, broken)
 }
 
-fn binaries(env: &Env) -> Vec<(PathBuf, String)> {
-    binaries_and_broken(env).0
+/// Whether `p` is where Homebrew or cargo put xcomm: in an xcomm keg, or
+/// the `bin/xcomm` of a cargo root whose record lists xcomm.
+fn installed_as_xcomm(env: &Env, p: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    homebrew_prefix(p).is_some()
+        || env.cargo_roots.iter().any(|root| {
+            cargo_has_xcomm(root)
+                && real(&root.join("bin/xcomm")).is_some_and(|r| Some(r) == real(p))
+        })
 }
 
 /// Sockets in the socket directories that no session answers on.
@@ -675,7 +726,11 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
     for (p, why) in &broken {
         problems.push(format!("{} does not run ({why})", p.display()));
     }
-    if found.is_empty() {
+    // An installed one that does not run is reported as such, not as
+    // missing; any other that does not run may be another program.
+    let none_on_path =
+        found.is_empty() && !broken.iter().any(|(p, _)| installed_as_xcomm(env, p));
+    if none_on_path {
         lines.push("binary: no xcomm on PATH".to_string());
     }
     for (p, v) in &found {
@@ -725,12 +780,13 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
     // One xcomm wrote, wherever it is kept: it should name a tool that is
     // there.
     if let Some(v) = written_by {
-        if found.is_empty() {
+        if none_on_path {
             problems.push(format!(
                 "the skill at {} is left from an install: no xcomm is on PATH",
                 skill.display()
             ));
-        } else if !versions.contains(&format!("xcomm {v}").as_str()) {
+        } else if !found.is_empty() && !versions.contains(&format!("xcomm {v}").as_str())
+        {
             problems.push(format!(
                 "the skill is xcomm {v}'s, the binary is not: run xcomm skill install{}",
                 match &env.dotfiles {
@@ -778,11 +834,11 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
             continue;
         }
         lines.push(format!("hotplug watcher {}: {status}", dir.display()));
-        if status.starts_with("running") && (found.is_empty() || !registered) {
+        if status.starts_with("running") && (none_on_path || !registered) {
             problems.push(format!(
                 "a hotplug watcher still runs ({}) with {}: xcomm uninstall stops it",
                 dir.display(),
-                if found.is_empty() {
+                if none_on_path {
                     "no xcomm on PATH"
                 } else {
                     "the herdr plugin not registered"

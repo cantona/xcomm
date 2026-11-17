@@ -20,6 +20,10 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- `xcomm doctor` reports an xcomm that Homebrew or cargo installed but that
+  does not run (for example a binary built for a newer glibc), with what it
+  said, instead of taking it for another program and reporting nothing;
+  `xcomm uninstall` names such a Homebrew binary as Homebrew's.
 - herdr picker: a port opened from it is reopened, after an unplug, on the USB
   port it was on (by-path), as for a port named on the command line, not by
   its by-id name, which identical adapters without a serial number share: the
