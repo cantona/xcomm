@@ -89,6 +89,67 @@ impl Env {
     pub fn skill(&self) -> PathBuf {
         self.home.join(".agents/skills/xcomm/SKILL.md")
     }
+
+    /// Where scripts/build.sh puts the man page, beside ~/.local/bin, where
+    /// man looks for it.
+    pub fn man_page(&self) -> PathBuf {
+        self.home.join(".local/share/man/man1/xcomm.1")
+    }
+}
+
+/// The man page at `Env::man_page`.
+enum ManPage {
+    Absent,
+    /// Something else is there: a link, a page xcomm did not write, or
+    /// one that cannot be read.
+    NotOurs,
+    Ours,
+}
+
+fn man_page(env: &Env) -> Result<ManPage, InstallError> {
+    let path = env.man_page();
+    let meta = match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ManPage::Absent),
+        Err(e) => return Err(InstallError(format!("{}: {e}", path.display()))),
+        Ok(m) => m,
+    };
+    if !meta.is_file() {
+        return Ok(ManPage::NotOurs);
+    }
+    // What cannot be read cannot be shown to be xcomm's; the .TH line is
+    // near the top, so the start is enough.
+    use std::io::Read;
+    let mut head = Vec::new();
+    let read =
+        std::fs::File::open(&path).and_then(|f| f.take(64 * 1024).read_to_end(&mut head));
+    let ours = read.is_ok()
+        && head
+            .split(|&b| b == b'\n')
+            .any(|l| l.starts_with(b".TH XCOMM 1 "));
+    Ok(if ours {
+        ManPage::Ours
+    } else {
+        ManPage::NotOurs
+    })
+}
+
+/// Whether ~/.local/bin, where build.sh installs xcomm beside the man
+/// page, still has it.
+fn local_xcomm(env: &Env) -> bool {
+    executable(&env.home.join(".local/bin/xcomm"))
+}
+
+/// Removes the man page build.sh installed, once the xcomm beside it in
+/// ~/.local/bin is gone; true when it did. A link, a page xcomm did not
+/// write, or one it cannot look at (doctor says why) is left.
+fn remove_man_page(env: &Env) -> Result<bool, InstallError> {
+    if local_xcomm(env) || !matches!(man_page(env), Ok(ManPage::Ours)) {
+        return Ok(false);
+    }
+    let path = env.man_page();
+    std::fs::remove_file(&path)
+        .map(|()| true)
+        .map_err(|e| InstallError(format!("{}: {e}", path.display())))
 }
 
 /// The skill at the default place, as uninstall and doctor see it.
@@ -423,6 +484,9 @@ fn remove_binary(env: &Env) -> Result<Step, InstallError> {
         })?;
         removed = true;
     }
+    // The page goes with the ~/.local install it came with, whatever else
+    // is on PATH.
+    removed |= remove_man_page(env)?;
     // What cargo did not install is not cargo's to take away: Homebrew's
     // is brew's, and the rest is the user's.
     let mut brewed: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -513,7 +577,7 @@ fn homebrew_prefix(p: &Path) -> Option<PathBuf> {
 }
 
 /// Takes away, in order, the hotplug watchers, the skill, the herdr plugin
-/// and the binaries, saying how each went; at the first failure it stops
+/// and the binaries (with the man page build.sh put beside them), saying how each went; at the first failure it stops
 /// and says what is left. False when a step failed (already said).
 pub fn uninstall(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
     type Action = fn(&Env) -> Result<Step, InstallError>;
@@ -823,6 +887,14 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
                 }
             ));
         }
+    }
+    match man_page(env) {
+        Ok(ManPage::Ours) if !local_xcomm(env) => problems.push(format!(
+            "the man page at {} is left from an install: no xcomm in ~/.local/bin",
+            env.man_page().display()
+        )),
+        Ok(_) => {}
+        Err(e) => problems.push(format!("man page: {e}")),
     }
     let plugin = plugin_state(env);
     let registered = !matches!(plugin, Ok(PluginState::NotRegistered));

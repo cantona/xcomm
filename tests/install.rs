@@ -100,6 +100,20 @@ impl Home {
         xcomm::skill::install(self.skill().parent().unwrap()).unwrap();
     }
 
+    fn man_page(&self) -> PathBuf {
+        self.home().join(".local/share/man/man1/xcomm.1")
+    }
+
+    /// The man page as scripts/build.sh installs it.
+    fn install_man_page(&self) {
+        std::fs::create_dir_all(self.man_page().parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("xcomm.1"),
+            self.man_page(),
+        )
+        .unwrap();
+    }
+
     /// What `cargo install --root ~/.local` records.
     fn cargo_record(&self) {
         let root = self.home().join(".local");
@@ -147,6 +161,7 @@ fn uninstall_takes_everything_away_in_order() {
     h.fake("herdr");
     h.fake("cargo");
     h.install_skill();
+    h.install_man_page();
     h.cargo_record();
     let o = h.run("uninstall", &[("FAKE_LIST", LINKED)]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
@@ -161,6 +176,7 @@ fn uninstall_takes_everything_away_in_order() {
             skill.display(),
         )
     );
+    assert!(!h.man_page().exists());
     assert!(!skill.exists());
     assert!(!skill.parent().unwrap().exists());
     assert_eq!(
@@ -183,6 +199,204 @@ fn uninstall_takes_everything_away_in_order() {
         h.log("herdr")
             .contains("plugin|uninstall|cantona.herdr-xcomm|")
     );
+}
+
+#[test]
+fn the_man_page_goes_with_the_local_install_and_only_xcomms() {
+    let h = Home::new("man");
+    let man = h.man_page();
+    let local = h.home().join(".local/bin");
+    std::fs::create_dir_all(&local).unwrap();
+    // A cargo that takes the binary and its record away, as the real one
+    // does.
+    support::write_exe(
+        &h.root.join("bin/cargo"),
+        "#!/bin/sh\n[ -n \"${CARGO_RC:-}\" ] && exit $CARGO_RC\n/bin/rm -f \"$3/bin/xcomm\" \"$3/.crates.toml\"\n",
+    );
+    let install = || {
+        h.cargo_record();
+        support::write_exe(&local.join("xcomm"), "#!/bin/sh\necho 'xcomm 0.0.1'\n");
+        h.install_man_page();
+    };
+    // While the binary stays (cargo failed), so does its page.
+    install();
+    let o = h.run("uninstall", &[("CARGO_RC", "101")]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(man.exists());
+    // With it, the page goes.
+    let o = h.run("uninstall", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(stdout(&o).contains("binaries: ok\n"), "{}", stdout(&o));
+    assert!(!man.exists());
+    // One left without the binary goes too; one xcomm did not write, one it
+    // cannot read, and a link are left.
+    h.install_man_page();
+    let o = h.run("uninstall", &[]);
+    assert!(stdout(&o).contains("binaries: ok\n"), "{}", stdout(&o));
+    assert!(!man.exists());
+    for page in [
+        &b".TH XCOMM 8 \"\" \"other\"\n"[..],
+        &b".TH FOO 1\ncaf\xe9\n"[..],
+    ] {
+        std::fs::write(&man, page).unwrap();
+        let o = h.run("uninstall", &[]);
+        assert!(
+            stdout(&o).contains("binaries: skip (no xcomm installed)"),
+            "{}",
+            stdout(&o)
+        );
+        assert_eq!(std::fs::read(&man).unwrap(), page);
+        // Not xcomm's: not a leftover of it either.
+        assert!(!stdout(&h.run("doctor", &[])).contains("man page"));
+    }
+    // (Root reads what mode 000 keeps from everyone else.)
+    if !root() {
+        h.install_man_page();
+        std::fs::set_permissions(&man, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let o = h.run("uninstall", &[]);
+        std::fs::set_permissions(&man, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+        assert!(man.exists());
+        std::fs::remove_file(&man).unwrap();
+    }
+    std::os::unix::fs::symlink(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("xcomm.1"),
+        &man,
+    )
+    .unwrap();
+    let o = h.run("uninstall", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(man.symlink_metadata().is_ok());
+    std::fs::remove_file(&man).unwrap();
+    // doctor: xcomm's page with no xcomm in ~/.local/bin is a leftover,
+    // whatever other xcomm is on PATH.
+    h.install_man_page();
+    let leftover = format!(
+        "problem: the man page at {} is left from an install: no xcomm in ~/.local/bin",
+        man.display()
+    );
+    let built = Path::new(env!("CARGO_BIN_EXE_xcomm"));
+    for name in ["xcomm", "xcomm-wait"] {
+        support::copy_exe(&built.with_file_name(name), &h.root.join("bin").join(name));
+    }
+    let o = h.run("doctor", &[]);
+    assert!(stdout(&o).contains(&leftover), "{}", stdout(&o));
+    support::write_exe(&local.join("xcomm"), "#!/bin/sh\necho 'xcomm 0.0.1'\n");
+    let o = h.run("doctor", &[]);
+    assert!(!stdout(&o).contains("man page"), "{}", stdout(&o));
+    // One it cannot look at: doctor says so, and uninstall leaves it and
+    // does the rest.
+    if root() {
+        return;
+    }
+    std::fs::remove_file(local.join("xcomm")).unwrap();
+    let dir = man.parent().unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let doctor = h.run("doctor", &[]);
+    let uninstall = h.run("uninstall", &[]);
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(doctor.status.code(), Some(1), "{}", stdout(&doctor));
+    assert!(
+        stdout(&doctor).contains("problem: man page: "),
+        "{}",
+        stdout(&doctor)
+    );
+    assert_eq!(uninstall.status.code(), Some(1), "{}", stdout(&uninstall));
+    assert!(
+        !stdout(&uninstall).contains("Permission denied"),
+        "{}",
+        stdout(&uninstall)
+    );
+    assert!(man.exists());
+}
+
+fn root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+/// Runs the man page part of scripts/build.sh as build.sh does (sh, set
+/// -eu, from the checkout), with HOME at `home`; whether what follows it
+/// still runs, and what it said.
+fn build_sh_man_block(home: &Path) -> (bool, String) {
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build.sh"),
+    )
+    .unwrap();
+    let start = script.find("man=\"$HOME/").expect("the man page block");
+    let end = start + script[start..].find("\nfi\n").expect("its end") + 4;
+    let o = Command::new("sh")
+        .args([
+            "-eu",
+            "-c",
+            &format!("{}echo REACHED\n", &script[start..end]),
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    (
+        o.status.success() && out.contains("REACHED"),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn build_sh_installs_the_man_page_only_where_it_is_xcomms_to_write() {
+    let h = Home::new("buildman");
+    let man = h.man_page();
+    let page =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("xcomm.1")).unwrap();
+    std::fs::create_dir_all(h.home().join(".local")).unwrap();
+    // Nothing there: installed, and again over its own copy.
+    for _ in 0..2 {
+        let (went_on, said) = build_sh_man_block(&h.home());
+        assert!(went_on && said.is_empty(), "{said}");
+        assert_eq!(std::fs::read(&man).unwrap(), page);
+    }
+    // Another program's page, and a link: left, with a word, and the build
+    // goes on.
+    std::fs::write(&man, ".TH XCOMM 8 \"\" \"other\"\n").unwrap();
+    let (went_on, said) = build_sh_man_block(&h.home());
+    assert!(went_on && said.contains("left alone"), "{said}");
+    assert!(
+        std::fs::read_to_string(&man)
+            .unwrap()
+            .starts_with(".TH XCOMM 8")
+    );
+    std::fs::remove_file(&man).unwrap();
+    let elsewhere = h.root.join("elsewhere.1");
+    std::fs::write(&elsewhere, "mine\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &man).unwrap();
+    let (went_on, said) = build_sh_man_block(&h.home());
+    assert!(went_on && said.contains("left alone"), "{said}");
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "mine\n");
+    std::fs::remove_file(&man).unwrap();
+    // A folder below HOME that is a link (stow folds them): nothing is
+    // written into where it leads.
+    let share = h.home().join(".local/share");
+    std::fs::remove_dir_all(share.join("man")).unwrap();
+    let dotfiles = h.root.join("dotfiles/man");
+    std::fs::create_dir_all(dotfiles.join("man1")).unwrap();
+    std::os::unix::fs::symlink(&dotfiles, share.join("man")).unwrap();
+    let (went_on, said) = build_sh_man_block(&h.home());
+    assert!(went_on && said.contains("left alone"), "{said}");
+    assert!(!dotfiles.join("man1/xcomm.1").exists());
+    std::fs::remove_file(share.join("man")).unwrap();
+    // One it cannot enter, or write to: a warning, and the build goes on.
+    if root() {
+        return;
+    }
+    std::fs::create_dir_all(man.parent().unwrap()).unwrap();
+    for (mode, warning) in [(0o000, "cannot look in"), (0o555, "man page not installed")]
+    {
+        let dir = man.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let (went_on, said) = build_sh_man_block(&h.home());
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(went_on && said.contains(warning), "{mode:o}: {said}");
+        assert!(!man.exists(), "{mode:o}");
+    }
 }
 
 #[test]

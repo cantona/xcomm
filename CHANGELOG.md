@@ -20,6 +20,12 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- `man xcomm` found nothing after `scripts/install.sh` or a herdr plugin
+  install: `scripts/build.sh` now installs the man page in
+  `~/.local/share/man/man1`, where man looks beside `~/.local/bin` (never
+  through a link or over another program's page). `xcomm uninstall` removes
+  it with the binaries (only a copy xcomm wrote), and `xcomm doctor` reports
+  one left with no xcomm in `~/.local/bin`. cargo installs no man page.
 - `xcomm watch status` and `stop` no longer make an empty `watch.pid` (and its
   directory) where no watcher is, nor a refused `watch start` the directory:
   `xcomm doctor` listed them as a watcher, and `xcomm uninstall` reported

@@ -81,8 +81,10 @@ xcomm skill install        # the agent skill, if you use one
 
 For what is on master but not released yet:
 `cargo install --locked --git https://github.com/cantona/xcomm xcomm`.
+cargo installs no man page: `xcomm --help` has the full text.
 
-**As a herdr plugin** (builds and installs the binaries and the agent skill):
+**As a herdr plugin** (builds and installs the binaries, the man page and the
+agent skill):
 
 ```sh
 herdr plugin install cantona/xcomm
@@ -92,7 +94,7 @@ herdr plugin install cantona/xcomm
 
 ```sh
 git clone https://github.com/cantona/xcomm && cd xcomm
-sh scripts/install.sh      # build, cargo install to ~/.local, link the plugin
+sh scripts/install.sh      # build, install to ~/.local (and man xcomm), link the plugin
 ```
 
 Building needs Rust 1.93 or later, as in Ubuntu 26.04 (the Homebrew formula
@@ -400,7 +402,8 @@ xcomm uninstall
 ```
 
 It stops the hotplug watchers, removes the skill (only a copy xcomm wrote),
-unregisters the herdr plugin, then runs `cargo uninstall`, printing each step,
+unregisters the herdr plugin, then runs `cargo uninstall` (and removes the man
+page from `~/.local/share/man`, only a copy xcomm wrote), printing each step,
 and stops at the first failure saying what is left. Use it rather than
 `herdr plugin uninstall`, which has no uninstall hook and leaves the binaries
 and the skill behind. `xcomm doctor` reports anything left over.

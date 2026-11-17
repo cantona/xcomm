@@ -467,12 +467,13 @@ each step went: the hotplug watchers, the skill in ~/.agents/skills/xcomm
 (left alone when xcomm did not write it, it is a link, or a dotfiles
 repository has it), the herdr plugin (herdr plugin uninstall or unlink),
 then the binaries (cargo uninstall from ~/.local, CARGO_INSTALL_ROOT and
-CARGO_HOME). It stops at the first failure and says what is left, and
+CARGO_HOME, with the man page in ~/.local/share/man/man1 if xcomm wrote
+it). It stops at the first failure and says what is left, and
 names an xcomm on PATH that cargo did not install. Use it rather than
 herdr plugin uninstall, which leaves the binaries and the skill. xcomm
 doctor reports what is installed and what is left over (stale sockets
-and locks, a skill or watcher with no binary); it exits 1 when something
-needs attention.
+and locks, a skill, man page or watcher with no binary); it exits 1 when
+something needs attention.
 
 Line settings:
   -b <baud>                  baud rate (default 115200)

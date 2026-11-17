@@ -444,12 +444,15 @@ repository may own it.
 .B xcomm uninstall
 Take away what an install made, in order, saying how each step went: the
 hotplug watchers, the skill, the herdr plugin, then the binaries
-.RB ( "cargo uninstall" ).
+.RB ( "cargo uninstall" ),
+with the man page in
+.I ~/.local/share/man/man1
+if xcomm wrote it.
 It stops at the first failure and says what is left.
 .TP
 .B xcomm doctor
 Report what is installed and what is left over (stale sockets and locks, a
-skill or watcher with no binary); exit 1 when something needs attention.
+skill, man page or watcher with no binary); exit 1 when something needs attention.
 .SH EXIT STATUS
 A session exits 0 after quit, the end of input, SIGTERM, SIGINT or SIGHUP,
 or when the terminal goes away; 1 on an error or when the device goes away;
