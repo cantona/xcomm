@@ -3,6 +3,12 @@
 <p align="center"><b>A serial terminal. Built for speed. Made for engineers. Ready for AI agents.</b></p>
 
 <p align="center">
+<a href="https://github.com/cantona/xcomm/actions/workflows/ci.yml"><img src="https://github.com/cantona/xcomm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://crates.io/crates/xcomm"><img src="https://img.shields.io/crates/v/xcomm.svg" alt="crates.io"></a>
+<a href="#license"><img src="https://img.shields.io/crates/l/xcomm.svg" alt="License: MIT OR Apache-2.0"></a>
+</p>
+
+<p align="center">
 <a href="#benchmarks">40× minicom's throughput on a fiftieth of its CPU</a>.
 The keys your fingers already know. A control socket that lets scripts and
 coding agents drive the board while you watch. A

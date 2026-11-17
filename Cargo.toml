@@ -11,6 +11,25 @@ description = "Fast serial terminal with an agent control interface and a herdr 
 repository = "https://github.com/cantona/xcomm"
 keywords = ["serial", "terminal", "minicom", "uart", "tty"]
 categories = ["command-line-utilities", "hardware-support"]
+readme = "README.md"
+# Only what builds and tests the crate: the README's pictures, CI and the
+# tools that make the pictures stay in the repository. The tests read
+# build.sh, install.sh and plugin-action.sh.
+include = [
+    "/src/",
+    "/tests/",
+    "/examples/",
+    "/skills/",
+    "/scripts/build.sh",
+    "/scripts/install.sh",
+    "/scripts/plugin-action.sh",
+    "/herdr-plugin.toml",
+    "/xcomm.1",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/Cargo.lock",
+]
 
 [dependencies]
 lexopt = "0.3.2"
