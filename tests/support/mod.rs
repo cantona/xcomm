@@ -69,10 +69,16 @@ fn read_until_after(
     assert!(!needle.is_empty(), "read_until needs a non-empty needle");
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
-    while !got.windows(needle.len()).any(|w| w == needle) {
+    // Only what came since the last look (and a needle's length before it,
+    // for one cut between reads) is searched: searching all of it on every
+    // read made a 1 MiB transfer through a macOS pty, 1 KiB a read, take
+    // seconds in the test alone.
+    let mut from = 0;
+    while !got[from..].windows(needle.len()).any(|w| w == needle) {
+        from = got.len().saturating_sub(needle.len() - 1);
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            panic!("timeout waiting for {needle:?}; got {got:?}");
+            panic!("timeout waiting for {needle:?}; got {}", shown(&got));
         }
         let ts = rustix::event::Timespec::try_from(left).unwrap();
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
@@ -83,12 +89,19 @@ fn read_until_after(
         let n = match rustix::io::read(fd, &mut buf) {
             Ok(n) => n,
             Err(rustix::io::Errno::IO) => 0,
-            Err(e) => panic!("read failed: {e}; got {got:?}"),
+            Err(e) => panic!("read failed: {e}; got {}", shown(&got)),
         };
-        assert!(n > 0, "EOF waiting for {needle:?}; got {got:?}");
+        assert!(n > 0, "EOF waiting for {needle:?}; got {}", shown(&got));
         got.extend_from_slice(&buf[..n]);
     }
     got
+}
+
+/// What a failed read_until prints of the bytes read: their count and the
+/// last 2 KiB, not a megabyte of them.
+fn shown(got: &[u8]) -> String {
+    let tail = &got[got.len().saturating_sub(2048)..];
+    format!("{} bytes, ending {tail:?}", got.len())
 }
 
 pub fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) {
