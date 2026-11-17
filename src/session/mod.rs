@@ -635,6 +635,9 @@ fn pump_with(
         }
         let sig_ready = revents(&polled[0]);
         let dev_ready = revents(&polled[1]);
+        // A key command (a transfer, a prompt) serves the clients on its own
+        // passes: this pass's poll results are stale after it.
+        let mut commanded = false;
         let stdin_ready = if want_stdin {
             revents(&polled[2])
         } else {
@@ -779,6 +782,7 @@ fn pump_with(
                                 typed: rest,
                             };
                             let outcome = ctl.command(c, &mut io)?;
+                            commanded = true;
                             rest = io.typed;
                             match outcome {
                                 CommandOutcome::Continue => {}
@@ -821,7 +825,8 @@ fn pump_with(
         // Last: what clients send queues behind the keys typed meanwhile.
         // Only a keyboard: piped input is the device's, not keys to read.
         let keyboard = stdin_fd.filter(|_| stdin_open && keys.is_some());
-        match ctl.ctl_serve(&polled[3..], &mut queue, keyboard)? {
+        let ready = if commanded { &[][..] } else { &polled[3..] };
+        match ctl.ctl_serve(ready, &mut queue, keyboard)? {
             CommandOutcome::Continue => {}
             CommandOutcome::Exit(exit) => return Ok(exit),
         }

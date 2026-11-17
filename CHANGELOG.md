@@ -14,6 +14,9 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- Control socket: a client dropped between two looks at the clients (a
+  subscriber left behind) no longer makes the clients after it act on each
+  other's events for a pass.
 - A break a client asks for that the driver refuses no longer leaves the port
   without its flow control (`--flow rts` or `xon`) for the rest of the session.
 - `ctl run` and `ctl read`: the `end=`/`next=` line no longer runs on from

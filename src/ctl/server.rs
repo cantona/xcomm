@@ -93,6 +93,11 @@ pub struct CtlServer {
     next_id: u64,
     /// UNATTENDED_STALL, shorter in tests.
     unattended_stall: Duration,
+    /// The clients [`poll_fds`](Self::poll_fds) appended, by id, in order:
+    /// [`serve`](Self::serve) gives each its own result even if the list
+    /// changed in between (a subscriber dropped, clients served during a
+    /// transfer).
+    polled: std::cell::RefCell<Vec<u64>>,
 }
 
 /// Bytes the session has taken from a client for the device.
@@ -689,6 +694,7 @@ impl CtlServer {
             accept_paused: None,
             next_id: 0,
             unattended_stall: UNATTENDED_STALL,
+            polled: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -799,7 +805,10 @@ impl CtlServer {
         let paused = self.accept_paused.filter(|&t| Instant::now() < t);
         let listen = if paused.is_some() { 0 } else { libc::POLLIN };
         out.push(pollfd(self.listener.as_raw_fd(), listen));
+        let mut polled = self.polled.borrow_mut();
+        polled.clear();
         for c in &self.clients {
+            polled.push(c.id);
             // One that closed its end and waits on the session has nothing
             // to poll for, and a hangup would be reported on every pass.
             let fd = if c.eof && c.written >= c.output.len() {
@@ -838,11 +847,19 @@ impl CtlServer {
     /// [`poll_fds`](Self::poll_fds) appended. Clients also move on without
     /// an event: a send waits for room in the session's queue.
     pub fn serve(&mut self, ready: &[libc::pollfd], s: &mut dyn Session) {
-        let n = self.clients.len().min(ready.len().saturating_sub(1));
-        for (i, c) in self.clients.iter_mut().enumerate() {
-            let revents = if i < n { ready[i + 1].revents } else { 0 };
+        let polled = self.polled.borrow();
+        for c in &mut self.clients {
+            let revents = polled
+                .iter()
+                .position(|&id| id == c.id)
+                .and_then(|i| ready.get(i + 1))
+                // Polled for this client: a transfer's own passes record
+                // their clients over these, which may not be `ready`'s.
+                .filter(|fd| fd.fd == c.stream.as_raw_fd())
+                .map_or(0, |fd| fd.revents);
             c.step(revents, self.mode, self.unattended_stall, s);
         }
+        drop(polled);
         self.clients.retain(|c| !c.dead);
         if self.accept_paused.is_some_and(|t| Instant::now() >= t) {
             self.accept_paused = None;

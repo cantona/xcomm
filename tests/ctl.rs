@@ -947,6 +947,43 @@ fn a_send_left_behind_goes_while_the_line_moves_and_is_dropped_when_it_does_not(
 }
 
 #[test]
+fn each_client_gets_its_own_poll_result_when_one_is_dropped_in_between() {
+    use xcomm::ctl::{CtlMode, server::CtlServer};
+    let dir = lock_dir("ctl-revents");
+    let mut server = CtlServer::bind(&dir, "ttyR", CtlMode::ReadWrite).unwrap();
+    let mut line = Line::new(1 << 20);
+    // S subscribes, A sits idle, B will ask for the status: in that order.
+    let mut sub = UnixStream::connect(server.path()).unwrap();
+    sub.write_all(b"{\"cmd\":\"subscribe\"}\n").unwrap();
+    serve_until(&mut server, &mut line, |_, clients| clients == 1);
+    let _a = UnixStream::connect(server.path()).unwrap();
+    serve_until(&mut server, &mut line, |_, clients| clients == 2);
+    let mut b = UnixStream::connect(server.path()).unwrap();
+    serve_until(&mut server, &mut line, |_, clients| clients == 3);
+    b.write_all(b"{\"cmd\":\"status\"}\n").unwrap();
+    let mut fds = Vec::new();
+    server.poll_fds(0, &mut fds);
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
+    assert_ne!(fds[3].revents & libc::POLLIN, 0, "B's request is there");
+    // Between the poll and the serve, device output leaves S a ring behind:
+    // it is dropped, and the clients after it move up the list.
+    line.ring.push(&[b'x'; 8192]);
+    server.device_output(&line.ring);
+    server.serve(&fds, &mut line);
+    // B was served with its own result in that same pass.
+    b.set_nonblocking(true).unwrap();
+    let mut reply = [0u8; 4096];
+    let n = b.read(&mut reply).expect("B's reply in the same pass");
+    assert!(
+        reply[..n].starts_with(b"{\""),
+        "{:?}",
+        String::from_utf8_lossy(&reply[..n])
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn break_on_a_pty_succeeds_and_the_session_goes_on() {
     let (dev, s, path) = start(&[]);
     let o = ctl(&s, &[&path, "break"]);
