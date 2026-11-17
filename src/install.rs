@@ -220,15 +220,7 @@ fn watch_act(
     dir: &Path,
     action: crate::watch::WatchAction,
 ) -> Result<String, crate::watch::WatchError> {
-    let base = dir.parent().unwrap_or(dir).display().to_string();
-    // state_dir takes the server's name from its socket's file name.
-    let socket = format!("/{}", dir.file_name().unwrap_or_default().to_string_lossy());
-    let env = move |k: &str| match k {
-        "HERDR_PLUGIN_STATE_DIR" => Some(base.clone()),
-        "HERDR_SOCKET_PATH" => Some(socket.clone()),
-        _ => None,
-    };
-    crate::watch::act(action, &env)
+    crate::watch::act_in(dir, action, &|_| None)
 }
 
 fn stop_watchers(env: &Env) -> Result<Step, InstallError> {
@@ -710,6 +702,12 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
         let status = watch_act(&dir, crate::watch::WatchAction::Status)
             .map(|s| s.lines().next().unwrap_or_default().to_string())
             .unwrap_or_else(|e| format!("cannot tell: {e}"));
+        // What an xcomm up to v0.1.2 left once its watcher ended: nothing to
+        // report. Not removed here or by watch: an old xcomm may be taking
+        // its lock that moment (uninstall removes it).
+        if crate::watch::is_old_state_dir(&dir) && status.starts_with("not running") {
+            continue;
+        }
         lines.push(format!("hotplug watcher {}: {status}", dir.display()));
         if status.starts_with("running") && (found.is_empty() || !registered) {
             problems.push(format!(

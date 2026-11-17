@@ -203,6 +203,17 @@ struct Env {
 }
 
 impl Env {
+    /// Where the watcher of this env's herdr server keeps its files.
+    fn state(&self) -> std::path::PathBuf {
+        let get = |k: &str| {
+            self.vars
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.clone())
+        };
+        xcomm::watch::state_dir(&get).unwrap()
+    }
+
     fn new() -> Env {
         let dir = lock_dir("watch");
         for d in ["state", "config", "root/dev", "locks", "run"] {
@@ -302,7 +313,7 @@ fn start_status_stop_and_notifications() {
     // The lock came with the watcher at once: a second start finds it.
     let o = env.watch(&["start"]);
     assert!(out(&o).starts_with("already running"), "{}", out(&o));
-    let log = env.dir.join("state/herdr.sock/watch.log");
+    let log = env.state().join("watch.log");
     wait_log(&log, "watching 1 ports", 1);
     let o = env.watch(&["status"]);
     let status = out(&o);
@@ -344,12 +355,148 @@ fn start_status_stop_and_notifications() {
     assert!(status.starts_with("not running"), "{status}");
     assert!(status.contains("Serial removed: ttyACM3"), "{status}");
     // Emptied: no pid is left to name another process later.
-    let pid_file = env.dir.join("state/herdr.sock/watch.pid");
+    let pid_file = env.state().join("watch.pid");
     assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "");
     // A pid in the file with no watcher holding the lock is not believed.
     std::fs::write(&pid_file, "1\n").unwrap();
     assert!(out(&env.watch(&["status"])).starts_with("not running"));
     assert!(out(&env.watch(&["stop"])).starts_with("not running"));
+}
+
+#[test]
+fn two_herdr_servers_each_get_their_own_watcher() {
+    // herdr gives every server the same plugin state directory, and every
+    // server's socket the same file name (herdr.sock).
+    let a = Env::new();
+    let mut b = Env::new();
+    let shared = a.state().parent().unwrap().to_str().unwrap().to_string();
+    for (k, v) in &mut b.vars {
+        if *k == "HERDR_PLUGIN_STATE_DIR" {
+            *v = shared.clone();
+        }
+    }
+    let _servers = (Fake::new(&a.dir), Fake::new(&b.dir));
+    assert_ne!(a.state(), b.state());
+    for env in [&a, &b] {
+        let o = env.watch(&["start"]);
+        assert!(out(&o).starts_with("started (pid "), "{}", out(&o));
+    }
+    for env in [&a, &b] {
+        let o = env.watch(&["status"]);
+        assert!(out(&o).starts_with("running (pid "), "{}", out(&o));
+    }
+    // An older xcomm's watcher whose server cannot be told (pid 1's
+    // environment is not this user's to read; macOS shows no other
+    // process's): taken as this server's, as up to v0.1.2, and said so.
+    let old = Path::new(&shared).join("herdr.sock");
+    std::fs::create_dir_all(&old).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(old.join("watch.pid"))
+        .unwrap();
+    rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .unwrap();
+    (&held).write_all(b"1\n").unwrap();
+    let status = out(&a.watch(&["status"]));
+    assert!(
+        status.starts_with(
+            "running (pid 1, started by an older xcomm, maybe for another herdr server)"
+        ),
+        "{status}"
+    );
+    drop(held);
+}
+
+/// A watcher as xcomm up to v0.1.2 left it: in `<state>/herdr.sock`, its
+/// lock held by a process started with `socket` as HERDR_SOCKET_PATH.
+fn old_watcher(state: &Path, socket: &str) -> std::process::Child {
+    let old = state.join("herdr.sock");
+    std::fs::create_dir_all(&old).unwrap();
+    let path = old.join("watch.pid");
+    std::fs::write(&path, "").unwrap();
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let mut cmd = Command::new("sleep");
+    cmd.arg("30").env("HERDR_SOCKET_PATH", socket);
+    // The child takes the lock itself, on an fd it keeps across exec: an
+    // inheritable fd made here could leak into another test's child and
+    // hold the lock after this one ends.
+    // SAFETY: open and flock only, on a path built before the fork.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+            let fd = rustix::fs::open(
+                c_path.as_c_str(),
+                rustix::fs::OFlags::RDWR,
+                rustix::fs::Mode::empty(),
+            )?;
+            rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+            std::mem::forget(fd);
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().unwrap();
+    std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+    child
+}
+
+#[test]
+fn an_older_xcomms_watcher_is_this_servers_or_left_alone() {
+    let env = Env::new();
+    let _server = Fake::new(&env.dir);
+    let state = env.state().parent().unwrap().to_path_buf();
+    let socket = env
+        .vars
+        .iter()
+        .find(|(k, _)| *k == "HERDR_SOCKET_PATH")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    // This server's (an upgrade runs start on a live server): it is the
+    // watcher, and no second one starts.
+    let mut old = old_watcher(&state, &socket);
+    let pid = old.id();
+    let o = env.watch(&["start"]);
+    assert!(
+        out(&o).starts_with(&format!(
+            "already running (pid {pid}, started by an older xcomm"
+        )),
+        "{}",
+        out(&o)
+    );
+    let status = out(&env.watch(&["status"]));
+    assert!(
+        status.starts_with(&format!("running (pid {pid}, started by an older xcomm")),
+        "{status}"
+    );
+    let o = env.watch(&["stop"]);
+    assert!(
+        out(&o).starts_with(&format!("stopped (pid {pid}), started by an older xcomm")),
+        "{}",
+        out(&o)
+    );
+    let _ = old.wait();
+    // Gone: a watcher starts. Its directory stays (an old xcomm may be
+    // taking its lock); doctor does not report it.
+    let o = env.watch(&["start"]);
+    assert!(out(&o).starts_with("started (pid "), "{}", out(&o));
+    assert!(xcomm::watch::is_old_state_dir(&state.join("herdr.sock")));
+    assert!(!xcomm::watch::is_old_state_dir(&env.state()));
+    assert!(out(&env.watch(&["stop"])).starts_with("stopped (pid "));
+    // Another server's: left alone, and not reported. Only where another
+    // process's environment can be read: macOS shows none.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let mut other = old_watcher(&state, "/elsewhere/herdr.sock");
+    let status = out(&env.watch(&["status"]));
+    assert!(status.starts_with("not running"), "{status}");
+    assert!(!status.contains("older"), "{status}");
+    let o = env.watch(&["start"]);
+    assert!(out(&o).starts_with("started (pid "), "{}", out(&o));
+    assert!(out(&env.watch(&["stop"])).starts_with("stopped (pid "));
+    assert!(state.join("herdr.sock/watch.pid").exists());
+    other.kill().unwrap();
+    let _ = other.wait();
 }
 
 #[test]
@@ -385,7 +532,7 @@ fn ignored_and_quiet_ports_are_logged_not_shown() {
     .unwrap();
     let o = env.watch(&["start"]);
     assert_eq!(o.status.code(), Some(0), "{}", out(&o));
-    let log = env.dir.join("state/herdr.sock/watch.log");
+    let log = env.state().join("watch.log");
     let until = Instant::now() + T;
     while !std::fs::read_to_string(&log).is_ok_and(|l| l.contains("watching")) {
         assert!(Instant::now() < until);
@@ -481,7 +628,7 @@ fn a_late_by_id_link_still_counts_for_ignore() {
     .unwrap();
     let o = env.watch(&["start"]);
     assert_eq!(o.status.code(), Some(0), "{}", out(&o));
-    let log = env.dir.join("state/herdr.sock/watch.log");
+    let log = env.state().join("watch.log");
     wait_log(&log, "watching", 1);
     // The node first, its link after the debounce, as a slow udev does.
     std::fs::write(env.dir.join("root/dev/ttyUSB7"), b"").unwrap();
@@ -508,7 +655,7 @@ fn the_watcher_ends_with_its_herdr_server() {
     let fake = Fake::new(&env.dir);
     let o = env.watch(&["start"]);
     assert_eq!(o.status.code(), Some(0), "{}", out(&o));
-    let log = env.dir.join("state/herdr.sock/watch.log");
+    let log = env.state().join("watch.log");
     wait_log(&log, "watching", 1);
     // The server goes, its socket with it; a device event wakes the watcher.
     drop(fake);

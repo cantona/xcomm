@@ -406,7 +406,9 @@ and
 from
 .IR $HERDR_PLUGIN_CONFIG_DIR/config.toml ;
 its pid file and log are under
-.BR $HERDR_PLUGIN_STATE_DIR .
+.BR $HERDR_PLUGIN_STATE_DIR ,
+in a directory of each herdr server's own (named after its socket), so each
+server runs a watcher.
 .TP
 .B xcomm \-\-skill
 Print the agent skill: how an agent drives a session with

@@ -485,6 +485,25 @@ fn doctor_flags_a_stale_socket_and_a_dangling_skill() {
 }
 
 #[test]
+fn doctor_leaves_out_what_an_older_watcher_left() {
+    let h = Home::new("doctor-old-watch");
+    h.fake("herdr");
+    // The directory xcomm up to v0.1.2 used, its watcher long gone; and one
+    // of today's, also stopped.
+    let state = h.root.join("state/herdr/plugins/cantona.herdr-xcomm");
+    for dir in ["herdr.sock", "herdr.sock-0123456789abcdef"] {
+        std::fs::create_dir_all(state.join(dir)).unwrap();
+        std::fs::write(state.join(dir).join("watch.pid"), "").unwrap();
+    }
+    let out = stdout(&h.run("doctor", &[("FAKE_LIST", NONE)]));
+    assert!(
+        out.contains("herdr.sock-0123456789abcdef: not running"),
+        "{out}"
+    );
+    assert!(!out.contains("herdr.sock: "), "{out}");
+}
+
+#[test]
 fn doctor_reports_an_install_and_a_broken_link() {
     let h = Home::new("installed");
     h.fake("herdr");
@@ -681,7 +700,12 @@ fn uninstall_stops_a_running_hotplug_watcher() {
         .output()
         .unwrap();
     assert!(o.status.success(), "{o:?}");
-    let pid_file = state.join("herdr.sock/watch.pid");
+    let get = |k: &str| match k {
+        "HERDR_PLUGIN_STATE_DIR" => Some(state.to_str().unwrap().to_string()),
+        "HERDR_SOCKET_PATH" => Some(sock.to_str().unwrap().to_string()),
+        _ => None,
+    };
+    let pid_file = xcomm::watch::state_dir(&get).unwrap().join("watch.pid");
     let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let pid: i32 = loop {
         if let Some(pid) = std::fs::read_to_string(&pid_file)
@@ -697,7 +721,8 @@ fn uninstall_stops_a_running_hotplug_watcher() {
     assert!(alive());
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     let out = stdout(&o);
-    assert!(out.contains("herdr.sock: running"), "{out}");
+    let dir = pid_file.parent().unwrap().display().to_string();
+    assert!(out.contains(&format!("{dir}: running")), "{out}");
     // No binary on PATH and a watcher still running: a leftover.
     assert!(
         out.contains("problem: a hotplug watcher still runs"),

@@ -318,23 +318,70 @@ fn glob(pat: &str, s: &str) -> bool {
     p[pi..].iter().all(|&c| c == '*')
 }
 
-/// `$HERDR_PLUGIN_STATE_DIR/<server>`: one watcher per herdr server, named
-/// after its socket's file name.
+/// `$HERDR_PLUGIN_STATE_DIR/<server>`: one watcher per herdr server. herdr
+/// gives every server the same plugin state directory, and every server's
+/// socket the same file name (`herdr.sock`, under its session's directory),
+/// so the name also carries a hash of the socket's whole path.
 pub fn state_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, WatchError> {
     let base = env("HERDR_PLUGIN_STATE_DIR")
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             WatchError("HERDR_PLUGIN_STATE_DIR is not set (run from herdr)".into())
         })?;
-    let server = env("HERDR_SOCKET_PATH")
-        .filter(|s| !s.is_empty())
-        .and_then(|s| {
-            Path::new(&s)
+    let server = match env("HERDR_SOCKET_PATH").filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let name = Path::new(&s)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "default".into());
+                .unwrap_or_else(|| "herdr".into());
+            let path = canonical_socket(&s);
+            format!("{name}-{:016x}", fnv1a(path.as_os_str().as_encoded_bytes()))
+        }
+        None => "default".into(),
+    };
     Ok(Path::new(&base).join(server))
+}
+
+/// The socket's path with its directory resolved (`//`, `.`, symlinks), so
+/// two spellings of one server name one directory. The directory, not the
+/// socket: it is still there to resolve after the server has gone.
+fn canonical_socket(socket: &str) -> PathBuf {
+    let path = Path::new(socket);
+    let whole: PathBuf = path.components().collect();
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or(whole),
+        _ => whole,
+    }
+}
+
+/// Where xcomm up to tag v0.1.2 kept the watcher of the server at
+/// HERDR_SOCKET_PATH: named after the socket's file name alone, which every
+/// server shares.
+fn old_state_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let base = env("HERDR_PLUGIN_STATE_DIR").filter(|s| !s.is_empty())?;
+    let socket = env("HERDR_SOCKET_PATH").filter(|s| !s.is_empty())?;
+    Some(Path::new(&base).join(Path::new(&socket).file_name()?))
+}
+
+/// Whether `dir` is named as xcomm up to tag v0.1.2 named a watcher's
+/// directory: the socket's file name alone, without the hash.
+pub fn is_old_state_dir(dir: &Path) -> bool {
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    match name.rsplit_once('-') {
+        Some((_, hash)) => {
+            !(hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        }
+        None => name != "default",
+    }
+}
+
+/// FNV-1a, 64 bits: stable across runs and builds, unlike std's hasher.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`, if herdr says where.
@@ -365,9 +412,139 @@ pub fn act(
         }
     }
     let dir = state_dir(env)?;
-    std::fs::create_dir_all(&dir)
+    // A watcher an older xcomm started keeps the old directory until its
+    // server ends. This server's is the watcher: started again (an upgrade
+    // runs start on a live server), it would notify everything twice.
+    if let Some(old) = old_state_dir(env) {
+        let files = Files::new(&old);
+        if files.pid.exists() && running(&files) {
+            let pid = files.read_pid();
+            let socket = env("HERDR_SOCKET_PATH").unwrap_or_default();
+            let theirs = pid.and_then(|p| process_env(p, "HERDR_SOCKET_PATH"));
+            // Another server's is not this one's business. One whose server
+            // cannot be told (macOS shows no other process's environment)
+            // is taken as this server's, as xcomm up to v0.1.2 took it: no
+            // second watcher starts.
+            if theirs
+                .as_deref()
+                .is_none_or(|s| canonical_socket(s) == canonical_socket(&socket))
+            {
+                let maybe = if theirs.is_none() {
+                    ", maybe for another herdr server"
+                } else {
+                    ""
+                };
+                let who = match pid {
+                    Some(p) => format!("pid {p}, started by an older xcomm{maybe}"),
+                    None => format!("started by an older xcomm{maybe}"),
+                };
+                return match action {
+                    WatchAction::Stop => stop(&files).map(|s| {
+                        if s.starts_with("stopped") {
+                            format!("{s}, started by an older xcomm{maybe}")
+                        } else {
+                            s
+                        }
+                    }),
+                    WatchAction::Status => {
+                        let all = status(&files, env);
+                        let rest = all.split_once('\n').map_or("", |(_, r)| r);
+                        Ok(format!("running ({who})\n{rest}"))
+                    }
+                    WatchAction::Start | WatchAction::Run => {
+                        Ok(format!("already running ({who})"))
+                    }
+                };
+            }
+        }
+    }
+    act_in(&dir, action, env)
+}
+
+/// The value of `key` in the environment process `pid` started with, when
+/// this user may read it.
+fn process_env(pid: i32, key: &str) -> Option<String> {
+    let block = process_environ(pid)?;
+    let prefix = format!("{key}=");
+    block
+        .split(|&b| b == 0)
+        .find_map(|var| var.strip_prefix(prefix.as_bytes()))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn process_environ(pid: i32) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ")).ok()
+}
+
+/// KERN_PROCARGS2: argc, the executable's path, padding, argv, then the
+/// environment, each NUL-terminated. The buffer must hold kern.argmax
+/// bytes, or the call fails.
+#[cfg(target_os = "macos")]
+fn process_environ(pid: i32) -> Option<Vec<u8>> {
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: argmax is a c_int, size its size.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&raw mut argmax).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 || argmax <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut buf = vec![0u8; usize::try_from(argmax).ok()?];
+    let mut len = buf.len();
+    // SAFETY: mib and buf are valid for the lengths given.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 || len < 4 {
+        return None;
+    }
+    buf.truncate(len);
+    let argc = usize::try_from(i32::from_ne_bytes(buf[..4].try_into().ok()?)).ok()?;
+    let mut rest = &buf[4..];
+    // The executable's path, then the NULs that pad it.
+    let end = rest.iter().position(|&b| b == 0)?;
+    rest = &rest[end..];
+    let start = rest.iter().position(|&b| b != 0)?;
+    rest = &rest[start..];
+    for _ in 0..argc {
+        let end = rest.iter().position(|&b| b == 0)?;
+        rest = &rest[end + 1..];
+    }
+    Some(rest.to_vec())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_environ(_pid: i32) -> Option<Vec<u8>> {
+    None
+}
+
+/// Carries out `action` on the watcher kept in `dir`.
+pub fn act_in(
+    dir: &Path,
+    action: WatchAction,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, WatchError> {
+    std::fs::create_dir_all(dir)
         .map_err(|e| WatchError(format!("{}: {e}", dir.display())))?;
-    let files = Files::new(&dir);
+    let files = Files::new(dir);
     match action {
         WatchAction::Start => start(&files, env),
         WatchAction::Stop => stop(&files),
