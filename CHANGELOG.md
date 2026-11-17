@@ -4,6 +4,8 @@ What changed in each release of xcomm.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-18
+
 ### Added
 - `XCOMM_NO_LOCK=1`: the same as `--no-lock`, for where no option can be given,
   such as the herdr plugin's session pane on a system where no lock directory
@@ -122,7 +124,8 @@ can drive while you watch, and a herdr plugin.
   control actions, hotplug notifications.
 - minicom's options and its `Ctrl-A` keys (`Alt-A` inside a multiplexer).
 
-[Unreleased]: https://github.com/cantona/xcomm/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/cantona/xcomm/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/cantona/xcomm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cantona/xcomm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cantona/xcomm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cantona/xcomm/releases/tag/v0.1.0
