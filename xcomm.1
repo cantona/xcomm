@@ -290,6 +290,15 @@ at most
 .B \-\-from\-oldest
 starts at the oldest byte kept. The next offset goes to standard error as
 .BI next= offset .
+Where standard error goes to the same place as standard output (both
+are terminals,
+.B 2>&1
+into a pipe or file, or the same file opened for appending), a line break goes to standard error first when the
+output does not end its line, so that line starts on its own. Standard
+output is never changed. A pipe into a program that shows it on the
+terminal
+.RB ( "| tee" )
+is not known to go there, and gets no line break.
 .TP
 .BI "xcomm ctl " device " wait " regex
 Wait for device output to match
@@ -328,6 +337,11 @@ instead of
 and print the output between the echoed line and the match. More than
 .BI \-\-max\-bytes " n"
 (default 16 MiB) of it exits 2.
+Its
+.B end=
+line is kept apart from the output as
+.BR read 's
+is.
 .TP
 .BI "xcomm ctl " device " break " \fR[\fIms\fR]
 Send a break: default 250 ms, at most 5000.

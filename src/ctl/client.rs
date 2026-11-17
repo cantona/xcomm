@@ -108,11 +108,11 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
                     ColorMode::Auto => rustix::termios::isatty(std::io::stdout()),
                 };
                 if keep {
-                    print_out(&data)?;
+                    print_device_output(&data)?;
                 } else {
                     let mut plain = Vec::with_capacity(data.len());
                     crate::ansi::EscapeStripper::new().strip(&data, &mut plain);
-                    print_out(&plain)?;
+                    print_device_output(&plain)?;
                 }
                 eprintln!("next={}", reply["next"]);
             }
@@ -575,6 +575,60 @@ fn read_reply(
 pub(super) fn print_out(bytes: &[u8]) -> Result<(), Failed> {
     crate::out::stdout(bytes)
         .map_err(|e| (code::FAILED, format!("cannot write to stdout: {e}")))
+}
+
+/// Device output, as it came. Where stderr goes to the same place (one
+/// terminal, or `2>&1` into a pipe or a file), what is written to stderr
+/// next (end=, next=, a message) would run on from output that does not
+/// end its line (`6.1+end=70`), so a line break goes to stderr first.
+/// stdout itself is never changed.
+pub(super) fn print_device_output(bytes: &[u8]) -> Result<(), Failed> {
+    print_out(bytes)?;
+    if !bytes.is_empty() && stdout_is_stderr() && !ends_line(bytes) {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\n");
+    }
+    Ok(())
+}
+
+/// Two terminals count as one: /dev/tty and the pts it stands for have
+/// different inodes, and two terminals side by side are rare. A file
+/// opened twice (`>f 2>f`, not `2>&1`) is not one place: each open has its
+/// own offset, which the output has just moved for stdout only; opened
+/// twice for appending (`>>f 2>>f`), every write goes to the end, so it is.
+fn stdout_is_stderr() -> bool {
+    use rustix::fs::{OFlags, SeekFrom, fcntl_getfl, fstat, seek};
+    use std::os::fd::AsFd;
+    let (out, err) = (std::io::stdout(), std::io::stderr());
+    if rustix::termios::isatty(&out) && rustix::termios::isatty(&err) {
+        return true;
+    }
+    let appends = |fd: std::os::fd::BorrowedFd<'_>| {
+        fcntl_getfl(fd).is_ok_and(|f| f.contains(OFlags::APPEND))
+    };
+    match (fstat(&out), fstat(&err)) {
+        (Ok(o), Ok(e)) if (o.st_dev, o.st_ino) == (e.st_dev, e.st_ino) => {
+            if appends(out.as_fd()) && appends(err.as_fd()) {
+                return true;
+            }
+            match (
+                seek(&out, SeekFrom::Current(0)),
+                seek(&err, SeekFrom::Current(0)),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether the cursor is at the start of a line after `bytes`: escape
+/// sequences after the last line break (a colour reset, bracketed paste
+/// mode) do not move it.
+fn ends_line(bytes: &[u8]) -> bool {
+    let mut text = Vec::new();
+    crate::ansi::EscapeStripper::new().strip(bytes, &mut text);
+    text.last().is_none_or(|&b| b == b'\n')
 }
 
 pub(super) fn print_json(v: &serde_json::Value) -> Result<(), Failed> {

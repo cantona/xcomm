@@ -358,6 +358,174 @@ fn run_has_no_race() {
     term.join().unwrap();
 }
 
+/// What `args` writes with stdout on a terminal (else a pipe), and stderr on
+/// the same terminal or pipe (`same`) or on a pipe of its own: what that
+/// terminal or pipe got, and stderr's own pipe. The terminal has OPOST off,
+/// so it shows the bytes as written.
+fn ctl_to(s: &Spawned, args: &[&str], terminal: bool, same: bool) -> (String, String) {
+    let (reader, writer) = if terminal {
+        let term = support::pty();
+        let mut t = rustix::termios::tcgetattr(&term.slave).unwrap();
+        t.output_modes.remove(rustix::termios::OutputModes::OPOST);
+        rustix::termios::tcsetattr(
+            &term.slave,
+            rustix::termios::OptionalActions::Now,
+            &t,
+        )
+        .unwrap();
+        (term.master, term.slave)
+    } else {
+        cloexec_pipe()
+    };
+    let mut cmd = ctl_cmd(&s.lock_dir, args);
+    cmd.stdout(Stdio::from(writer.try_clone().unwrap()));
+    if same {
+        cmd.stderr(Stdio::from(writer.try_clone().unwrap()));
+    }
+    let o = cmd.output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // The Command holds copies of the writer too.
+    drop(cmd);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    if terminal {
+        // macOS discards what the master has not read once the last slave
+        // fd closes, so keep ours open, write a marker after everything
+        // ctl wrote (the terminal keeps the order, OPOST is off) and read
+        // up to it.
+        const END: &[u8] = b"\x00end-of-ctl\x00";
+        write_all(writer.as_fd(), END);
+        got = read_until(reader.as_fd(), END, T);
+        assert!(got.ends_with(END), "{got:?}");
+        got.truncate(got.len() - END.len());
+    } else {
+        // A pipe keeps what was written: close the last writer and read to
+        // the end.
+        drop(writer);
+        while let Ok(n @ 1..) = rustix::io::read(&reader, &mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    (String::from_utf8_lossy(&got).into_owned(), stderr(&o))
+}
+
+/// A pipe no child spawned by another test thread can inherit: a held
+/// write end would keep ctl_to's read from ever ending. macOS has no
+/// pipe2(2); there the flag comes just after.
+fn cloexec_pipe() -> (OwnedFd, OwnedFd) {
+    #[cfg(target_os = "linux")]
+    let p = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let p = {
+        let p = rustix::pipe::pipe().unwrap();
+        for fd in [&p.0, &p.1] {
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).unwrap();
+        }
+        p
+    };
+    p
+}
+
+/// Splits `end=N` (or `next=N`) and its line break off the end of `out`.
+fn offset_line<'a>(out: &'a str, key: &str) -> &'a str {
+    let at = out
+        .rfind(key)
+        .unwrap_or_else(|| panic!("no {key} in {out:?}"));
+    let n = &out[at + key.len()..];
+    assert!(
+        n.ends_with('\n') && n[..n.len() - 1].bytes().all(|b| b.is_ascii_digit()),
+        "{out:?}"
+    );
+    &out[..at]
+}
+
+#[test]
+fn run_and_read_keep_the_offset_line_apart() {
+    let (dev, s, path) = start(&[]);
+    let (stop, devt) = device(&dev, |line| {
+        let mut out = line.to_vec();
+        if line == b"colour" {
+            out.extend_from_slice(b"\r\nok\r\n\x1b[0m");
+        } else {
+            out.extend_from_slice(b"\r\n6.1+\r\n# ");
+        }
+        out
+    });
+    let run = [
+        path.as_str(),
+        "run",
+        "uname -r",
+        "--until",
+        "\\r?\\n[^\\n]*# $",
+    ];
+    // One terminal, or one pipe (2>&1): a line break before end=.
+    for terminal in [true, false] {
+        let (got, _) = ctl_to(&s, &run, terminal, true);
+        assert_eq!(offset_line(&got, "end="), "6.1+\n", "terminal {terminal}");
+    }
+    // stderr elsewhere: stdout is the output exactly, on a terminal too.
+    for terminal in [true, false] {
+        let (got, err) = ctl_to(&s, &run, terminal, false);
+        assert_eq!(got, "6.1+", "terminal {terminal}");
+        assert_eq!(offset_line(&err, "end="), "", "terminal {terminal}");
+    }
+    // A file: one open shared (2>&1) gets the line break; two opens of it
+    // (>f 2>f) each write at their own offset, so it would land on the
+    // output's first byte, and is left out.
+    let dir =
+        std::env::temp_dir().join(format!("xcomm-offset-line-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("out");
+    let shared = std::fs::File::create(&f).unwrap();
+    let o = ctl_cmd(&s.lock_dir, &run)
+        .stdout(shared.try_clone().unwrap())
+        .stderr(shared)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    let got = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(offset_line(&got, "end="), "6.1+\n");
+    let o = ctl_cmd(&s.lock_dir, &run)
+        .stdout(std::fs::File::create(&f).unwrap())
+        .stderr(std::fs::OpenOptions::new().write(true).open(&f).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    let got = std::fs::read_to_string(&f).unwrap();
+    assert!(got.starts_with("end="), "{got:?}");
+    // Two opens for appending (>>f 2>>f) write at the end alike: one place.
+    std::fs::write(&f, "").unwrap();
+    let append = || std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+    let o = ctl_cmd(&s.lock_dir, &run)
+        .stdout(append())
+        .stderr(append())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    let got = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(offset_line(&got, "end="), "6.1+\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+    // read: the same, here for the prompt, which does not end its line.
+    let read = [path.as_str(), "read", "--last", "2"];
+    let (got, _) = ctl_to(&s, &read, true, true);
+    assert_eq!(offset_line(&got, "next="), "# \n");
+    let (got, _) = ctl_to(&s, &read, true, false);
+    assert_eq!(got, "# ");
+    // Output that ends its line gets no second line break.
+    let ends = [path.as_str(), "run", "uname -r", "--until", "# $"];
+    let (got, _) = ctl_to(&s, &ends, true, true);
+    assert_eq!(offset_line(&got, "end="), "6.1+\r\n");
+    // Nor when only escape sequences follow the line break: read keeps
+    // them on a terminal, and they do not move the cursor.
+    let o = ctl(&s, &[&path, "send", "colour"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    shown(&s, b"ok\r\n");
+    let (got, _) = ctl_to(&s, &[&path, "read", "--last", "8"], true, true);
+    assert_eq!(offset_line(&got, "next="), "ok\r\n\x1b[0m");
+    stop.store(true, Ordering::Relaxed);
+    devt.join().unwrap();
+}
+
 #[test]
 fn run_json_output_excludes_echo_and_prompt() {
     let (dev, s, path) = start(&[]);

@@ -7,7 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use super::client::{
-    self, Conn, Dirs, Failed, ending_bytes, print_json, print_out, send_after,
+    self, Conn, Dirs, Failed, ending_bytes, print_device_output, print_json, print_out,
+    send_after,
 };
 use super::code;
 use super::matcher::{Matcher, Outcome, Which};
@@ -310,7 +311,7 @@ fn finish(
         print_json(&v)?;
     } else {
         match (output, outcome) {
-            (Some(output), _) => print_out(output)?,
+            (Some(output), _) => print_device_output(output)?,
             (None, Outcome::Matched { text, .. }) => {
                 print_out(format!("{text}\n").as_bytes())?
             }
