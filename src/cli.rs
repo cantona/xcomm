@@ -275,7 +275,10 @@ pub enum LineEnding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CtlCmd {
-    Status,
+    /// With a field: that field's value alone.
+    Status {
+        field: Option<&'static str>,
+    },
     Sessions,
     /// `--pane-from-context`: the pane herdr's plugin context names.
     PaneFromContext,
@@ -501,7 +504,9 @@ Control socket (for scripts and agents, from another terminal):
                              SIGINT or SIGHUP (not with --ctl off)
   --no-ctl-marker            do not show what clients send as a dim
                              [ctl] line in the terminal
-  xcomm ctl <device> status  port, settings, modem lines and offsets
+  xcomm ctl <device> status [<field>]
+                             port, settings, modem lines and offsets; a
+                             field (offset, pid, ...) prints its value alone
   xcomm ctl <device> send <text>
                              send <text> and Enter (CR); -n for no line
                              ending, --lf or --crlf for another; --hex <hex>
@@ -707,6 +712,17 @@ pub const CTL_USAGE: &str = "usage: xcomm ctl [--json] <device> | --pane <id> \
      status|send|read|wait|run|break|dtr|rts|set|capture|xfer ..., \
      or xcomm ctl [--json] sessions";
 
+/// `name` as a field of `ctl status`.
+fn status_field(name: &str) -> Result<&'static str, CliError> {
+    let fields = crate::ctl::client::STATUS_ROWS.map(|(key, _)| key);
+    fields.into_iter().find(|&key| key == name).ok_or_else(|| {
+        CliError(format!(
+            "ctl status: no field '{name}' (one of {})",
+            fields.join(", ")
+        ))
+    })
+}
+
 fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     let mut p = lexopt::Parser::from_args(args.iter().cloned());
     let mut json = false;
@@ -886,8 +902,14 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
             CtlCmd::Sessions
         }
         "status" => {
-            extra(0)?;
-            CtlCmd::Status
+            extra(1)?;
+            let field = rest.first().map(|f| status_field(f)).transpose()?;
+            if field.is_some() && json {
+                return Err(CliError(
+                    "ctl status <field> prints one value: not with --json".into(),
+                ));
+            }
+            CtlCmd::Status { field }
         }
         "send" => {
             let data = match (rest.first(), hex, file) {

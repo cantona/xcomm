@@ -501,10 +501,6 @@ fn start_headless(
 
 #[test]
 fn the_headless_start_block_tells_its_session_from_anothers() {
-    if Command::new("jq").arg("--version").output().is_err() {
-        eprintln!("skipped: jq is not on PATH");
-        return;
-    }
     let lock = lock_dir("skill-headless");
     let mut sessions = Vec::new();
     let dev = support::pty();
@@ -719,7 +715,7 @@ fn every_example_has_a_test() {
         [
             "Stop U-Boot autoboot",
             "Log in",
-            "Run and parse --json",
+            "Run and pick out a value",
             "Capture a boot log",
             "Upload a file with zmodem",
         ]
@@ -787,13 +783,9 @@ fn example_log_in() {
 }
 
 #[test]
-fn example_run_and_parse_json() {
-    if Command::new("jq").arg("--version").output().is_err() {
-        eprintln!("skipped: jq is not on PATH");
-        return;
-    }
-    let cwd = scratch("json");
-    let (out, _s) = run_example(&example("Run and parse --json"), &cwd, |m| {
+fn example_run_and_pick_out_a_value() {
+    let cwd = scratch("pick");
+    let (out, _s) = run_example(&example("Run and pick out a value"), &cwd, |m| {
         Device::start(
             m,
             replies(&[
@@ -804,21 +796,16 @@ fn example_run_and_parse_json() {
                 (
                     "ip -4 addr show eth0\r",
                     "ip -4 addr show eth0\r\n2: eth0: <UP> mtu 1500\r\n    \
-                     inet 192.168.1.5/24 brd 192.168.1.255 scope global eth0\r\nroot@board:~# ",
+                     inet 192.168.1.5/24 brd 192.168.1.255 scope global eth0\r\n    \
+                     inet 10.0.0.2/8 scope global secondary eth0\r\nroot@board:~# ",
                 ),
             ]),
         )
     });
-    // .output ends with the device's line ending, which jq -r prints.
-    let lines: Vec<&str> = out
-        .lines()
-        .map(|l| l.trim_end_matches('\r'))
-        .filter(|l| !l.is_empty())
-        .collect();
+    // No CR in the version, and only the first of two addresses.
     assert_eq!(
-        lines,
-        ["Linux version 6.1.0 (test)", "192.168.1.5"],
-        "{out:?}"
+        out,
+        "kernel: Linux version 6.1.0 (test), eth0: 192.168.1.5\n"
     );
     let _ = std::fs::remove_dir_all(&cwd);
 }

@@ -35,12 +35,12 @@ jobs:
       RUST: 1.98.1
     steps:
       - uses: actions/checkout@v4
-      - name: Tools the transfer and skill tests drive (lrzsz, jq)
+      - name: Tools the transfer tests drive (lrzsz)
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update && sudo apt-get install -y lrzsz jq
+            sudo apt-get update && sudo apt-get install -y lrzsz
           else
-            brew install lrzsz jq
+            brew install lrzsz
           fi
       - name: Rust
         run: |

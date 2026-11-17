@@ -116,6 +116,29 @@ fn status_reports_device_and_offset() {
 }
 
 #[test]
+fn status_field_prints_its_value_alone() {
+    let (dev, s, path) = start(&["--ctl", "ro"]);
+    let field = |f: &str| stdout(&ctl(&s, &[&path, "status", f]));
+    assert_eq!(field("offset"), "0\n");
+    write_all(dev.master.as_fd(), b"hello");
+    shown(&s, b"hello");
+    assert_eq!(field("offset"), "5\n");
+    assert_eq!(field("pid"), format!("{}\n", s.child.id()));
+    assert_eq!(field("device"), format!("{path}\n"));
+    assert_eq!(field("ctl"), "ro\n");
+    assert_eq!(field("herdr_pane"), "-\n");
+    assert!(field("settings").starts_with("115200 8N1 flow "));
+    // Every field the reply has, and no other, can be asked for.
+    let v = json(&ctl(&s, &["--json", &path, "status"]));
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.retain(|k| !["ok", "code"].contains(k));
+    keys.sort_unstable();
+    let mut fields = xcomm::ctl::client::STATUS_ROWS.map(|(key, _)| key);
+    fields.sort_unstable();
+    assert_eq!(keys, fields);
+}
+
+#[test]
 fn send_reaches_device_with_cr() {
     let (dev, s, path) = start(&[]);
     write_all(dev.master.as_fd(), b"abc");

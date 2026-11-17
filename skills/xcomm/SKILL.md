@@ -33,7 +33,10 @@ xcomm ctl --json <dev> status
 
 `status` gives the port's settings, whether it is connected, the output
 offsets, a running capture or transfer, and `ctl` (`rw` or `ro`). Exit 3
-means there is no session for that device.
+means there is no session for that device. `status <field>` prints one
+field's value alone (`status offset`, `status pid`), with no `jq`
+needed. `--json` is still there on every `ctl` command: it gives the
+whole reply as one object, for a JSON parser.
 
 ## Starting a session
 
@@ -54,7 +57,7 @@ prints its pid:
 ```sh
 log=$(mktemp)
 xcomm --headless -b 115200 <dev> > "$log" 2>&1 & echo "pid $! log $log"
-for i in $(seq 25); do xcomm ctl --json <dev> status 2>/dev/null | jq -e .pid && break; sleep 0.2; done
+for i in $(seq 25); do xcomm ctl <dev> status pid 2>/dev/null && break; sleep 0.2; done
 ```
 
 If that is another pid, or nothing came, your start failed (the log says
@@ -71,9 +74,9 @@ the log of a failed start once you have read it.
   command`, `not found`, a kernel `panic`), so a failure ends the wait at
   once with exit 7 instead of a timeout.
 - Read the output since your own command, not the whole buffer: take
-  the `offset` from `status` before you act, and pass it to `--since`
-  (`wait` and `read` also give the next one, as `end=` and `next=` on
-  stderr). `--since 0` reaches back to output from before, such as the
+  the offset with `xcomm ctl <dev> status offset` before you act, and pass it
+  to `--since` (`wait` and `read` also give the next one, as `end=` and
+  `next=` on stderr). `--since 0` reaches back to output from before, such as the
   previous boot.
 - Ask the user before a break, a DTR/RTS change or a baud change on a
   session you did not start: each can reset or interrupt the board.
@@ -86,12 +89,13 @@ the log of a failed start once you have read it.
 
 Run a command and get what it printed, up to the next prompt. The output
 ends where the match starts, so start the pattern at the line break to
-leave the prompt's line out. Output that does not end in a line break
-(`printf abc`) is on the prompt's line and goes with it: match just the
-prompt (`'\$ $'`) for that, and cut the prompt off yourself.
+leave the prompt's line out (`\r?\n`, so a CR before it goes too).
+Output that does not end in a line break (`printf abc`) is on the
+prompt's line and goes with it: match just the prompt (`'\$ $'`) for
+that, and cut the prompt off yourself.
 
 ```sh
-xcomm ctl <dev> run 'uname -a' --until '\n[^\n]*\$ $' --timeout 10
+xcomm ctl <dev> run 'uname -a' --until '\r?\n[^\n]*\$ $' --timeout 10
 ```
 
 Wait for something from now on, and remember where it ended:
@@ -104,7 +108,7 @@ Wait from an offset taken before you acted, so a line that came before
 the wait started still counts:
 
 ```sh
-off=$(xcomm ctl --json <dev> status | jq .offset)
+off=$(xcomm ctl <dev> status offset)
 xcomm ctl <dev> send 'reboot'
 xcomm ctl <dev> wait 'Starting kernel' --since "$off" --timeout 60
 ```
@@ -153,7 +157,7 @@ the countdown from that offset - U-Boot prints it once, and a wait from
 now on misses it if it came first:
 
 ```sh
-off=$(xcomm ctl --json <dev> status | jq .offset)
+off=$(xcomm ctl <dev> status offset)
 xcomm ctl <dev> wait 'Hit any key' --since "$off" --timeout 60 && xcomm ctl <dev> run -n ' ' --until '=> $' --timeout 5
 ```
 
@@ -168,16 +172,21 @@ xcomm ctl <dev> run 'root' --until 'Password: $' --timeout 10
 xcomm ctl <dev> run 'secret' --until '# $' --fail-on 'Login incorrect' --timeout 10
 ```
 
-### Run and parse --json
+### Run and pick out a value
 
-`--json` gives one object: `which` (`until`, `fail_on`, `idle` or
-`timeout`), `text` and `groups` of the match, `end`, and `output` (what
-came between the echoed command and the match):
+`run` prints what came between the echoed command and the match, with
+no line ending of its own: `\r?\n` starts the match at the CR, so the
+value does not end in one. Take a value out of it with `sed`:
 
 ```sh
-xcomm ctl --json <dev> run 'cat /proc/version' --until '\n[^\n]*# $' --timeout 10 | jq -r .output
-xcomm ctl --json <dev> run 'ip -4 addr show eth0' --until 'inet ([0-9.]+)/' --timeout 10 | jq -r '.groups[0]'
+ver=$(xcomm ctl <dev> run 'cat /proc/version' --until '\r?\n[^\n]*# $' --timeout 10)
+ip=$(xcomm ctl <dev> run 'ip -4 addr show eth0' --until '\r?\n[^\n]*# $' --timeout 10 | sed -n '/inet /{s/.*inet \([0-9.]*\)\/.*/\1/p;q;}')
+echo "kernel: $ver, eth0: $ip"
 ```
+
+`--json` gives the same as one object: `which` (`until`, `fail_on`,
+`idle` or `timeout`), `text` and `groups` of the match, `end`, and
+`output`.
 
 ### Capture a boot log
 

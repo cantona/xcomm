@@ -606,10 +606,16 @@ fn ctl_commands_parse() {
     let c = ctl(&["ttyUSB1", "status"]);
     assert_eq!(
         (c.device.as_deref(), &c.cmd, c.json),
-        (Some("ttyUSB1"), &CtlCmd::Status, false)
+        (Some("ttyUSB1"), &CtlCmd::Status { field: None }, false)
     );
     let c = ctl(&["--json", "sessions"]);
     assert_eq!((c.device, c.cmd, c.json), (None, CtlCmd::Sessions, true));
+    assert_eq!(
+        ctl(&["ttyUSB1", "status", "offset"]).cmd,
+        CtlCmd::Status {
+            field: Some("offset")
+        }
+    );
     assert!(ctl(&["sessions", "--json"]).json);
     assert_eq!(
         ctl(&["ttyUSB1", "send", "ls"]).cmd,
@@ -921,11 +927,16 @@ fn ctl_usage_errors() {
             &["ttyUSB1", "frobnicate"],
             "unknown ctl command 'frobnicate'",
         ),
+        (&["sessions", "extra"], "unexpected argument 'extra'"),
         (
-            &["ttyUSB1", "status", "extra"],
+            &["ttyUSB1", "status", "pid", "extra"],
             "unexpected argument 'extra'",
         ),
-        (&["sessions", "extra"], "unexpected argument 'extra'"),
+        (
+            &["ttyUSB1", "status", "nope"],
+            "no field 'nope' (one of device,",
+        ),
+        (&["--json", "ttyUSB1", "status", "pid"], "not with --json"),
         (&["ttyUSB1", "send"], "needs <text>"),
         (&["ttyUSB1", "send", "a", "b"], "unexpected argument 'b'"),
         (&["ttyUSB1", "send", "a", "--hex", "00"], "one of"),

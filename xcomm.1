@@ -247,8 +247,21 @@ when there is no usable runtime directory), reachable only by the same user.
 .B xcomm ctl
 talks to it:
 .TP
-.BI "xcomm ctl " device " status"
-Port, line settings, modem lines and output offsets.
+.BI "xcomm ctl " device " status " \fR[\fIfield\fR]
+Port, line settings, modem lines and output offsets. With a
+.IR field ,
+the name of a key of
+.BR "\-\-json status" ,
+only its value:
+.B offset
+is the number to give a later
+.B wait
+or
+.B read
+as
+.BR \-\-since ,
+.B pid
+the session's process.
 .TP
 .BI "xcomm ctl " device " send " text
 Send
@@ -346,7 +359,8 @@ The session in herdr pane
 instead of naming the device.
 .TP
 .B \-\-json
-The reply as JSON.
+The reply as one JSON object (see
+.BR EXAMPLES ).
 .SH OTHER COMMANDS
 .TP
 .B xcomm list
@@ -500,6 +514,22 @@ xcomm sessions apart and the exclusive open does the rest.
 The agent skill, as
 .B xcomm skill install
 writes it.
+.SH EXAMPLES
+Wait for a line that comes after a reboot, from the offset taken before it:
+.PP
+.EX
+off=$(xcomm ctl ttyUSB0 status offset)
+xcomm ctl ttyUSB0 send reboot
+xcomm ctl ttyUSB0 wait 'login:' \-\-since "$off" \-\-timeout 120
+.EE
+.PP
+Whole replies as JSON, for a parser such as
+.BR jq (1):
+.PP
+.EX
+xcomm ctl \-\-json ttyUSB0 status | jq .settings
+xcomm ctl \-\-json ttyUSB0 run 'uname \-r' \-\-until '\er?\en[^\en]*# $' \-\-timeout 5 | jq \-r .output
+.EE
 .SH SEE ALSO
 .BR minicom (1),
 .BR picocom (1),

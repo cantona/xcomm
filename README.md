@@ -242,7 +242,7 @@ by your user.
 
 | Command | |
 |---|---|
-| `xcomm ctl <dev> status` | port, settings, modem lines, offsets |
+| `xcomm ctl <dev> status [<field>]` | port, settings, modem lines, offsets; one field's value alone (`offset`, `pid`, …) |
 | `xcomm ctl <dev> send <text>` | send text and Enter; `-n`, `--lf`, `--crlf`; `--hex`, `--file` for raw bytes |
 | `xcomm ctl <dev> read` | output kept: `--since <offset>`, `--last <bytes>`, `--max-bytes`, `--from-oldest`; next offset on stderr |
 | `xcomm ctl <dev> wait <regex>` | wait for a match: `--since`, `--timeout <s>`, `--fail-on <regex>`, `--idle <ms>`, `--raw`, `--unicode` |

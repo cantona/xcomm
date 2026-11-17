@@ -50,10 +50,12 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
     let mut conn = Conn::open_for(&dirs, args)?;
     match &args.cmd {
         CtlCmd::Sessions | CtlCmd::PaneFromContext => unreachable!("handled above"),
-        CtlCmd::Status => {
+        CtlCmd::Status { field } => {
             let reply = conn.request(&Request::Status)?;
             if args.json {
                 print_json(&reply)?;
+            } else if let Some(key) = field {
+                print_out(format!("{}\n", status_value(&reply, key)).as_bytes())?;
             } else {
                 print_status(&reply)?;
             }
@@ -581,39 +583,47 @@ pub(super) fn print_json(v: &serde_json::Value) -> Result<(), Failed> {
     print_out(&line)
 }
 
+/// The fields of a status reply as `ctl status` prints them: the JSON key,
+/// which `ctl status <field>` takes, and the row's label.
+pub const STATUS_ROWS: [(&str, &str); 13] = [
+    ("device", "device"),
+    ("tty", "tty"),
+    ("stable", "stable"),
+    ("connected", "connected"),
+    ("settings", "settings"),
+    ("modem", "modem"),
+    ("offset", "offset"),
+    ("oldest", "oldest"),
+    ("capture", "capture"),
+    ("transfer", "transfer"),
+    ("ctl", "ctl"),
+    ("herdr_pane", "herdr pane"),
+    ("pid", "pid"),
+];
+
+fn status_value(v: &serde_json::Value, key: &str) -> String {
+    match (key, &v[key]) {
+        ("settings", s) => settings_text(s),
+        ("modem", serde_json::Value::Object(m)) => {
+            ["dtr", "rts", "cts", "dsr", "dcd", "ri"]
+                .iter()
+                .map(|k| {
+                    format!("{}={}", k.to_uppercase(), if m[*k] == true { 1 } else { 0 })
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        (_, serde_json::Value::String(s)) => s.clone(),
+        (_, serde_json::Value::Null) => "-".into(),
+        (_, other) => other.to_string(),
+    }
+}
+
 fn print_status(v: &serde_json::Value) -> Result<(), Failed> {
-    let text = |key: &str| match &v[key] {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => "-".into(),
-        other => other.to_string(),
-    };
-    let settings = settings_text(&v["settings"]);
-    let modem = match &v["modem"] {
-        serde_json::Value::Object(m) => ["dtr", "rts", "cts", "dsr", "dcd", "ri"]
-            .iter()
-            .map(|k| {
-                format!("{}={}", k.to_uppercase(), if m[*k] == true { 1 } else { 0 })
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => "-".into(),
-    };
-    let out = format!(
-        "device     {}\ntty        {}\nstable     {}\nconnected  {}\nsettings   {settings}\n\
-         modem      {modem}\noffset     {}\noldest     {}\ncapture    {}\ntransfer   {}\n\
-         ctl        {}\nherdr pane {}\npid        {}\n",
-        text("device"),
-        text("tty"),
-        text("stable"),
-        text("connected"),
-        text("offset"),
-        text("oldest"),
-        text("capture"),
-        text("transfer"),
-        text("ctl"),
-        text("herdr_pane"),
-        text("pid"),
-    );
+    let out: String = STATUS_ROWS
+        .iter()
+        .map(|(key, label)| format!("{label:<10} {}\n", status_value(v, key)))
+        .collect();
     print_out(out.as_bytes())
 }
 
