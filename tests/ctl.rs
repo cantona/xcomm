@@ -859,6 +859,36 @@ fn client(
     })
 }
 
+/// A client that sends `sizes` as sends and closes, all before the server
+/// reads any of it: then the close is seen first, and every request is one
+/// left behind. (Written while the server reads, a request could be read
+/// whole before the close, and the close would give it up: macOS's socket
+/// buffer is small.) Fails rather than blocks if it does not fit.
+fn sent_and_closed(server: &xcomm::ctl::server::CtlServer, sizes: &[usize]) {
+    let mut c = UnixStream::connect(server.path()).unwrap();
+    // Linux caps it (the requests fit its default anyway); macOS refuses a
+    // size above kern.ipc.maxsockbuf, 8 MiB by default.
+    let size: libc::c_int = 1 << 20;
+    // SAFETY: a valid socket and an int option.
+    let rc = unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(&c),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw const size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_SNDBUF: {}", std::io::Error::last_os_error());
+    c.set_nonblocking(true).unwrap();
+    for &n in sizes {
+        let data = xcomm::ctl::proto::base64_encode(&vec![b'x'; n]);
+        let req = format!("{{\"cmd\":\"send\",\"data_b64\":\"{data}\"}}\n");
+        c.write_all(req.as_bytes())
+            .expect("the requests fit in the socket's buffer");
+    }
+}
+
 /// Serves `server` until `done`, for 30 s at most (a loaded machine); the
 /// line has `per_pass` of room on each pass.
 fn serve_until(
@@ -875,7 +905,13 @@ fn serve_until(
         if done(line, fds.len() - 1) {
             return;
         }
-        assert!(std::time::Instant::now() < until, "sent {:?}", line.sent);
+        assert!(
+            std::time::Instant::now() < until,
+            "sent {:?}, written {}, clients {}",
+            line.sent,
+            line.written,
+            fds.len().saturating_sub(1)
+        );
         let ms = wake.map_or(20, |t| {
             t.saturating_duration_since(std::time::Instant::now())
                 .as_millis()
@@ -897,11 +933,10 @@ fn a_send_left_behind_goes_while_the_line_moves_and_is_dropped_when_it_does_not(
     server.set_unattended_stall(Duration::from_millis(300));
     // A first send longer than one read pass is read after the close. On a
     // slow line that takes some each pass, all of it goes, however long.
-    let mut line = Line::new(64 << 10);
-    let c = client(&server, &[350_000, 2], None);
+    let mut line = Line::new(16 << 10);
+    sent_and_closed(&server, &[100_000, 2]);
     serve_until(&mut server, &mut line, |l, _| l.sent.len() == 2);
-    c.join().unwrap();
-    assert_eq!(line.sent, [350_000, 2]);
+    assert_eq!(line.sent, [100_000, 2]);
     // Behind another client's send, it gets no room for a long while (about
     // 1 s, three times the stall), but the line moves: it waits its turn
     // rather than being dropped.
@@ -911,24 +946,24 @@ fn a_send_left_behind_goes_while_the_line_moves_and_is_dropped_when_it_does_not(
     // Its send under way (its request can come slowly: macOS's socket
     // buffer is small), so the other one is behind it.
     serve_until(&mut server, &mut line, |l, _| l.written > 0);
-    let b = client(&server, &[2], None);
+    sent_and_closed(&server, &[2]);
     serve_until(&mut server, &mut line, |l, _| l.sent.len() == 2);
     assert_eq!(line.sent, [50_000, 2]);
     go.send(()).unwrap();
     a.join().unwrap();
-    b.join().unwrap();
     serve_until(&mut server, &mut line, |_, clients| clients == 0);
     // A line held off while the long send is due: once it has taken nothing
     // for the stall, the client goes, and its later request (which the
     // line would take) does not run after the send cut short.
     let mut line = Line::new(64 << 10);
     line.stuck_over = 1000;
-    let c = client(&server, &[350_000, 2], None);
+    sent_and_closed(&server, &[100_000, 2]);
     serve_until(&mut server, &mut line, |_, clients| clients == 1);
-    // Its long first request read whole (a few passes), well within the stall.
+    // Its long first request read whole (the accept and one more pass) and
+    // its send started, well within the stall.
     let t = std::time::Instant::now();
     serve_until(&mut server, &mut line, |_, _| {
-        t.elapsed() >= Duration::from_millis(200)
+        t.elapsed() >= Duration::from_millis(60)
     });
     // Time the server was away (its loop blocked elsewhere) is not counted:
     // a pass after a long gap does not drop it.
@@ -940,7 +975,6 @@ fn a_send_left_behind_goes_while_the_line_moves_and_is_dropped_when_it_does_not(
     server.poll_fds(0, &mut fds);
     assert_eq!(fds.len(), 2, "the client was dropped after the gap");
     serve_until(&mut server, &mut line, |_, clients| clients == 0);
-    c.join().unwrap();
     assert_eq!(line.sent, [0usize; 0]);
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1434,10 +1468,16 @@ fn a_marker_gives_the_colour_back_across_the_rings_wrap() {
     // A 4 KiB ring that has wrapped: the bytes a marker looks back over are
     // in two pieces.
     let (dev, s, path) = start(&["--ring-size", "4096"]);
-    let filler = vec![b'.'; 6000];
-    write_all(dev.master.as_fd(), &filler);
-    write_all(dev.master.as_fd(), b"\x1b[1;31mred");
+    // From a thread, while the terminal is read: a macOS pty holds about
+    // 1 KiB, and the session stops reading the device while its terminal
+    // is full.
+    let master = dev.master.try_clone().unwrap();
+    let feeder = std::thread::spawn(move || {
+        write_all(master.as_fd(), &[b'.'; 6000]);
+        write_all(master.as_fd(), b"\x1b[1;31mred");
+    });
     shown(&s, b"\x1b[1;31mred");
+    feeder.join().unwrap();
     let o = ctl(&s, &[&path, "send", "x"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     shown(&s, b"\x1b[0;2m\r\n[ctl] x^M\x1b[0m\x1b[1;31m\r\n");
