@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Each master run is a group of its own, so every master commit gets a
+# verdict. Elsewhere a branch and its pull request share one group (keyed by
+# the repository the branch is in, so forks never share it), and a newer push
+# replaces the run still going.
+concurrency:
+  group: >-
+    ${{ github.ref == 'refs/heads/master'
+    && format('ci-master-{0}', github.run_id)
+    || format('ci-{0}-{1}',
+         github.event.pull_request.head.repo.full_name || github.repository,
+         github.head_ref || github.ref_name) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      # The toolchain the project is checked with; scripts/check.sh also
+      # runs the MSRV, Cargo.toml's rust-version.
+      RUST: 1.98.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools the transfer and skill tests drive (lrzsz, jq)
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y lrzsz jq
+          else
+            brew install lrzsz jq
+          fi
+      - name: Rust
+        run: |
+          # As scripts/check.sh reads it: 1.96 is toolchain 1.96.0.
+          MSRV=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          case $MSRV in *.*.*) ;; *.*) MSRV=$MSRV.0 ;; *) echo "bad rust-version '$MSRV'"; exit 1 ;; esac
+          rustup toolchain install "$RUST" --profile minimal --component clippy,rustfmt
+          rustup toolchain install "$MSRV" --profile minimal
+          rustup default "$RUST"
+          rustup target add aarch64-apple-darwin --toolchain "$RUST"
+          rustup target add aarch64-apple-darwin --toolchain "$MSRV"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ env.RUST }}
+      - run: sh scripts/check.sh
