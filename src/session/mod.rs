@@ -964,8 +964,8 @@ pub fn run(
     // process with lock files half made.
     let signals = SignalPipe::install(&signals())
         .map_err(|e| Failure::Other(format!("signals: {e}")))?;
-    let (mut held, cleared) = if opts.no_lock {
-        (None, None)
+    let (mut held, cleared, locked) = if opts.no_lock {
+        (None, None, None)
     } else {
         let real = std::fs::canonicalize(&path).map_err(|e| {
             Failure::Other(format!("cannot open {}: {e}", path.display()))
@@ -974,7 +974,7 @@ pub fn run(
             LockFailure::Busy(msg) => Failure::Busy(msg),
             LockFailure::Other(msg) => Failure::Other(msg),
         })?;
-        (Some(held), cleared)
+        (Some(held), cleared, Some(real))
     };
     // Taken before the open: a link replaced after it is a change to see.
     let stable = reconnect::stable_path(&path);
@@ -990,7 +990,19 @@ pub fn run(
             }
             _ => Failure::Other(e.to_string()),
         })?;
-    if through_link(&stable) != link {
+    // The lock is for the device the path named then: a link moved on
+    // since (udev, between the lock and the open) would leave it on one
+    // device and the port open on another, as reopen checks too.
+    let same = |real: &PathBuf| -> io::Result<bool> {
+        Ok(rustix::fs::fstat(port.fd())?.st_rdev == rustix::fs::stat(real)?.st_rdev)
+    };
+    if through_link(&stable) != link
+        || locked
+            .as_ref()
+            // Only a device seen to differ: one gone already (stat fails)
+            // is found gone by the session, and waited for, as before.
+            .is_some_and(|real| same(real).is_ok_and(|s| !s))
+    {
         return Err(Failure::Other(format!(
             "{} changed while being opened",
             stable.display()
