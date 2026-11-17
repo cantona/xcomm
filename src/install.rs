@@ -154,24 +154,39 @@ pub enum PluginState {
 
 /// Runs `program args`; its stdout, or why it failed.
 fn run(program: &Path, args: &[&str]) -> Result<String, InstallError> {
-    let o = Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| InstallError(format!("{}: {e}", program.display())))?;
+    let o = output(program, args)?;
     if o.status.success() {
         return Ok(String::from_utf8_lossy(&o.stdout).into_owned());
     }
+    Err(failure(program, args, &o))
+}
+
+fn output(program: &Path, args: &[&str]) -> Result<std::process::Output, InstallError> {
+    Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| InstallError(format!("{}: {e}", program.display())))
+}
+
+/// How a run that failed went, with what it said.
+fn failure(program: &Path, args: &[&str], o: &std::process::Output) -> InstallError {
     let mut why = String::from_utf8_lossy(&o.stderr).trim().to_string();
     if why.is_empty() {
         why = String::from_utf8_lossy(&o.stdout).trim().to_string();
     }
-    Err(InstallError(format!(
+    InstallError(format!(
         "{} {} ({}): {why}",
         program.display(),
         args.join(" "),
         o.status
-    )))
+    ))
+}
+
+/// The code of the error herdr reports as JSON on stderr.
+fn herdr_error_code(stderr: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(stderr).ok()?;
+    v["error"]["code"].as_str().map(str::to_string)
 }
 
 /// How herdr has the plugin: `herdr plugin list --json`.
@@ -279,7 +294,19 @@ fn remove_plugin(env: &Env) -> Result<Step, InstallError> {
             run(herdr, &["plugin", "uninstall", PLUGIN_ID]).map(|_| Step::Done)
         }
         PluginState::Linked(_) => {
-            run(herdr, &["plugin", "unlink", PLUGIN_ID]).map(|_| Step::Done)
+            let unlink = ["plugin", "unlink", PLUGIN_ID];
+            let o = output(herdr, &unlink)?;
+            if o.status.success() {
+                return Ok(Step::Done);
+            }
+            // herdr unlinks only through a running server; uninstall takes a
+            // linked plugin's registration away without one, and leaves its
+            // directory.
+            if herdr_error_code(&o.stderr).as_deref() == Some("server_not_running") {
+                return run(herdr, &["plugin", "uninstall", PLUGIN_ID])
+                    .map(|_| Step::Done);
+            }
+            Err(failure(herdr, &unlink, &o))
         }
     }
 }

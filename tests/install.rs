@@ -502,6 +502,59 @@ fn a_failing_cargo_is_reported_with_what_is_left() {
 }
 
 #[test]
+fn without_a_herdr_server_a_linked_plugin_is_uninstalled() {
+    // herdr 0.9.5 unlinks only through its server, and says so as JSON on
+    // stderr; uninstall works without one.
+    let fake = |h: &Home| {
+        support::write_exe(
+            &h.root.join("bin/herdr"),
+            &format!(
+                "#!/bin/sh\nprintf '%s|' \"$@\" >> '{log}'\necho >> '{log}'\n\
+                 case \"$*\" in\n\
+                 \"plugin list\"*) printf '%s\\n' \"$FAKE_LIST\"; exit 0 ;;\n\
+                 \"plugin unlink\"*) printf '%s\\n' \"$UNLINK_ERR\" >&2; exit 1 ;;\n\
+                 esac\n",
+                log = h.root.join("herdr.log").display()
+            ),
+        );
+    };
+    let h = Home::new("noserver");
+    fake(&h);
+    h.fake("cargo");
+    h.cargo_record();
+    let not_running = r#"{"id":"cli:plugin","error":{"code":"server_not_running","message":"no herdr server is running at /x/herdr.sock"}}"#;
+    let o = h.run(
+        "uninstall",
+        &[("FAKE_LIST", LINKED), ("UNLINK_ERR", not_running)],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(stdout(&o).contains("herdr plugin: ok\n"), "{}", stdout(&o));
+    assert_eq!(
+        h.log("herdr"),
+        "plugin|list|--json|--plugin|cantona.herdr-xcomm|\n\
+         plugin|unlink|cantona.herdr-xcomm|\n\
+         plugin|uninstall|cantona.herdr-xcomm|\n"
+    );
+    assert!(h.log("cargo").starts_with("uninstall|"));
+    // Any other refusal is not worked around: it stops there, as before.
+    let h = Home::new("unlinkfail");
+    fake(&h);
+    h.fake("cargo");
+    h.cargo_record();
+    let busy = r#"{"id":"cli:plugin","error":{"code":"plugin_busy","message":"busy"}}"#;
+    let o = h.run("uninstall", &[("FAKE_LIST", LINKED), ("UNLINK_ERR", busy)]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("herdr plugin: FAILED: ") && out.contains("plugin_busy"),
+        "{out}"
+    );
+    assert!(out.ends_with("not done: herdr plugin, binaries\n"), "{out}");
+    assert!(!h.log("herdr").contains("uninstall"), "{}", h.log("herdr"));
+    assert_eq!(h.log("cargo"), "");
+}
+
+#[test]
 fn doctor_flags_a_stale_socket_and_a_dangling_skill() {
     let h = Home::new("doctor");
     h.fake("herdr");

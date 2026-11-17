@@ -20,6 +20,9 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- `xcomm uninstall` takes a linked herdr plugin away when no herdr server is
+  running, which `herdr plugin unlink` refuses to do; it stopped there before,
+  leaving the binaries in place.
 - `xcomm doctor` reports an xcomm that Homebrew or cargo installed but that
   does not run (for example a binary built for a newer glibc), with what it
   said, instead of taking it for another program and reporting nothing;
