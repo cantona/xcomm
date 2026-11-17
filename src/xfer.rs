@@ -254,17 +254,29 @@ impl<'a> Transfer<'a> {
     }
 }
 
-/// `name` as the shell would find it on PATH: an executable file.
+/// `name` as the shell would find it on PATH: an executable file, by an
+/// absolute path. The program runs in the transfer's directory, so a
+/// relative PATH entry (`.`, or an empty one) is taken from where xcomm
+/// runs now; left relative, it would name a file in the transfer directory
+/// (one an earlier transfer may have written).
 fn find_program(name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| {
-            if dir.as_os_str().is_empty() {
-                PathBuf::from(".").join(name)
-            } else {
-                dir.join(name)
-            }
+    // Only a relative entry needs it: a directory removed since xcomm
+    // started still finds a program on an absolute one.
+    find_program_in(name, &path, std::env::current_dir().ok().as_deref())
+}
+
+fn find_program_in(
+    name: &str,
+    path: &std::ffi::OsStr,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter_map(|dir| match cwd {
+            _ if dir.is_absolute() => Some(dir.join(name)),
+            Some(cwd) => Some(cwd.join(dir).join(name)),
+            None => None,
         })
         .find(|p| {
             std::fs::metadata(p)
@@ -521,5 +533,42 @@ impl Drop for Transfer<'_> {
             self.kill();
             let _ = self.port.set_blocking(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_program_in;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    #[test]
+    fn a_relative_path_entry_is_taken_from_where_xcomm_runs() {
+        let here =
+            std::env::temp_dir().join(format!("xcomm-find-{}", std::process::id()));
+        std::fs::create_dir_all(here.join("sub")).unwrap();
+        for p in [here.join("rz"), here.join("sub/sz")] {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let find = |name, path: &str| find_program_in(name, path.as_ref(), Some(&here));
+        // Absolute whatever the entry: the program runs in another directory.
+        assert_eq!(find("rz", ".:/nonexistent"), Some(here.join("./rz")));
+        assert_eq!(find("rz", ":/nonexistent"), Some(here.join("rz")));
+        assert_eq!(find("sz", "sub"), Some(here.join("sub/sz")));
+        assert!(find("rz", "sub").is_none());
+        let abs = here.join("sub");
+        assert_eq!(find("sz", abs.to_str().unwrap()), Some(abs.join("sz")));
+        assert!(find("rz", "").map(|p| p.is_absolute()).unwrap_or(false));
+        assert!(Path::new(&find("rz", ".").unwrap()).is_absolute());
+        // No cwd (removed since xcomm started): relative entries are
+        // skipped, absolute ones still found.
+        let abs = format!(".:{}", here.join("sub").display());
+        assert_eq!(
+            find_program_in("sz", abs.as_ref(), None),
+            Some(here.join("sub/sz"))
+        );
+        assert!(find_program_in("rz", ".".as_ref(), None).is_none());
+        std::fs::remove_dir_all(&here).unwrap();
     }
 }

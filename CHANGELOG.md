@@ -14,6 +14,9 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- File transfers: with a relative directory on PATH (`.`), `rz`/`sz` are taken
+  from where xcomm runs, not from the transfer directory, where an earlier
+  transfer may have written one.
 - `xcomm doctor` looks for `xcomm-wait` beside the binary a link on PATH leads
   to, where `ctl wait` and `ctl run` look for it, not beside the link.
 - Opening a port through a link that udev moves between the lock and the open
