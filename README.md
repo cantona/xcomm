@@ -406,7 +406,8 @@ and stops at the first failure saying what is left. Use it rather than
 and the skill behind. `xcomm doctor` reports anything left over.
 
 Installed with Homebrew: run `xcomm uninstall` for the watchers and the skill
-(it then says the binary is not cargo's), then `brew uninstall xcomm`.
+(it then names the binary as Homebrew's and the `brew uninstall xcomm` that
+removes it), then run that command.
 
 ## Benchmarks
 

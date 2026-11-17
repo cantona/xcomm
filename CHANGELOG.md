@@ -13,6 +13,9 @@ What changed in each release of xcomm.
   `less`).
 
 ### Changed
+- `xcomm uninstall` and `xcomm doctor` recognise a Homebrew install: uninstall
+  leaves it to Homebrew and names the `brew uninstall xcomm` that removes it,
+  and doctor names it as Homebrew's.
 - Licensed under the GNU GPL, version 2 only (GPL-2.0-only); every source file
   carries an SPDX copyright and license header.
 

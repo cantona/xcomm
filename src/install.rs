@@ -396,27 +396,85 @@ fn remove_binary(env: &Env) -> Result<Step, InstallError> {
         })?;
         removed = true;
     }
-    // What cargo did not install is not cargo's to take away.
-    let left: Vec<String> = binaries(env)
-        .into_iter()
-        .map(|(p, _)| p.display().to_string())
-        .collect();
+    // What cargo did not install is not cargo's to take away: Homebrew's
+    // is brew's, and the rest is the user's.
+    let mut brewed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut left: Vec<PathBuf> = Vec::new();
+    for (p, _) in binaries(env) {
+        match homebrew_prefix(&p) {
+            Some(prefix) => brewed.push((p, prefix)),
+            None => left.push(p),
+        }
+    }
+    let list = |ps: &[PathBuf]| {
+        ps.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut why = Vec::new();
+    let prefixes: std::collections::BTreeSet<&PathBuf> =
+        brewed.iter().map(|(_, prefix)| prefix).collect();
+    // The keg's own brew, by path: the brew on PATH may be another
+    // prefix's, or there may be none.
+    let brew = |prefix: &Path| quote(&prefix.join("bin/brew").display().to_string());
+    if let [prefix] = Vec::from_iter(&prefixes)[..] {
+        let paths: Vec<PathBuf> = brewed.iter().map(|(p, _)| p.clone()).collect();
+        why.push(format!(
+            "still on PATH, installed by Homebrew: {}; remove it with {} uninstall xcomm",
+            list(&paths),
+            brew(prefix)
+        ));
+    } else if !brewed.is_empty() {
+        let each: Vec<String> = brewed
+            .iter()
+            .map(|(p, prefix)| {
+                format!("{} ({} uninstall xcomm)", p.display(), brew(prefix))
+            })
+            .collect();
+        why.push(format!(
+            "still on PATH, installed by Homebrew: {}",
+            each.join(", ")
+        ));
+    }
     if !left.is_empty() {
-        return Err(InstallError(format!(
+        why.push(format!(
             "still on PATH, not installed by cargo under {}: {}; remove it yourself",
             env.cargo_roots
                 .iter()
                 .map(|r| r.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            left.join(", ")
-        )));
+            list(&left)
+        ));
+    }
+    if !why.is_empty() {
+        return Err(InstallError(why.join("; ")));
     }
     Ok(if removed {
         Step::Done
     } else {
         Step::Skipped("no xcomm installed".into())
     })
+}
+
+/// The Homebrew prefix `p` is from, if it is Homebrew's: its `bin/xcomm`
+/// is a link into the keg, `<prefix>/Cellar/xcomm/<version>/bin`, in a
+/// prefix that has `bin/brew` (not any directory named Cellar).
+fn homebrew_prefix(p: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut dir = real.parent();
+    while let Some(d) = dir {
+        if d.file_name() == Some("xcomm".as_ref())
+            && let Some(cellar) = d.parent()
+            && cellar.file_name() == Some("Cellar".as_ref())
+            && let Some(prefix) = cellar.parent()
+        {
+            return executable(&prefix.join("bin/brew")).then(|| prefix.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// Takes away, in order, the hotplug watchers, the skill, the herdr plugin
@@ -625,7 +683,12 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
         // leads to, not beside the link.
         let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
         let wait = real.with_file_name(crate::ctl::WAIT_HELPER);
-        lines.push(format!("binary: {} ({v})", p.display()));
+        let by = if homebrew_prefix(p).is_some() {
+            ", Homebrew"
+        } else {
+            ""
+        };
+        lines.push(format!("binary: {} ({v}{by})", p.display()));
         if !executable(&wait) {
             problems.push(format!(
                 "{} is missing: xcomm ctl wait and run need it beside xcomm",

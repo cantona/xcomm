@@ -290,6 +290,75 @@ fn binaries_cargo_did_not_install_here_are_named() {
     assert!(out.ends_with("not done: binaries\n"), "{out}");
     // Said once, not again on stderr.
     assert_eq!(String::from_utf8_lossy(&o.stderr), "");
+    // Homebrew's (bin/xcomm a link into <prefix>/Cellar/xcomm/<version>/bin,
+    // in a prefix with bin/brew): left to brew, by name; doctor says whose
+    // it is.
+    let h = Home::new("brewed");
+    let built = Path::new(env!("CARGO_BIN_EXE_xcomm"));
+    let keg_in = |prefix: &Path, on_path: &Path| {
+        let keg = prefix.join("Cellar/xcomm/0.1.2/bin");
+        std::fs::create_dir_all(&keg).unwrap();
+        std::fs::create_dir_all(on_path).unwrap();
+        for name in ["xcomm", "xcomm-wait"] {
+            support::copy_exe(&built.with_file_name(name), &keg.join(name));
+            std::os::unix::fs::symlink(keg.join(name), on_path.join(name)).unwrap();
+        }
+    };
+    let brew = h.root.join("brew");
+    keg_in(&brew, &h.root.join("bin"));
+    // Without bin/brew, a directory that happens to be called Cellar is not
+    // Homebrew's.
+    let o = h.run("uninstall", &[]);
+    assert_eq!(o.status.code(), Some(1));
+    let out = stdout(&o);
+    assert!(out.contains("remove it yourself"), "{out}");
+    assert!(!out.contains("Homebrew"), "{out}");
+    std::fs::create_dir_all(brew.join("bin")).unwrap();
+    support::write_exe(&brew.join("bin/brew"), "#!/bin/sh\nexit 0\n");
+    let o = h.run("uninstall", &[]);
+    assert_eq!(o.status.code(), Some(1));
+    let out = stdout(&o);
+    assert!(
+        out.contains(&format!(
+            "binaries: FAILED: still on PATH, installed by Homebrew: {}; remove it with \
+             {} uninstall xcomm\n",
+            h.root.join("bin/xcomm").display(),
+            brew.canonicalize().unwrap().join("bin/brew").display()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("remove it yourself"), "{out}");
+    let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
+    assert!(
+        stdout(&o).contains(&format!(
+            "binary: {} (xcomm {}, Homebrew)",
+            h.root.join("bin/xcomm").display(),
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{}",
+        stdout(&o)
+    );
+    // Two Homebrew prefixes: each binary gets its own prefix's brew, quoted
+    // for the shell.
+    let brew2 = h.root.join("brew two");
+    keg_in(&brew2, &h.root.join("tools"));
+    std::fs::create_dir_all(brew2.join("bin")).unwrap();
+    support::write_exe(&brew2.join("bin/brew"), "#!/bin/sh\nexit 0\n");
+    let o = h.run("uninstall", &[]);
+    assert_eq!(o.status.code(), Some(1));
+    let out = stdout(&o);
+    assert!(
+        out.contains(&format!(
+            "binaries: FAILED: still on PATH, installed by Homebrew: {} ({} uninstall \
+             xcomm), {} ('{}' uninstall xcomm)\n",
+            h.root.join("bin/xcomm").display(),
+            // The prefix is where the keg really is (macOS: /private/var).
+            brew.canonicalize().unwrap().join("bin/brew").display(),
+            h.root.join("tools/xcomm").display(),
+            brew2.canonicalize().unwrap().join("bin/brew").display()
+        )),
+        "{out}"
+    );
     // Another program that happens to be called xcomm is not this one.
     let h = Home::new("other");
     let other = h.root.join("bin/xcomm");
