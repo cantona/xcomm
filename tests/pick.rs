@@ -159,7 +159,7 @@ fn placement_cycles_and_shapes_the_command() {
             "--target-pane",
             "w1:p2",
             "--env",
-            "XCOMM_DEVICE=/dev/serial/by-id/usb-FTDI_A-if00-port0",
+            "XCOMM_DEVICE=/dev/ttyUSB0",
             "--env",
             "XCOMM_BAUD=115200",
             "--focus",
@@ -180,7 +180,7 @@ fn placement_cycles_and_shapes_the_command() {
         &argv[7..11],
         ["--placement", "tab", "--target-pane", "w1:p2"]
     );
-    // No by-id link: the path.
+    // Always the kernel name, by-id link or not.
     assert!(argv.contains(&"XCOMM_DEVICE=/dev/ttyUSB1".to_string()));
     s.apply(PickKey::Placement);
     assert_eq!(s.placement, Placement::SplitRight);

@@ -14,6 +14,11 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- herdr picker: a port opened from it is reopened, after an unplug, on the USB
+  port it was on (by-path), as for a port named on the command line, not by
+  its by-id name, which identical adapters without a serial number share: the
+  session could come back on another board's console. An adapter moved to
+  another USB port is not followed any more.
 - File transfers: with a relative directory on PATH (`.`), `rz`/`sz` are taken
   from where xcomm runs, not from the transfer directory, where an earlier
   transfer may have written one.

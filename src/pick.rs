@@ -365,7 +365,10 @@ pub fn open_command(
     if let Some(pane) = target_pane {
         argv.extend(["--target-pane".to_string(), pane.to_string()]);
     }
-    let device = port.by_id.as_deref().unwrap_or(&port.path);
+    // The kernel name: the session then follows the USB port it is on
+    // (by-path), not the by-id name, which identical adapters without a
+    // serial number share, and udev moves to whichever came last.
+    let device = &port.path;
     argv.extend([
         "--env".to_string(),
         format!("XCOMM_DEVICE={device}"),
@@ -519,12 +522,6 @@ pub fn run(
                     }
                 }
                 PickAction::Open => {
-                    // udev makes the by-id link a little after the node:
-                    // the session should follow the adapter, not the name.
-                    let port = &mut state.ports[state.selected];
-                    if port.by_id.is_none() {
-                        port.by_id = crate::list::by_id_of(&port.tty);
-                    }
                     let argv = open_command(&state, PLUGIN_ID, target.as_deref());
                     match std::process::Command::new(&herdr_bin)
                         .args(&argv)
