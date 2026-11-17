@@ -1303,13 +1303,14 @@ impl<'a> Live<'a> {
             .end()
             .saturating_sub(MARKER_LOOK)
             .max(self.ring.oldest());
-        let mut tail = Vec::new();
-        if let Ok((a, b)) = self.ring.slices(from, MARKER_LOOK as usize) {
-            tail.reserve_exact(a.len() + b.len());
-            tail.extend_from_slice(a);
-            tail.extend_from_slice(b);
-        }
-        let state = crate::ansi::term_state(&tail);
+        // The ring's own bytes when they are in one piece (all but a window
+        // across the wrap): no 64 KiB copy for every marker, and none again
+        // on each pass while one waits for a sequence to end.
+        let state = match self.ring.slices(from, MARKER_LOOK as usize) {
+            Ok((a, [])) => crate::ansi::term_state(a),
+            Ok((a, b)) => crate::ansi::term_state(&[a, b].concat()),
+            Err(_) => crate::ansi::term_state(&[]),
+        };
         let late = force
             || self
                 .markers_since

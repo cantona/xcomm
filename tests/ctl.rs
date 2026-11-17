@@ -1430,6 +1430,20 @@ fn no_color_takes_the_dim_off_the_marker_but_not_the_devices_color() {
 }
 
 #[test]
+fn a_marker_gives_the_colour_back_across_the_rings_wrap() {
+    // A 4 KiB ring that has wrapped: the bytes a marker looks back over are
+    // in two pieces.
+    let (dev, s, path) = start(&["--ring-size", "4096"]);
+    let filler = vec![b'.'; 6000];
+    write_all(dev.master.as_fd(), &filler);
+    write_all(dev.master.as_fd(), b"\x1b[1;31mred");
+    shown(&s, b"\x1b[1;31mred");
+    let o = ctl(&s, &[&path, "send", "x"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    shown(&s, b"\x1b[0;2m\r\n[ctl] x^M\x1b[0m\x1b[1;31m\r\n");
+}
+
+#[test]
 fn no_ctl_marker_suppresses_it() {
     let (dev, s, path) = start(&["--no-ctl-marker"]);
     let o = ctl(&s, &[&path, "send", "ls"]);
