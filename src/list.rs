@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm list`: the serial ports there are, with their USB identity, who
 //! holds their lock and the herdr pane of a session on them. Nothing is
 //! opened but sysfs files, lock files and session sockets.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! What the keys typed after the prefix do.
 
 use std::ffi::OsString;

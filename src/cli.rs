@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Command-line parsing and prefix key resolution.
 
 use std::ffi::OsString;

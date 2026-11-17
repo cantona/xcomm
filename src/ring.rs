@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The last bytes the device sent, by absolute offset: byte N is the Nth
 //! byte read from the device since the session started.
 

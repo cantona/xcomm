@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Writes the README's picker and `xcomm list` screens from made-up ports
 //! (list.ansi is the README's `xcomm list` example, as text),
 //! through the same code that draws the real ones, so the README shows

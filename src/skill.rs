@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The agent skill: `skills/xcomm/SKILL.md`, printed by `xcomm --skill` and
 //! written by `xcomm skill install`.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Output helpers that return write errors instead of panicking.
 //!
 //! `println!` and `eprintln!` panic when the write fails (a closed pipe), and

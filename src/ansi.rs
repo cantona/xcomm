@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Escape sequences in device output: the SGR color filter used when color
 //! is off (`--color never`, or `auto` with stdout not a terminal or
 //! TERM=dumb), and the stripper that gives regex matching plain text. Both keep their

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 """demo-board.py LINK: a made-up board on a pty, for the README's pictures.
 
 Makes a pty, links LINK to its slave, and plays a board's console on the

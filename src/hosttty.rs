@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The host terminal: raw mode that is always restored, and a self-pipe that
 //! turns signals into poll(2) readiness.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Hardware tests. Run with:
 //!   XCOMM_HW_A=/dev/ttyUSB1 cargo test --test hw_port -- --ignored
 //! (they take the port one at a time; it is opened exclusively).

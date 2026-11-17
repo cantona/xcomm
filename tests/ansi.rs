@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 use xcomm::ansi::{
     EscapeStripper, SGR_HELD_MAX, SgrFilter, color_enabled, device_color_enabled,
     ends_inside, term_state,

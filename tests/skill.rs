@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The agent skill: what `--skill` prints, `skill install`, and that the
 //! skill's commands are ones xcomm takes - each parsed by the real parser,
 //! each example run against a fake device.

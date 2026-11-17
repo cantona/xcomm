@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm uninstall` and `xcomm doctor`: what an install leaves, taken
 //! away in order, or reported.
 

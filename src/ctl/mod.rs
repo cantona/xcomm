@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The control interface: a socket per session that agents and scripts use
 //! to read device output and send to the device (`xcomm ctl`).
 

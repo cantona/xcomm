@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 # picker-gif-capture.sh XCOMM OUT: the two sessions of the README's picker
 # GIF, captured into OUT/s0.ansi and OUT/s1.ansi for scripts/picker-gif.py.
 #

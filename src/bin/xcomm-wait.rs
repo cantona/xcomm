@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm ctl wait` and `xcomm ctl run`: `xcomm` execs this with its own
 //! arguments, so the regex engine is not in the xcomm binary.
 

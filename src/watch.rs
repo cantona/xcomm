@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm watch`: the hotplug watcher herdr starts with the plugin. It tells
 //! herdr (`notification.show`) when a serial port comes or goes.
 

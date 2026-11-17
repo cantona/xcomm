@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The README and the man page keep up with the binary: every long option
 //! `xcomm --help` names, and every exit code of `xcomm ctl`.
 

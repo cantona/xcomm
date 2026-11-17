@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! UUCP lock files (`LCK..ttyUSB0`), the convention minicom and picocom use
 //! to keep two programs off one serial port.
 //!

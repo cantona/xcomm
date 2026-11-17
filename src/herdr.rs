@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The herdr API, spoken directly over `HERDR_SOCKET_PATH`: one JSON
 //! request line per connection, one reply line (herdr 0.9.5).
 

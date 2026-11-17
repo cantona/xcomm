@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The session's end of the control socket, served from the session's own
 //! poll loop: it never blocks, and costs nothing per device read while no
 //! one subscribes.

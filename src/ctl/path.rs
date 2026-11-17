@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Where session sockets live.
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};

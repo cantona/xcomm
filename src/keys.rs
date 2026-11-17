@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The command prefix key (Ctrl-A, Alt-A, ...): splits keyboard input into
 //! bytes for the device and the keys typed after the prefix. Runs on every
 //! keystroke, so it scans with memchr and never allocates.

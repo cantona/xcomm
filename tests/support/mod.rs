@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Shared helpers for integration tests. Not every test file uses every helper.
 #![allow(dead_code)]
 

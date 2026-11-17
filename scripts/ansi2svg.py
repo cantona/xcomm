@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 """ansi2svg.py: renders a terminal capture (text with SGR escapes, as
 `herdr pane read --format ansi` gives it) as an SVG terminal window.
 

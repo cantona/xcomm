@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm uninstall` and `xcomm doctor`, run as a user would, under a
 //! temporary HOME with fake `herdr` and `cargo` that log their argv.
 

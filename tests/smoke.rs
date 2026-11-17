@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 use std::process::{Command, Stdio};
 
 /// Strips variables that change prefix resolution, so the tests do not

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm pick`: the port picker herdr shows in a popup. A plain list in
 //! raw mode, no TUI library. Enter opens the port in a new plugin pane, or
 //! focuses the pane already showing it.

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 # build.sh: what the herdr plugin runs (target/release) and what agents and
 # the shell run (xcomm and xcomm-wait in ~/.local/bin).
 set -eu

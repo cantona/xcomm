@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! A pty taken as a device that can come back (XCOMM_TEST_PTY_AS_DEVICE),
 //! so the session takes the path of a USB adapter. One test, in its own
 //! binary: while waiting, the session follows the old pty name, and a pty

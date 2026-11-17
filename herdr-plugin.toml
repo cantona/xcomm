@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 # The herdr plugin of xcomm. Commands run from this directory: build it
 # first with `sh scripts/build.sh` (scripts/install.sh also links it).
 id = "cantona.herdr-xcomm"

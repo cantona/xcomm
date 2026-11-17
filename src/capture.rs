@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The capture file: device output copied to a file, in batches.
 //!
 //! Writes are synchronous. A capture on a hard-mounted network filesystem

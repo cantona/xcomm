@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Unix socket helpers shared by the clients xcomm runs inside a session
 //! or a listing, where waiting on another process is not an option.
 

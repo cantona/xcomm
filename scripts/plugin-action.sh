@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 # plugin-action.sh <action>: an action of the xcomm herdr plugin. Pane
 # actions act on the xcomm session in the pane they were invoked on; the
 # outcome, or the error, is shown as a herdr notification.

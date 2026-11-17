@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The control protocol: one JSON object per line each way. Bytes inside
 //! JSON are base64 (RFC 4648, with padding).
 

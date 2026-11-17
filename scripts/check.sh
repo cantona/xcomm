@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 # check.sh          check the working tree
 # check.sh --staged check exactly what is staged (the tree the next commit will contain)
 set -eu

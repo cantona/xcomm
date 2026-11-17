@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Serial device nodes coming and going: inotify on `<root>/dev`,
 //! `<root>/dev/serial` and `<root>/dev/serial/by-id` on Linux, watched again
 //! after each event, as udev removes the by-id directory with the last

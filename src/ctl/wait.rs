@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `xcomm ctl wait` and `xcomm ctl run`, run by the xcomm-wait binary
 //! that `xcomm` hands them to: the regex engine they need stays out of the
 //! xcomm binary, so out of every session's memory.

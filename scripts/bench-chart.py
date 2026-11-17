@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 """bench-chart.py OUT.svg REPORT.json...: the README's benchmark chart.
 
 One panel per metric, one bar per tool, from `xcomm-bench run` reports, or

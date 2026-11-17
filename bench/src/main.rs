@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Benchmarks a serial terminal on a pty pair: device-to-terminal
 //! throughput, CPU and memory per MiB, keystroke-to-device latency and
 //! syscalls per MiB. The same harness runs xcomm, minicom, picocom and tio,

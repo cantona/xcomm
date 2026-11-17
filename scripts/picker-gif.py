@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
 """picker-gif.py SCREENS CAPTURES OUT: the README's picker GIF.
 
 Shows what Enter does in the herdr port picker: on a port open in a pane it

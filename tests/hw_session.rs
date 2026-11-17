@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Hardware tests of the modem-line commands. Run with:
 //!   XCOMM_HW_A=/dev/ttyUSB1 cargo test --test hw_session -- --ignored
 //! Only /dev/ttyUSB1 may be used on the development machine: the other

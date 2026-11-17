@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Pattern matching for `ctl wait` and `ctl run`, done in the client:
 //! device output, without its escape sequences unless raw, searched as it
 //! comes in.

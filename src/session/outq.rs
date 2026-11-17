@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! A fixed-capacity byte queue for output to the device. It never grows,
 //! so the loop does not allocate; a full queue tells the caller to stop
 //! reading its input.
