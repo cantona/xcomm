@@ -357,17 +357,53 @@ mod tests {
     fn watch_peer(
         peer: impl FnOnce(UnixStream) + Send + 'static,
     ) -> Result<Outcome, Failed> {
+        watch_peer_with(opts(), peer)
+    }
+
+    fn watch_peer_with(
+        o: WaitOpts,
+        peer: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> Result<Outcome, Failed> {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || peer(theirs));
         // No socket there: a close the session's last words do not explain
         // reads as the session gone.
         let mut conn = Conn::new(Path::new("/nonexistent/x.sock"), ours, None).unwrap();
-        let o = opts();
         let mut m =
             Matcher::new(o.until.as_deref(), &o.fail_on, false, false, false).unwrap();
         let got = watch(&mut conn, &mut m, 0, &o, None, &|| false);
         t.join().unwrap();
         got
+    }
+
+    /// The groups of a match on `ip (\d+)` when "ip 12" comes, then "34"
+    /// after `gap`.
+    fn ip_after(gap: Duration) -> Vec<Option<String>> {
+        let o = WaitOpts {
+            until: Some(r"ip (\d+)".into()),
+            fail_on: vec![],
+            ..opts()
+        };
+        let got = watch_peer_with(o, move |mut s| {
+            s.write_all(b"ip 12").unwrap();
+            std::thread::sleep(gap);
+            s.write_all(b"34\r\n").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let Ok(Outcome::Matched { groups, .. }) = got else {
+            panic!("{got:?}");
+        };
+        groups
+    }
+
+    #[test]
+    fn a_match_at_the_end_waits_settle_for_the_rest() {
+        assert_eq!(ip_after(Duration::from_millis(5)), [Some("1234".into())]);
+    }
+
+    #[test]
+    fn a_match_at_the_end_is_taken_once_settle_has_passed() {
+        assert_eq!(ip_after(Duration::from_millis(200)), [Some("12".into())]);
     }
 
     #[test]
