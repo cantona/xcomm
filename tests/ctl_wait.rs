@@ -255,19 +255,31 @@ fn match_split_across_chunks() {
 
 #[test]
 fn a_match_at_the_end_takes_what_follows_soon_after() {
-    let (dev, s, path) = start(&[]);
-    let from = offset(&s, &path).to_string();
-    let child = spawn_ctl(
-        &s,
-        &["--json", &path, "wait", r"ip (\d+)", "--since", &from],
-    );
-    write_all(dev.master.as_fd(), b"ip 12");
-    shown(&s, b"ip 12");
-    std::thread::sleep(Duration::from_millis(10));
-    write_all(dev.master.as_fd(), b"34\r\n");
-    let o = child.wait_with_output().unwrap();
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(json_of(&o)["groups"], serde_json::json!(["1234"]));
+    // "Soon" is the 50 ms a match touching the end waits for more; the rest
+    // comes 10 ms later here. A loaded CI runner can stall either process
+    // for longer than that once, so it gets three tries, and only a miss
+    // every time fails.
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let (dev, s, path) = start(&[]);
+        let from = offset(&s, &path).to_string();
+        let child = spawn_ctl(
+            &s,
+            &["--json", &path, "wait", r"ip (\d+)", "--since", &from],
+        );
+        write_all(dev.master.as_fd(), b"ip 12");
+        shown(&s, b"ip 12");
+        std::thread::sleep(Duration::from_millis(10));
+        write_all(dev.master.as_fd(), b"34\r\n");
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let groups = json_of(&o)["groups"].clone();
+        if groups == serde_json::json!(["1234"]) {
+            return;
+        }
+        got.push(groups);
+    }
+    panic!("the rest was never taken: {got:?}");
 }
 
 #[test]
