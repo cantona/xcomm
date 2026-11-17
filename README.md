@@ -5,7 +5,7 @@
 <p align="center">
 <a href="https://github.com/cantona/xcomm/actions/workflows/ci.yml"><img src="https://github.com/cantona/xcomm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://crates.io/crates/xcomm"><img src="https://img.shields.io/crates/v/xcomm.svg" alt="crates.io"></a>
-<a href="#license"><img src="https://img.shields.io/crates/l/xcomm.svg" alt="License: MIT OR Apache-2.0"></a>
+<a href="#license"><img src="https://img.shields.io/badge/license-GPL--2.0--only-blue.svg" alt="License: GPL-2.0-only"></a>
 </p>
 
 <p align="center">
@@ -479,4 +479,5 @@ never read or translated while writing it.
 
 ## License
 
-Either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Copyright 2026 Su Kang Yin. Licensed under the
+[GNU General Public License, version 2 only](COPYING).

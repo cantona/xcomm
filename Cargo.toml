@@ -6,7 +6,7 @@ name = "xcomm"
 version = "0.1.2"
 edition = "2024"
 rust-version = "1.93"
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-only"
 description = "Fast serial terminal with an agent control interface and a herdr plugin"
 repository = "https://github.com/cantona/xcomm"
 keywords = ["serial", "terminal", "minicom", "uart", "tty"]
@@ -26,8 +26,7 @@ include = [
     "/herdr-plugin.toml",
     "/xcomm.1",
     "/README.md",
-    "/LICENSE-APACHE",
-    "/LICENSE-MIT",
+    "/COPYING",
     "/Cargo.lock",
 ]
 
