@@ -1354,6 +1354,12 @@ impl<'a> Live<'a> {
             self.unshown.get_mut().clear();
             return;
         };
+        // Nothing to show: no clock read on this pass.
+        if self.markers.is_empty() && self.unshown.get_mut().is_empty() {
+            self.retry_at = None;
+            self.retry = MARKER_RETRY;
+            return;
+        }
         let until = Instant::now()
             + if force {
                 MARKER_WAIT * 10

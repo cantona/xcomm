@@ -708,7 +708,9 @@ impl CtlServer {
     /// client's id. One whose client has closed the connection is dropped:
     /// it was given up on (a client that timed out has said it failed).
     pub fn pending_action(&mut self) -> Option<(u64, &Action)> {
-        let now = proto::now_ms();
+        // The clock is read only for an action with a deadline: not on
+        // every pass of the session loop.
+        let mut now = None;
         for c in &mut self.clients {
             let gone = c.action.is_some() && c.peer_gone();
             if gone && !c.unattended {
@@ -720,7 +722,10 @@ impl CtlServer {
                 // handshake, and `abandoned` aborts it on the first turn
                 // of the loop.
                 c.action = None;
-            } else if c.action.is_some() && c.action_deadline.is_some_and(|d| now > d) {
+            } else if c.action.is_some()
+                && c.action_deadline
+                    .is_some_and(|d| *now.get_or_insert_with(proto::now_ms) > d)
+            {
                 c.action = None;
                 c.reply(expired());
                 c.flush();
