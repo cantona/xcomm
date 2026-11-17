@@ -28,6 +28,7 @@ include = [
     "/herdr-plugin.toml",
     "/xcomm.1",
     "/README.md",
+    "/CHANGELOG.md",
     "/COPYING",
     "/Cargo.lock",
 ]
