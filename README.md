@@ -95,8 +95,8 @@ git clone https://github.com/cantona/xcomm && cd xcomm
 sh scripts/install.sh      # build, cargo install to ~/.local, link the plugin
 ```
 
-Building needs Rust 1.96 or later (the Homebrew formula uses its own; the
-herdr plugin and cargo use yours). File transfers
+Building needs Rust 1.93 or later, as in Ubuntu 26.04 (the Homebrew formula
+uses its own; the herdr plugin and cargo use yours). File transfers
 need [lrzsz](https://ohse.de/uwe/software/lrzsz.html) (`sz`/`rz`;
 `brew install lrzsz` or `apt install lrzsz`); the herdr plugin needs herdr
 0.9.5 or later.

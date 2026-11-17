@@ -5,7 +5,7 @@ members = [".", "bench"]
 name = "xcomm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 description = "Fast serial terminal with an agent control interface and a herdr plugin"
 repository = "https://github.com/cantona/xcomm"
@@ -34,7 +34,7 @@ include = [
 [dependencies]
 lexopt = "0.3.2"
 memchr = "2.8.3"
-libc = "0.2.191"
+libc = "0.2.186"
 rustix = { version = "1.1.6", features = ["termios", "pipe", "fs", "process", "event", "net"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

@@ -44,7 +44,7 @@ jobs:
           fi
       - name: Rust
         run: |
-          # As scripts/check.sh reads it: 1.96 is toolchain 1.96.0.
+          # As scripts/check.sh reads it: 1.93 is toolchain 1.93.0.
           MSRV=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           case $MSRV in *.*.*) ;; *.*) MSRV=$MSRV.0 ;; *) echo "bad rust-version '$MSRV'"; exit 1 ;; esac
           rustup toolchain install "$RUST" --profile minimal --component clippy,rustfmt
