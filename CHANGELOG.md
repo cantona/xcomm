@@ -14,6 +14,8 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- `xcomm doctor` looks for `xcomm-wait` beside the binary a link on PATH leads
+  to, where `ctl wait` and `ctl run` look for it, not beside the link.
 - Opening a port through a link that udev moves between the lock and the open
   now fails ("changed while being opened") instead of holding the lock of one
   device while the session runs on another.

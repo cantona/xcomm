@@ -545,6 +545,23 @@ fn doctor_reports_an_install_and_a_broken_link() {
     );
     assert!(out.ends_with("1 problem\n"), "{out}");
     assert_eq!(o.status.code(), Some(1));
+    // A link on PATH to the binaries elsewhere: xcomm-wait is looked for
+    // beside the binary, where ctl wait and run look, not beside the link.
+    let linked = h.home().join("linkbin");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(bin.join("xcomm"), linked.join("xcomm")).unwrap();
+    let path2 = format!(
+        "{}:{}:{}",
+        h.root.join("bin").display(),
+        linked.display(),
+        h.root.join("tools").display()
+    );
+    let o = h.run("doctor", &[("FAKE_LIST", NONE), ("PATH", &path2)]);
+    assert!(
+        !stdout(&o).contains("xcomm-wait is missing"),
+        "{}",
+        stdout(&o)
+    );
     // Without xcomm-wait beside it, ctl wait and run cannot work.
     std::fs::remove_file(bin.join("xcomm-wait")).unwrap();
     let o = h.run("doctor", &[("FAKE_LIST", NONE), ("PATH", &path)]);

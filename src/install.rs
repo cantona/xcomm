@@ -621,7 +621,10 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
         lines.push("binary: no xcomm on PATH".to_string());
     }
     for (p, v) in &found {
-        let wait = p.with_file_name(crate::ctl::WAIT_HELPER);
+        // Where xcomm looks for it: beside the binary a link on PATH
+        // leads to, not beside the link.
+        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        let wait = real.with_file_name(crate::ctl::WAIT_HELPER);
         lines.push(format!("binary: {} ({v})", p.display()));
         if !executable(&wait) {
             problems.push(format!(
