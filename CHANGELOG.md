@@ -14,6 +14,8 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- A break a client asks for that the driver refuses no longer leaves the port
+  without its flow control (`--flow rts` or `xon`) for the rest of the session.
 - `ctl run` and `ctl read`: the `end=`/`next=` line no longer runs on from
   output that does not end its line (`6.1+end=70`) where stderr goes to
   the same terminal or stream as stdout; stdout itself is unchanged.

@@ -655,14 +655,29 @@ impl Port {
     pub fn set_break(&self, on: bool) -> io::Result<()> {
         let flow = self.settings.get().flow;
         if on {
+            let mut saved = None;
             if flow != Flow::None {
                 let mut free = tcgetattr(&self.fd)?;
+                saved = Some(free.clone());
                 free.control_modes.remove(ControlModes::CRTSCTS);
                 free.input_modes.remove(InputModes::IXON);
                 self.write_termios(&mut free)?;
             }
-            return ioctl_none(self.fd(), libc::TIOCSBRK as libc::c_ulong)
-                .map_err(|e| io::Error::new(e.kind(), format!("break not sent: {e}")));
+            let Err(e) = ioctl_none(self.fd(), libc::TIOCSBRK as libc::c_ulong) else {
+                return Ok(());
+            };
+            // No break to end, so no set_break(false) will come: flow
+            // control goes back on now, or the port is left without it.
+            let restored = saved.map_or(Ok(()), |mut t| self.write_termios(&mut t));
+            return Err(match restored {
+                Ok(()) => io::Error::new(e.kind(), format!("break not sent: {e}")),
+                Err(r) => io::Error::new(
+                    e.kind(),
+                    format!(
+                        "break not sent: {e}; flow control could not be restored either: {r}"
+                    ),
+                ),
+            });
         }
         let cleared = ioctl_none(self.fd(), libc::TIOCCBRK as libc::c_ulong);
         let restored = if flow == Flow::None {
