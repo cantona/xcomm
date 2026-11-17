@@ -11,7 +11,8 @@ use rustix::event::{PollFd, PollFlags, poll};
 
 use super::outq::OutQueue;
 use super::{
-    CommandIo, CommandOutcome, Control, ExitReason, STALL, SessionError, Signaled, on_signals,
+    CommandIo, CommandOutcome, Control, ExitReason, STALL, SessionError, Signaled,
+    on_signals,
 };
 use crate::capture::Capture;
 use crate::cli::{LineSettings, PrefixChoice, TermOpts};
@@ -404,17 +405,17 @@ struct View<'v> {
 impl ctl::server::Session for View<'_> {
     fn status(&self) -> proto::Status {
         let settings = self.port.map(|p| proto::SettingsView::of(&p.settings()));
-        let modem = self
-            .port
-            .and_then(|p| p.modem_lines().ok())
-            .map(|m| proto::ModemView {
-                dtr: m.dtr,
-                rts: m.rts,
-                cts: m.cts,
-                dsr: m.dsr,
-                dcd: m.dcd,
-                ri: m.ri,
-            });
+        let modem =
+            self.port
+                .and_then(|p| p.modem_lines().ok())
+                .map(|m| proto::ModemView {
+                    dtr: m.dtr,
+                    rts: m.rts,
+                    cts: m.cts,
+                    dsr: m.dsr,
+                    dcd: m.dcd,
+                    ri: m.ri,
+                });
         proto::Status {
             device: self.names.device.clone(),
             tty: self.names.tty.clone(),
@@ -489,7 +490,9 @@ fn write_all_to(fd: BorrowedFd<'_>, signals: &SignalPipe, mut bytes: &[u8]) -> u
                     PollFd::new(&fd, PollFlags::OUT),
                     PollFd::new(&signal_fd, PollFlags::IN),
                 ];
-                if poll(&mut fds, None).is_err() || fds[1].revents().contains(PollFlags::IN) {
+                if poll(&mut fds, None).is_err()
+                    || fds[1].revents().contains(PollFlags::IN)
+                {
                     return all - bytes.len();
                 }
             }
@@ -502,7 +505,12 @@ fn write_all_to(fd: BorrowedFd<'_>, signals: &SignalPipe, mut bytes: &[u8]) -> u
 /// Writes what the terminal takes until `until` (now: what it has room
 /// for), in pieces small enough not to block on it, and returns how much.
 /// A signal waiting ends it.
-fn write_within(fd: BorrowedFd<'_>, signals: &SignalPipe, bytes: &[u8], until: Instant) -> usize {
+fn write_within(
+    fd: BorrowedFd<'_>,
+    signals: &SignalPipe,
+    bytes: &[u8],
+    until: Instant,
+) -> usize {
     let mut done = 0;
     let signal_fd = signals.fd();
     for piece in bytes.chunks(64) {
@@ -510,9 +518,10 @@ fn write_within(fd: BorrowedFd<'_>, signals: &SignalPipe, bytes: &[u8], until: I
             PollFd::new(&fd, PollFlags::OUT),
             PollFd::new(&signal_fd, PollFlags::IN),
         ];
-        let wait =
-            rustix::event::Timespec::try_from(until.saturating_duration_since(Instant::now()))
-                .unwrap_or_default();
+        let wait = rustix::event::Timespec::try_from(
+            until.saturating_duration_since(Instant::now()),
+        )
+        .unwrap_or_default();
         let ready = matches!(poll(&mut fds, Some(&wait)), Ok(n) if n > 0)
             && fds[0].revents().contains(PollFlags::OUT)
             && !fds[1].revents().contains(PollFlags::IN);
@@ -569,7 +578,9 @@ const MARKER_LOOK: u64 = 64 << 10;
 /// bytes of the send, cut between characters.
 fn marker_line(bytes: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(b"\r\n[ctl] ");
-    let hex = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(format!("\\x{v:02x}").as_bytes());
+    let hex = |out: &mut Vec<u8>, v: u32| {
+        out.extend_from_slice(format!("\\x{v:02x}").as_bytes())
+    };
     let mut shown = 0;
     'all: for chunk in bytes.utf8_chunks() {
         for c in chunk.valid().chars() {
@@ -640,12 +651,14 @@ impl<'a> Live<'a> {
             if self.hold.is_some() {
                 return Ok(CommandOutcome::Continue);
             }
-            let Some((wait_id, action)) = self.server.as_mut().and_then(|s| s.pending_action())
+            let Some((wait_id, action)) =
+                self.server.as_mut().and_then(|s| s.pending_action())
             else {
                 self.action_wait = None;
                 return Ok(CommandOutcome::Continue);
             };
-            let on_line = !matches!(action, Action::CaptureStart(_) | Action::CaptureStop);
+            let on_line =
+                !matches!(action, Action::CaptureStart(_) | Action::CaptureStop);
             // A wait is the action's it began for, not another client's.
             if self.action_wait.as_ref().is_some_and(|w| w.id != wait_id) {
                 self.action_wait = None;
@@ -657,7 +670,8 @@ impl<'a> Live<'a> {
                 return Ok(CommandOutcome::Continue);
             }
             self.action_wait = None;
-            let Some((id, action)) = self.server.as_mut().and_then(|s| s.next_action()) else {
+            let Some((id, action)) = self.server.as_mut().and_then(|s| s.next_action())
+            else {
                 return Ok(CommandOutcome::Continue);
             };
             let result = match (action, &queue, self.port) {
@@ -721,7 +735,10 @@ impl<'a> Live<'a> {
                             if let Some(s) = self.server.as_mut() {
                                 s.finish_action(
                                     id,
-                                    Err((ctl::code::FAILED, "the session is ending".into())),
+                                    Err((
+                                        ctl::code::FAILED,
+                                        "the session is ending".into(),
+                                    )),
                                 );
                             }
                             return Ok(CommandOutcome::Exit(exit));
@@ -735,7 +752,10 @@ impl<'a> Live<'a> {
         }
     }
 
-    fn ctl_capture_start(&mut self, path: &Path) -> Result<serde_json::Value, (u8, String)> {
+    fn ctl_capture_start(
+        &mut self,
+        path: &Path,
+    ) -> Result<serde_json::Value, (u8, String)> {
         if let Some(c) = &self.capture {
             return Err((
                 ctl::code::FAILED,
@@ -1182,7 +1202,10 @@ impl<'a> Live<'a> {
         }
     }
 
-    fn toggle_capture(&mut self, io: &mut CommandIo<'_>) -> Result<CommandOutcome, SessionError> {
+    fn toggle_capture(
+        &mut self,
+        io: &mut CommandIo<'_>,
+    ) -> Result<CommandOutcome, SessionError> {
         if let Some(c) = self.capture.take() {
             let (path, total) = (c.path().to_path_buf(), c.total());
             match c.close() {
@@ -1231,7 +1254,8 @@ impl<'a> Live<'a> {
             tv_sec: 0,
             tv_nsec: 100_000_000,
         };
-        if matches!(poll(&mut fds, Some(&wait)), Ok(1)) && fds[0].revents().contains(PollFlags::OUT)
+        if matches!(poll(&mut fds, Some(&wait)), Ok(1))
+            && fds[0].revents().contains(PollFlags::OUT)
         {
             let _ = rustix::io::write(fd, if on { WRAP_ON } else { WRAP_OFF });
         }
@@ -1495,7 +1519,12 @@ impl<'a> Live<'a> {
         io: &mut CommandIo<'_>,
     ) -> Result<CommandOutcome, SessionError> {
         let current = port.settings();
-        let line = match self.prompt(&format!("baud [{}]: ", current.baud), BAUD_MAX, false, io)? {
+        let line = match self.prompt(
+            &format!("baud [{}]: ", current.baud),
+            BAUD_MAX,
+            false,
+            io,
+        )? {
             Prompt::Line(line) => String::from_utf8_lossy(&line).into_owned(),
             Prompt::Cancelled => return Ok(CommandOutcome::Continue),
             Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
@@ -1564,7 +1593,9 @@ impl<'a> Live<'a> {
         let mut files = Vec::new();
         if let Some(text) = ask {
             match self.prompt(text, PATH_MAX, true, io)? {
-                Prompt::Line(line) if line.is_empty() => return Ok(CommandOutcome::Continue),
+                Prompt::Line(line) if line.is_empty() => {
+                    return Ok(CommandOutcome::Continue);
+                }
                 Prompt::Line(line) => files.push(PathBuf::from(OsString::from_vec(line))),
                 Prompt::Cancelled => return Ok(CommandOutcome::Continue),
                 Prompt::Exit(exit) => return Ok(CommandOutcome::Exit(exit)),
@@ -1600,7 +1631,8 @@ impl<'a> Live<'a> {
         // Headless, its progress would fill a pipe no one reads.
         let progress = !self.headless;
         let mut transfer =
-            match Transfer::start(port, run.proto, run.dir, run.files, run.cwd, progress) {
+            match Transfer::start(port, run.proto, run.dir, run.files, run.cwd, progress)
+            {
                 Ok(t) => t,
                 Err(e) => {
                     self.process_output(false);
@@ -1632,7 +1664,8 @@ impl<'a> Live<'a> {
         );
         self.transferring = true;
         self.update_herdr();
-        let ended = self.wait_transfer(&mut transfer, run.stdin, run.typed, run.requester);
+        let ended =
+            self.wait_transfer(&mut transfer, run.stdin, run.typed, run.requester);
         self.transferring = false;
         self.update_herdr();
         if let Err(e) = transfer.release() {
@@ -1681,7 +1714,10 @@ impl<'a> Live<'a> {
             match transfer.try_finish() {
                 // Done before the abort took effect: done.
                 Ok(Some(_)) => {
-                    return Ok(Ok((true, format!("transfer done: {}", transfer.program()))));
+                    return Ok(Ok((
+                        true,
+                        format!("transfer done: {}", transfer.program()),
+                    )));
                 }
                 Err(XferError::Failed { .. }) if aborted.is_some() => {
                     return Ok(Ok((false, "transfer aborted".into())));
@@ -1734,7 +1770,9 @@ impl<'a> Live<'a> {
             let timeout = due.map(|due| due.saturating_duration_since(Instant::now()));
             match super::poll_entries(&mut polled, timeout) {
                 Ok(()) => {}
-                Err(rustix::io::Errno::INTR) => polled.iter_mut().for_each(|e| e.revents = 0),
+                Err(rustix::io::Errno::INTR) => {
+                    polled.iter_mut().for_each(|e| e.revents = 0)
+                }
                 Err(e) => return Err(SessionError(format!("poll: {e}"))),
             }
             // The program has the port: clients cannot send meanwhile, and
@@ -1763,7 +1801,9 @@ impl<'a> Live<'a> {
                 if let Signaled::Exit(exit) = signaled {
                     transfer.abort();
                     let deadline = Instant::now() + EXIT_GRACE;
-                    while matches!(transfer.try_finish(), Ok(None)) && Instant::now() < deadline {
+                    while matches!(transfer.try_finish(), Ok(None))
+                        && Instant::now() < deadline
+                    {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     transfer.kill();
@@ -1780,10 +1820,11 @@ impl<'a> Live<'a> {
                         let mut rest = &buf[..n];
                         while !rest.is_empty() {
                             let mut command = None;
-                            let used = keys.feed(rest, Instant::now(), &mut |a| match a {
-                                KeyAction::Forward(b) => abort |= has_ctrl_c(b),
-                                KeyAction::Command(c) => command = Some(c),
-                            });
+                            let used =
+                                keys.feed(rest, Instant::now(), &mut |a| match a {
+                                    KeyAction::Forward(b) => abort |= has_ctrl_c(b),
+                                    KeyAction::Command(c) => command = Some(c),
+                                });
                             rest = &rest[used..];
                             abort |= matches!(command, Some(b'x' | b'q'));
                         }
@@ -1953,7 +1994,10 @@ impl<'a> Live<'a> {
     /// protocol, modifyOtherKeys) counts as its byte; any other key (an
     /// arrow, an Alt-letter) is ignored whole, so none of it is left over for
     /// the device.
-    fn escape_in_prompt(&mut self, io: &mut CommandIo<'_>) -> Result<EscInPrompt, SessionError> {
+    fn escape_in_prompt(
+        &mut self,
+        io: &mut CommandIo<'_>,
+    ) -> Result<EscInPrompt, SessionError> {
         let mut seq = [0u8; HELD_MAX];
         seq[0] = ESC;
         let mut len = 1;
@@ -1974,7 +2018,9 @@ impl<'a> Live<'a> {
                 None => match self.read_key(io, Some(self.prefix_time))? {
                     Key::Byte(b) => b,
                     Key::Exit(exit) => return Ok(EscInPrompt::Exit(exit)),
-                    Key::Timeout | Key::Resumed | Key::Gone => return Ok(EscInPrompt::Byte(ESC)),
+                    Key::Timeout | Key::Resumed | Key::Gone => {
+                        return Ok(EscInPrompt::Byte(ESC));
+                    }
                 },
             };
             len += 1;
@@ -1989,7 +2035,8 @@ impl<'a> Live<'a> {
         timeout: Option<Duration>,
     ) -> Result<Key, SessionError> {
         let signal_fd = io.signals.fd();
-        let timeout = timeout.map(|t| rustix::event::Timespec::try_from(t).expect("fits"));
+        let timeout =
+            timeout.map(|t| rustix::event::Timespec::try_from(t).expect("fits"));
         loop {
             let mut fds = [
                 PollFd::new(&io.stdin, PollFlags::IN),
@@ -2054,7 +2101,11 @@ impl Control for Live<'_> {
         Ok(())
     }
 
-    fn command(&mut self, key: u8, io: &mut CommandIo<'_>) -> Result<CommandOutcome, SessionError> {
+    fn command(
+        &mut self,
+        key: u8,
+        io: &mut CommandIo<'_>,
+    ) -> Result<CommandOutcome, SessionError> {
         self.cr_ended = false;
         if key == ESC {
             return Ok(CommandOutcome::Continue);
@@ -2106,7 +2157,9 @@ impl Control for Live<'_> {
             }
             (Cmd::Baud, Some(port)) => return self.change_baud(port, io),
             (Cmd::Send, Some(port)) => return self.transfer(port, Direction::Send, io),
-            (Cmd::Receive, Some(port)) => return self.transfer(port, Direction::Receive, io),
+            (Cmd::Receive, Some(port)) => {
+                return self.transfer(port, Direction::Receive, io);
+            }
         }
         Ok(CommandOutcome::Continue)
     }

@@ -65,7 +65,8 @@ pub enum WatchAction {
 /// The config file; a missing one is the defaults.
 pub fn load_config(path: &Path) -> Result<WatchConfig, WatchError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => parse_config(&text).map_err(|e| WatchError(format!("{}: {e}", path.display()))),
+        Ok(text) => parse_config(&text)
+            .map_err(|e| WatchError(format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(WatchConfig::default()),
         Err(e) => Err(WatchError(format!("{}: {e}", path.display()))),
     }
@@ -180,7 +181,8 @@ impl Parser<'_> {
         {
             self.i += 1;
         }
-        (self.i > start).then(|| String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
+        (self.i > start)
+            .then(|| String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
     }
 
     /// `w` as a whole word.
@@ -258,7 +260,8 @@ impl Parser<'_> {
 pub fn diff(before: &[PortInfo], after: &[PortInfo]) -> (Vec<PortInfo>, Vec<PortInfo>) {
     // A field one list has and the other not yet (udev makes the by-id
     // link after the node) does not make another adapter.
-    let agree = |x: &Option<String>, y: &Option<String>| x.is_none() || y.is_none() || x == y;
+    let agree =
+        |x: &Option<String>, y: &Option<String>| x.is_none() || y.is_none() || x == y;
     let same = |a: &PortInfo, b: &PortInfo| {
         a.tty == b.tty && agree(&a.by_id, &b.by_id) && agree(&a.vid_pid, &b.vid_pid)
     };
@@ -320,7 +323,9 @@ fn glob(pat: &str, s: &str) -> bool {
 pub fn state_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, WatchError> {
     let base = env("HERDR_PLUGIN_STATE_DIR")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| WatchError("HERDR_PLUGIN_STATE_DIR is not set (run from herdr)".into()))?;
+        .ok_or_else(|| {
+            WatchError("HERDR_PLUGIN_STATE_DIR is not set (run from herdr)".into())
+        })?;
     let server = env("HERDR_SOCKET_PATH")
         .filter(|s| !s.is_empty())
         .and_then(|s| {
@@ -352,14 +357,16 @@ pub fn act(
         "HERDR_SOCKET_PATH",
         "XCOMM_WATCH_ROOT",
     ] {
-        if let Some(v) = env(var).filter(|v| !v.is_empty() && !Path::new(v).is_absolute()) {
+        if let Some(v) = env(var).filter(|v| !v.is_empty() && !Path::new(v).is_absolute())
+        {
             return Err(WatchError(format!(
                 "{var} must be an absolute path, not '{v}'"
             )));
         }
     }
     let dir = state_dir(env)?;
-    std::fs::create_dir_all(&dir).map_err(|e| WatchError(format!("{}: {e}", dir.display())))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| WatchError(format!("{}: {e}", dir.display())))?;
     let files = Files::new(&dir);
     match action {
         WatchAction::Start => start(&files, env),
@@ -440,7 +447,9 @@ const LOCK_TRIES: usize = 10;
 const LOCK_RETRY: Duration = Duration::from_millis(20);
 
 /// The herdr server notifications go to; without one there is no point.
-fn herdr(env: &dyn Fn(&str) -> Option<String>) -> Result<crate::herdr::Herdr, WatchError> {
+fn herdr(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<crate::herdr::Herdr, WatchError> {
     crate::herdr::Herdr::server_from_env(env)
         .ok_or_else(|| WatchError("HERDR_SOCKET_PATH is not set (run from herdr)".into()))
 }
@@ -468,7 +477,10 @@ fn already(files: &Files) -> String {
 }
 
 /// Forks a watcher that holds the lock for as long as it runs.
-fn start(files: &Files, env: &dyn Fn(&str) -> Option<String>) -> Result<String, WatchError> {
+fn start(
+    files: &Files,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, WatchError> {
     herdr(env)?;
     let lock = files.lock()?;
     if !try_lock(&lock)? {
@@ -489,8 +501,8 @@ fn start(files: &Files, env: &dyn Fn(&str) -> Option<String>) -> Result<String, 
         .append(true)
         .open(&files.log)
         .map_err(|e| WatchError(format!("{}: {e}", files.log.display())))?;
-    let null =
-        std::fs::File::open("/dev/null").map_err(|e| WatchError(format!("/dev/null: {e}")))?;
+    let null = std::fs::File::open("/dev/null")
+        .map_err(|e| WatchError(format!("/dev/null: {e}")))?;
     // SAFETY: the process is single-threaded here, so the child may go on
     // running Rust code.
     match unsafe { libc::fork() } {
@@ -545,8 +557,8 @@ fn stop(files: &Files) -> Result<String, WatchError> {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let target =
-        rustix::process::Pid::from_raw(pid).ok_or_else(|| WatchError(format!("bad pid {pid}")))?;
+    let target = rustix::process::Pid::from_raw(pid)
+        .ok_or_else(|| WatchError(format!("bad pid {pid}")))?;
     rustix::process::kill_process(target, rustix::process::Signal::TERM)
         .map_err(|e| WatchError(format!("kill {pid}: {e}")))?;
     let until = Instant::now() + STOP_WAIT;
@@ -618,8 +630,9 @@ fn watch(env: &dyn Fn(&str) -> Option<String>) -> Result<(), WatchError> {
         Some(path) => load_config(&path)?,
         None => WatchConfig::default(),
     };
-    let signals = crate::hosttty::SignalPipe::install(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP])
-        .map_err(|e| WatchError(format!("signals: {e}")))?;
+    let signals =
+        crate::hosttty::SignalPipe::install(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP])
+            .map_err(|e| WatchError(format!("signals: {e}")))?;
     let herdr = herdr(env)?;
     let server_socket = PathBuf::from(env("HERDR_SOCKET_PATH").unwrap_or_default());
     // Looked up when wanted: a directory made after the start counts.
@@ -692,7 +705,8 @@ fn watch(env: &dyn Fn(&str) -> Option<String>) -> Result<(), WatchError> {
         };
         // Ports not announced yet as this list began: their going is not
         // announced either.
-        let unannounced_before: Vec<String> = unannounced.iter().map(|(t, _)| t.clone()).collect();
+        let unannounced_before: Vec<String> =
+            unannounced.iter().map(|(t, _)| t.clone()).collect();
         let (added, removed) = diff(&ports, &now);
         // A new port without its by-id link yet waits a little for it: an
         // ignore glob on the by-id name must see it.
@@ -731,8 +745,9 @@ fn watch(env: &dyn Fn(&str) -> Option<String>) -> Result<(), WatchError> {
             // The session now waits for its device: asked now, as the
             // list from before may predate it.
             if title == "Serial removed"
-                && let Some(pane) = crate::list::session_pane(&socket_dirs(), &p.tty, false)
-                    .or_else(|| p.herdr_pane.clone())
+                && let Some(pane) =
+                    crate::list::session_pane(&socket_dirs(), &p.tty, false)
+                        .or_else(|| p.herdr_pane.clone())
             {
                 body.push_str(&format!(", open in pane {pane}"));
             }

@@ -406,7 +406,8 @@ fn ignored_and_quiet_ports_are_logged_not_shown() {
     }
     std::fs::write(env.dir.join("root/dev/ttyUSB6"), b"").unwrap();
     let until = Instant::now() + T;
-    while !std::fs::read_to_string(&log).is_ok_and(|l| l.contains("ttyUSB6 (not shown)")) {
+    while !std::fs::read_to_string(&log).is_ok_and(|l| l.contains("ttyUSB6 (not shown)"))
+    {
         assert!(
             Instant::now() < until,
             "{:?}",

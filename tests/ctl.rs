@@ -662,7 +662,8 @@ fn closing_the_write_side_ends_a_subscription_at_once() {
 
 #[test]
 fn a_name_that_leads_to_another_device_is_not_matched_by_name() {
-    let dir = std::env::temp_dir().join(format!("xcomm-ctl-moved-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("xcomm-ctl-moved-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (d1, d2) = (support::pty(), support::pty());
@@ -1101,7 +1102,8 @@ fn an_action_read_after_its_deadline_is_not_run() {
     let deadline = xcomm::ctl::proto::now_ms() + 200;
     stream
         .write_all(
-            format!("{{\"cmd\":\"set\",\"baud\":4800,\"deadline_ms\":{deadline}}}\n").as_bytes(),
+            format!("{{\"cmd\":\"set\",\"baud\":4800,\"deadline_ms\":{deadline}}}\n")
+                .as_bytes(),
         )
         .unwrap();
     std::thread::sleep(Duration::from_millis(500));
@@ -1453,7 +1455,8 @@ fn a_client_that_cannot_be_answered_is_dropped_on_a_quiet_session() {
 fn an_unanswerable_subscriber_does_not_spin_the_session() {
     let (_dev, s, path) = start(&[]);
     let ticks = || -> u64 {
-        let stat = std::fs::read_to_string(format!("/proc/{}/stat", s.child.id())).unwrap();
+        let stat =
+            std::fs::read_to_string(format!("/proc/{}/stat", s.child.id())).unwrap();
         // utime and stime: fields 14 and 15, after the ")" of the name.
         let rest = &stat[stat.rfind(')').unwrap() + 2..];
         let f: Vec<&str> = rest.split(' ').collect();

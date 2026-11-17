@@ -73,7 +73,8 @@ fn the_manifest_is_what_herdr_takes() {
         );
         for c in action["contexts"].as_array().unwrap() {
             assert!(
-                ["global", "workspace", "tab", "pane", "selection"].contains(&c.as_str().unwrap()),
+                ["global", "workspace", "tab", "pane", "selection"]
+                    .contains(&c.as_str().unwrap()),
                 "{c}"
             );
         }
@@ -149,7 +150,8 @@ impl Root {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         };
         fake(dir.join("target/release/xcomm"), "xcomm.log", xcomm_script);
         fake(dir.join("herdr"), "herdr.log", "exit ${HERDR_RC:-0}");
@@ -265,7 +267,8 @@ fn pane_actions_act_on_the_pane_and_say_what_happened() {
         herdr,
         "plugin|pane|open|--plugin|cantona.herdr-xcomm|--entrypoint|prompt|--env|XCOMM_PROMPT=capture|--env|XCOMM_PANE=w1:p2|\n"
     );
-    let (_, xcomm, herdr) = action("capture", &[("STATUS", r#"{"capture":"/home/u/cap.txt"}"#)]);
+    let (_, xcomm, herdr) =
+        action("capture", &[("STATUS", r#"{"capture":"/home/u/cap.txt"}"#)]);
     assert!(xcomm.contains("capture|stop|"), "{xcomm}");
     assert!(
         herdr.contains("capture stopped|--body|/home/u/cap.txt (12 bytes)"),
@@ -278,7 +281,8 @@ fn pane_actions_act_on_the_pane_and_say_what_happened() {
     );
     // A prompt only opens on a session: otherwise the error is shown at
     // once, not after the answer has been typed.
-    let (code, _, herdr) = action("capture", &[("STATUS", r#"{"capture":null,"ctl":"ro"}"#)]);
+    let (code, _, herdr) =
+        action("capture", &[("STATUS", r#"{"capture":null,"ctl":"ro"}"#)]);
     assert_eq!(code, Some(1));
     assert_eq!(
         herdr,
@@ -322,7 +326,9 @@ fn pane_actions_act_on_the_pane_and_say_what_happened() {
     let (code, _, herdr) = action("open", &[]);
     assert_eq!(code, Some(0));
     assert!(
-        herdr.contains("plugin|pane|open|--plugin|cantona.herdr-xcomm|--entrypoint|picker|"),
+        herdr.contains(
+            "plugin|pane|open|--plugin|cantona.herdr-xcomm|--entrypoint|picker|"
+        ),
         "{herdr}"
     );
     let (code, _, herdr) = action("open", &[("HERDR_RC", "7")]);

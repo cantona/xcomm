@@ -132,7 +132,9 @@ fn main() -> ExitCode {
             }
         }
         Ok(Command::ShowPrefix(p)) => print(&p.describe()),
-        Ok(Command::Ctl(args)) if matches!(args.cmd, CtlCmd::Wait { .. } | CtlCmd::Run { .. }) => {
+        Ok(Command::Ctl(args))
+            if matches!(args.cmd, CtlCmd::Wait { .. } | CtlCmd::Run { .. }) =>
+        {
             exec_wait()
         }
         Ok(Command::Ctl(args)) => ExitCode::from(xcomm::ctl::client::run(&args, &env)),
@@ -147,7 +149,13 @@ fn main() -> ExitCode {
         Ok(Command::Prompt { kind, pane }) => {
             use std::os::fd::AsFd;
             let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
-            match xcomm::pick::run_prompt(kind, &pane, stdin.as_fd(), stdout.as_fd(), &env) {
+            match xcomm::pick::run_prompt(
+                kind,
+                &pane,
+                stdin.as_fd(),
+                stdout.as_fd(),
+                &env,
+            ) {
                 Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
                 Err(e) => {
                     out::report(&format!("pick: {e}"));

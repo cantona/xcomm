@@ -1,6 +1,6 @@
 use xcomm::ansi::{
-    EscapeStripper, SGR_HELD_MAX, SgrFilter, color_enabled, device_color_enabled, ends_inside,
-    term_state,
+    EscapeStripper, SGR_HELD_MAX, SgrFilter, color_enabled, device_color_enabled,
+    ends_inside, term_state,
 };
 use xcomm::cli::ColorMode;
 
@@ -171,7 +171,8 @@ fn a_control_after_esc_does_not_end_it() {
 /// again changes nothing.
 #[test]
 fn filtering_keeps_the_visible_text() {
-    let alphabet: &[u8] = b"\x1b\x1b\x1b[[]P\\m;31(B?\x07\x18\x1a\nxHNO\x7f\x80\xc3\x9b:$ X^_\r>";
+    let alphabet: &[u8] =
+        b"\x1b\x1b\x1b[[]P\\m;31(B?\x07\x18\x1a\nxHNO\x7f\x80\xc3\x9b:$ X^_\r>";
     let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
     let mut next = move |n: usize| {
         seed = seed

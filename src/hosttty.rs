@@ -8,7 +8,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
-use rustix::termios::{InputModes, OptionalActions, OutputModes, Termios, tcgetattr, tcsetattr};
+use rustix::termios::{
+    InputModes, OptionalActions, OutputModes, Termios, tcgetattr, tcsetattr,
+};
 
 /// The terminal state to restore if the process dies in raw mode.
 ///
@@ -174,7 +176,8 @@ fn install_restore_hooks() -> io::Result<()> {
                     }
                     (*PREVIOUS.0.get())[i].write(old);
                     let mut action: libc::sigaction = std::mem::zeroed();
-                    action.sa_sigaction = restore_on_fatal as *const () as libc::sighandler_t;
+                    action.sa_sigaction =
+                        restore_on_fatal as *const () as libc::sighandler_t;
                     // SA_ONSTACK: a stack overflow must run on the alternate stack.
                     action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
                     if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
@@ -223,8 +226,8 @@ pub struct RawMode {
 impl RawMode {
     pub fn enter(fd: BorrowedFd<'_>) -> io::Result<RawMode> {
         let raw_fd = fd.as_raw_fd();
-        let saved =
-            tcgetattr(fd).map_err(|e| context(e, format_args!("tcgetattr on fd {raw_fd}")))?;
+        let saved = tcgetattr(fd)
+            .map_err(|e| context(e, format_args!("tcgetattr on fd {raw_fd}")))?;
         let mut raw = saved.clone();
         raw.make_raw();
         // make_raw leaves these: IXOFF would send ^S/^Q to the terminal when
@@ -363,7 +366,8 @@ pub fn ignored(sig: libc::c_int) -> bool {
     // SAFETY: queries the disposition only.
     unsafe {
         let mut old: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
     }
 }
 
@@ -464,7 +468,8 @@ impl SignalPipe {
                 ));
             }
         }
-        let (read, write) = nonblocking_pipe().map_err(|e| context(e, "pipe for signals"))?;
+        let (read, write) =
+            nonblocking_pipe().map_err(|e| context(e, "pipe for signals"))?;
         if SIGNAL_WRITE_FD
             .compare_exchange(-1, write.as_raw_fd(), Ordering::SeqCst, Ordering::SeqCst)
             .is_err()

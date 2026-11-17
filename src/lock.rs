@@ -48,7 +48,8 @@ impl fmt::Display for LockError {
             }
             LockError::Contended { path, why } => write!(f, "{}: {why}", path.display()),
             LockError::NoLockDir { tried } => {
-                let list: Vec<String> = tried.iter().map(|p| p.display().to_string()).collect();
+                let list: Vec<String> =
+                    tried.iter().map(|p| p.display().to_string()).collect();
                 write!(
                     f,
                     "no writable lock directory (tried {}); use --no-lock to run without one",
@@ -82,7 +83,9 @@ const LOCK_DIRS: [&str; 3] = ["/var/spool/lock", "/var/lock", "/tmp"];
 /// `XCOMM_LOCK_DIR` (test-only; used as given, no fallback, so a test
 /// never touches the real lock directory) or the first writable standard
 /// directory.
-pub fn default_lock_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, LockError> {
+pub fn default_lock_dir(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, LockError> {
     if let Some(dir) = env("XCOMM_LOCK_DIR").filter(|d| !d.is_empty()) {
         let dir = PathBuf::from(dir);
         return match writable(&dir) {
@@ -176,7 +179,11 @@ impl Drop for UucpLock {
 }
 
 fn lock_path(dir: &Path, tty_name: &str) -> Result<PathBuf, LockError> {
-    if tty_name.is_empty() || tty_name == "." || tty_name == ".." || tty_name.contains('/') {
+    if tty_name.is_empty()
+        || tty_name == "."
+        || tty_name == ".."
+        || tty_name.contains('/')
+    {
         return Err(LockError::Io {
             path: dir.to_path_buf(),
             source: io::Error::new(
@@ -450,7 +457,10 @@ fn create_private(dir: &Path, tty_name: &str, pid: u32) -> io::Result<(PathBuf, 
 /// later unlink by name can remove the fresh lock. TIOCEXCL on the port is
 /// the second line of defence. Lock directories on NFS (where flock is
 /// emulated with fcntl locks) are not supported.
-pub fn acquire(dir: &Path, tty_name: &str) -> Result<(UucpLock, Option<Cleared>), LockError> {
+pub fn acquire(
+    dir: &Path,
+    tty_name: &str,
+) -> Result<(UucpLock, Option<Cleared>), LockError> {
     let path = lock_path(dir, tty_name)?;
     let io_err = |p: &Path| {
         let p = p.to_path_buf();
@@ -496,7 +506,8 @@ pub fn acquire(dir: &Path, tty_name: &str) -> Result<(UucpLock, Option<Cleared>)
         let _ = std::fs::remove_file(&tmp);
         match linked {
             Ok(()) => return Ok((UucpLock { path, file }, cleared)),
-            Err(LockError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(LockError::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
 
@@ -583,7 +594,10 @@ pub fn acquire(dir: &Path, tty_name: &str) -> Result<(UucpLock, Option<Cleared>)
                 };
                 return Err(LockError::Io {
                     path,
-                    source: io::Error::new(e.kind(), format!("cannot remove {what}: {e}{hint}")),
+                    source: io::Error::new(
+                        e.kind(),
+                        format!("cannot remove {what}: {e}{hint}"),
+                    ),
                 });
             }
             cleared = Some(stale);

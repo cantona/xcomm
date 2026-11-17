@@ -47,7 +47,9 @@ pub fn socket_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
 /// The socket directory, made 0700 if missing. One that is not a directory
 /// of this user's that only they can enter is an error: in /tmp anyone can
 /// make it first.
-pub fn make_socket_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CtlError> {
+pub fn make_socket_dir(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, CtlError> {
     let dir = socket_dir(env);
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}

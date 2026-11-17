@@ -39,7 +39,8 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
         CtlCmd::PaneFromContext => {
             let pane = context_pane(env).ok_or((
                 code::FAILED,
-                "no pane in HERDR_PLUGIN_CONTEXT_JSON (run from a herdr plugin action)".to_string(),
+                "no pane in HERDR_PLUGIN_CONTEXT_JSON (run from a herdr plugin action)"
+                    .to_string(),
             ))?;
             print_out(format!("{pane}\n").as_bytes())?;
             return Ok(code::OK);
@@ -61,8 +62,9 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
             let mut bytes = match data {
                 SendData::Text(t) => t.as_bytes().to_vec(),
                 SendData::Hex(b) => b.clone(),
-                SendData::File(p) => std::fs::read(p)
-                    .map_err(|e| (code::FAILED, format!("--file {}: {e}", p.display())))?,
+                SendData::File(p) => std::fs::read(p).map_err(|e| {
+                    (code::FAILED, format!("--file {}: {e}", p.display()))
+                })?,
             };
             bytes.extend_from_slice(ending_bytes(*ending));
             let reply = send(&mut conn, &bytes)?;
@@ -196,7 +198,10 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
             if args.json {
                 print_json(&reply)?;
             } else {
-                print_out(format!("{}\n", reply["result"].as_str().unwrap_or("done")).as_bytes())?;
+                print_out(
+                    format!("{}\n", reply["result"].as_str().unwrap_or("done"))
+                        .as_bytes(),
+                )?;
             }
         }
     }
@@ -266,7 +271,9 @@ fn action_timeout(conn: &mut Conn, hold_ms: u32) -> Result<Option<Duration>, Fai
     let queued = bits_per_second(&conn.request(&Request::Status)?).map_or(
         Duration::ZERO,
         |(bits, per_sec)| {
-            Duration::from_secs_f64(2.0 * crate::session::QUEUE_SIZE as f64 * bits / per_sec)
+            Duration::from_secs_f64(
+                2.0 * crate::session::QUEUE_SIZE as f64 * bits / per_sec,
+            )
         },
     );
     Ok(Some(
@@ -286,7 +293,8 @@ fn context_pane(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
 
 /// `file` from this client's directory: the session's is another.
 fn absolute(file: &Path) -> Result<std::path::PathBuf, Failed> {
-    std::path::absolute(file).map_err(|e| (code::FAILED, format!("{}: {e}", file.display())))
+    std::path::absolute(file)
+        .map_err(|e| (code::FAILED, format!("{}: {e}", file.display())))
 }
 
 /// JSON carries text: a name that is not UTF-8 cannot be sent.
@@ -378,13 +386,20 @@ impl Conn {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused
                     ) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    failed.get_or_insert((code::DENIED, format!("{}: {e}", sock.display())));
+                    failed.get_or_insert((
+                        code::DENIED,
+                        format!("{}: {e}", sock.display()),
+                    ));
                 }
                 Err(e) => {
-                    failed.get_or_insert((code::FAILED, format!("{}: {e}", sock.display())));
+                    failed.get_or_insert((
+                        code::FAILED,
+                        format!("{}: {e}", sock.display()),
+                    ));
                 }
             }
         }
@@ -452,12 +467,16 @@ impl Conn {
 
     /// Sends `request` and returns the reply's fields; a failed reply is
     /// an error with its code.
-    pub(super) fn request(&mut self, request: &Request) -> Result<serde_json::Value, Failed> {
+    pub(super) fn request(
+        &mut self,
+        request: &Request,
+    ) -> Result<serde_json::Value, Failed> {
         // The session does not run it once this client has given up.
         let envelope = proto::Envelope {
             request: request.clone(),
             deadline_ms: self.timeout.map(|t| {
-                proto::now_ms().saturating_add(u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                proto::now_ms()
+                    .saturating_add(u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
             }),
         };
         let mut line = serde_json::to_vec(&envelope).expect("a request serializes");
@@ -552,7 +571,8 @@ fn read_reply(
 }
 
 pub(super) fn print_out(bytes: &[u8]) -> Result<(), Failed> {
-    crate::out::stdout(bytes).map_err(|e| (code::FAILED, format!("cannot write to stdout: {e}")))
+    crate::out::stdout(bytes)
+        .map_err(|e| (code::FAILED, format!("cannot write to stdout: {e}")))
 }
 
 pub(super) fn print_json(v: &serde_json::Value) -> Result<(), Failed> {
@@ -571,7 +591,9 @@ fn print_status(v: &serde_json::Value) -> Result<(), Failed> {
     let modem = match &v["modem"] {
         serde_json::Value::Object(m) => ["dtr", "rts", "cts", "dsr", "dcd", "ri"]
             .iter()
-            .map(|k| format!("{}={}", k.to_uppercase(), if m[*k] == true { 1 } else { 0 }))
+            .map(|k| {
+                format!("{}={}", k.to_uppercase(), if m[*k] == true { 1 } else { 0 })
+            })
             .collect::<Vec<_>>()
             .join(" "),
         _ => "-".into(),

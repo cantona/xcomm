@@ -62,7 +62,8 @@ fn sigterm_exits_cleanly_and_restores_the_terminal() {
 #[test]
 fn terminal_hangup_ends_the_session() {
     let (_dev, mut s) = start(&[]);
-    let support::Pty { master, slave, .. } = std::mem::replace(&mut s.host, support::pty());
+    let support::Pty { master, slave, .. } =
+        std::mem::replace(&mut s.host, support::pty());
     drop(master);
     drop(slave);
     assert!(s.wait_exit(T).success());
@@ -199,7 +200,8 @@ fn hangup_while_stopped_ends_the_session_cleanly() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // Closing the terminal sends SIGHUP and SIGCONT to the session.
-    let support::Pty { master, slave, .. } = std::mem::replace(&mut s.host, support::pty());
+    let support::Pty { master, slave, .. } =
+        std::mem::replace(&mut s.host, support::pty());
     drop(master);
     drop(slave);
     assert!(s.wait_exit(T).success());
@@ -295,20 +297,24 @@ fn hangup_while_the_device_streams_exits_cleanly() {
         // Non-blocking: once xcomm is gone nobody drains the pty, and a
         // blocking write would never return.
         let fl = rustix::fs::fcntl_getfl(master.as_fd()).unwrap();
-        rustix::fs::fcntl_setfl(master.as_fd(), fl | rustix::fs::OFlags::NONBLOCK).unwrap();
+        rustix::fs::fcntl_setfl(master.as_fd(), fl | rustix::fs::OFlags::NONBLOCK)
+            .unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let feeding = stop.clone();
         let feeder = std::thread::spawn(move || {
             while !feeding.load(std::sync::atomic::Ordering::Relaxed) {
                 match rustix::io::write(master.as_fd(), &[0x43u8; 4096]) {
                     Ok(_) => {}
-                    Err(rustix::io::Errno::AGAIN) => std::thread::sleep(Duration::from_millis(1)),
+                    Err(rustix::io::Errno::AGAIN) => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
                     Err(_) => break,
                 }
             }
         });
         std::thread::sleep(Duration::from_millis(100));
-        let support::Pty { master, slave, .. } = std::mem::replace(&mut s.host, support::pty());
+        let support::Pty { master, slave, .. } =
+            std::mem::replace(&mut s.host, support::pty());
         drop(master);
         drop(slave);
         let status = s.wait_exit(T);
@@ -419,7 +425,8 @@ fn piped_input_reaches_the_device_complete_before_exit() {
                 &dev.master,
                 rustix::event::PollFlags::IN,
             )];
-            let ts = rustix::event::Timespec::try_from(Duration::from_millis(100)).unwrap();
+            let ts =
+                rustix::event::Timespec::try_from(Duration::from_millis(100)).unwrap();
             if rustix::event::poll(&mut fds, Some(&ts)).unwrap() > 0 {
                 match rustix::io::read(dev.master.as_fd(), &mut buf) {
                     Ok(n) => got.extend_from_slice(&buf[..n]),
@@ -499,7 +506,12 @@ fn device_output_with(extra: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
     let path = dev.slave_path.to_str().unwrap().to_string();
     let mut args: Vec<&str> = extra.to_vec();
     args.push(&path);
-    let s = support::spawn_with_env(env!("CARGO_BIN_EXE_xcomm"), &args, &lock_dir("color"), env);
+    let s = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &args,
+        &lock_dir("color"),
+        env,
+    );
     read_until(s.host.master.as_fd(), b"\r\n", T);
     write_all(dev.master.as_fd(), COLORED);
     read_until(s.host.master.as_fd(), b"end", T)

@@ -9,7 +9,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::proto::{self, ModemLine, ModemOp, Request, SettingsPatch, Status, XferDir, XferProto};
+use super::proto::{
+    self, ModemLine, ModemOp, Request, SettingsPatch, Status, XferDir, XferProto,
+};
 use super::{CtlError, CtlMode, code};
 use crate::ring::Ring;
 
@@ -318,7 +320,8 @@ impl Client {
         if readable && !self.eof && (!self.busy() || hup) && !self.take_input(hup) {
             self.eof = true;
         }
-        if !self.unattended && (hup || (revents == 0 && was_waiting)) && self.peer_gone() {
+        if !self.unattended && (hup || (revents == 0 && was_waiting)) && self.peer_gone()
+        {
             // What it was waiting for is not wanted now; what it sent
             // before closing still runs, so the rest of its requests are
             // read first (they are in the socket until then).
@@ -346,7 +349,11 @@ impl Client {
             self.flush();
             // A reply written whole frees the client for a request already
             // here, which no event would announce.
-            if self.dead || self.busy() || self.cursor.is_some() || self.line_end().is_none() {
+            if self.dead
+                || self.busy()
+                || self.cursor.is_some()
+                || self.line_end().is_none()
+            {
                 break;
             }
         }
@@ -356,7 +363,10 @@ impl Client {
         // Nothing can be written to it and it may never close: once what
         // it sent has run, it is only holding a place. A subscriber runs no
         // more requests, and nothing it subscribed to can reach it.
-        if self.unwritable && !self.busy() && (self.cursor.is_some() || !self.has_request()) {
+        if self.unwritable
+            && !self.busy()
+            && (self.cursor.is_some() || !self.has_request())
+        {
             self.dead = true;
             return;
         }
@@ -519,11 +529,15 @@ impl Client {
                 cwd,
             } => {
                 let want = match (dir, xproto) {
-                    (XferDir::Send, _) if files.is_empty() => Some("xfer send needs a file"),
+                    (XferDir::Send, _) if files.is_empty() => {
+                        Some("xfer send needs a file")
+                    }
                     (XferDir::Recv, XferProto::Xmodem) if files.len() != 1 => {
                         Some("xfer recv xmodem needs one file name")
                     }
-                    (XferDir::Recv, XferProto::Zmodem | XferProto::Ymodem) if !files.is_empty() => {
+                    (XferDir::Recv, XferProto::Zmodem | XferProto::Ymodem)
+                        if !files.is_empty() =>
+                    {
                         Some("the sender names the files: xfer recv takes none")
                     }
                     _ => None,
@@ -532,7 +546,8 @@ impl Client {
                     return self.reply(proto::err(code::USAGE, why));
                 }
                 if !Path::new(&cwd).is_absolute() {
-                    return self.reply(proto::err(code::USAGE, "xfer needs an absolute cwd"));
+                    return self
+                        .reply(proto::err(code::USAGE, "xfer needs an absolute cwd"));
                 }
                 self.act(
                     mode,
@@ -582,9 +597,14 @@ impl CtlServer {
     /// Listens on the socket for `tty_name` in `dir` (made and checked
     /// already). A socket left by a session that is gone is replaced; one
     /// a live session answers on is an error.
-    pub fn bind(dir: &Path, tty_name: &str, mode: CtlMode) -> Result<CtlServer, CtlError> {
+    pub fn bind(
+        dir: &Path,
+        tty_name: &str,
+        mode: CtlMode,
+    ) -> Result<CtlServer, CtlError> {
         let path = super::path::socket_path(dir, tty_name);
-        let failed = |e: io::Error| CtlError(format!("control socket {}: {e}", path.display()));
+        let failed =
+            |e: io::Error| CtlError(format!("control socket {}: {e}", path.display()));
         let listener = match UnixListener::bind(&path) {
             Ok(l) => l,
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
@@ -599,7 +619,8 @@ impl CtlServer {
             }
             Err(e) => return Err(failed(e)),
         };
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(failed)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(failed)?;
         listener.set_nonblocking(true).map_err(failed)?;
         let m = std::fs::symlink_metadata(&path).map_err(failed)?;
         Ok(CtlServer {
@@ -652,7 +673,11 @@ impl CtlServer {
     }
 
     /// Answers client `id`'s action, if the client is still there.
-    pub fn finish_action(&mut self, id: u64, result: Result<serde_json::Value, (u8, String)>) {
+    pub fn finish_action(
+        &mut self,
+        id: u64,
+        result: Result<serde_json::Value, (u8, String)>,
+    ) {
         if let Some(c) = self.clients.iter_mut().find(|c| c.id == id) {
             c.awaiting = false;
             c.reply(match result {
@@ -703,7 +728,11 @@ impl CtlServer {
     /// Appends what to poll: the listener, then each client, in the order
     /// [`serve`](Self::serve) takes their results. Returns when the server
     /// wants a pass with no event.
-    pub fn poll_fds(&self, ring_end: u64, out: &mut Vec<libc::pollfd>) -> Option<Instant> {
+    pub fn poll_fds(
+        &self,
+        ring_end: u64,
+        out: &mut Vec<libc::pollfd>,
+    ) -> Option<Instant> {
         let paused = self.accept_paused.filter(|&t| Instant::now() < t);
         let listen = if paused.is_some() { 0 } else { libc::POLLIN };
         out.push(pollfd(self.listener.as_raw_fd(), listen));
@@ -720,10 +749,9 @@ impl CtlServer {
         // A client that has closed is polled for nothing, so a request of
         // its own that is already read needs a pass of its own to run in;
         // so does dropping one that cannot be answered.
-        let ready = self
-            .clients
-            .iter()
-            .any(|c| !c.busy() && (c.unwritable || (c.cursor.is_none() && c.has_request())));
+        let ready = self.clients.iter().any(|c| {
+            !c.busy() && (c.unwritable || (c.cursor.is_none() && c.has_request()))
+        });
         if ready { Some(Instant::now()) } else { paused }
     }
 
@@ -804,7 +832,9 @@ impl Drop for CtlServer {
     fn drop(&mut self) {
         // Only the file this server made: another session may have
         // replaced it since.
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.file) {
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|m| (m.dev(), m.ino()) == self.file)
+        {
             let _ = std::fs::remove_file(&self.path);
         }
     }

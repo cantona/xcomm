@@ -88,7 +88,8 @@ pub fn dropped_line(at: u64) -> String {
     format!("{DROPPED_HEAD}{at}{DROPPED_TAIL}")
 }
 
-const DROPPED_HEAD: &str = "\n{\"ok\":false,\"code\":9,\"error\":\"subscriber too slow at offset ";
+const DROPPED_HEAD: &str =
+    "\n{\"ok\":false,\"code\":9,\"error\":\"subscriber too slow at offset ";
 const DROPPED_TAIL: &str = "\"}\n";
 
 /// Where `bytes` ends with a `dropped_line`, and its offset.
@@ -356,7 +357,8 @@ fn line(v: &serde_json::Value) -> Vec<u8> {
     out
 }
 
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

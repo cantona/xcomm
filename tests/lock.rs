@@ -201,7 +201,8 @@ fn default_lock_dir_honours_the_test_hook_and_checks_it() {
     let ds = d.to_str().unwrap().to_string();
     let env = move |k: &str| (k == "XCOMM_LOCK_DIR").then(|| ds.clone());
     assert_eq!(default_lock_dir(&env).unwrap(), *d);
-    let missing = |k: &str| (k == "XCOMM_LOCK_DIR").then(|| "/nonexistent/xcomm".to_string());
+    let missing =
+        |k: &str| (k == "XCOMM_LOCK_DIR").then(|| "/nonexistent/xcomm".to_string());
     assert!(default_lock_dir(&missing).is_err());
     let none = |_: &str| None;
     #[cfg(not(target_os = "macos"))]
@@ -219,9 +220,11 @@ fn default_lock_dir_honours_the_test_hook_and_checks_it() {
         Err(LockError::NoLockDir { tried }) => {
             assert_eq!(tried.len(), standard.len());
             assert!(
-                standard
-                    .iter()
-                    .all(|d| rustix::fs::access(*d, rustix::fs::Access::WRITE_OK).is_err())
+                standard.iter().all(|d| rustix::fs::access(
+                    *d,
+                    rustix::fs::Access::WRITE_OK
+                )
+                .is_err())
             );
         }
         Err(e) => panic!("{e}"),
@@ -294,7 +297,9 @@ fn empty_lock_file_is_contention_while_young_and_cleared_when_old() {
     let path = d.join("LCK..ttyEMPTY");
     fs::write(&path, "").unwrap();
     match acquire(&d, "ttyEMPTY") {
-        Err(LockError::Contended { why, .. }) => assert!(why.contains("being written"), "{why}"),
+        Err(LockError::Contended { why, .. }) => {
+            assert!(why.contains("being written"), "{why}")
+        }
         other => panic!("{other:?}"),
     }
     assert!(matches!(
@@ -359,7 +364,11 @@ fn concurrent_acquirers_of_one_stale_lock_get_exactly_one_lock() {
                 // Threads share the pid, so a loser may also see its own pid.
                 let own_pid = e.to_string().contains("own pid");
                 assert!(
-                    own_pid || matches!(e, LockError::Held { .. } | LockError::Contended { .. }),
+                    own_pid
+                        || matches!(
+                            e,
+                            LockError::Held { .. } | LockError::Contended { .. }
+                        ),
                     "{e}"
                 );
             }
@@ -515,7 +524,9 @@ fn holder_reports_a_held_flock_with_an_invisible_pid() {
     )
     .unwrap();
     match holder(&d, "ttyNS") {
-        Err(LockError::Contended { why, .. }) => assert!(why.contains("not visible here"), "{why}"),
+        Err(LockError::Contended { why, .. }) => {
+            assert!(why.contains("not visible here"), "{why}")
+        }
         other => panic!("{other:?}"),
     }
 }

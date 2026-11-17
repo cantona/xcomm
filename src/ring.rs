@@ -91,7 +91,12 @@ impl Ring {
     /// Appends to `out` up to `max` bytes from offset `since`, and returns
     /// the offset after them. From `end` (or beyond: not sent yet) nothing
     /// is appended and `since` comes back.
-    pub fn read(&self, since: u64, max: usize, out: &mut Vec<u8>) -> Result<u64, Evicted> {
+    pub fn read(
+        &self,
+        since: u64,
+        max: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<u64, Evicted> {
         let (a, b) = self.slices(since, max)?;
         out.extend_from_slice(a);
         out.extend_from_slice(b);

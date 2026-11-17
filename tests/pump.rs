@@ -41,7 +41,9 @@ fn nonblocking(fd: BorrowedFd<'_>) {
 fn raw_device(p: &support::Pty) -> OwnedFd {
     let fd = rustix::fs::open(
         &p.slave_path,
-        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::NOCTTY
+            | rustix::fs::OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
     )
     .unwrap();
@@ -453,7 +455,8 @@ impl Control for Ringed {
         Ok(())
     }
     fn tick(&mut self) -> ControlFlow<()> {
-        if self.ring.end() >= self.want || self.started.elapsed() > Duration::from_secs(5) {
+        if self.ring.end() >= self.want || self.started.elapsed() > Duration::from_secs(5)
+        {
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())

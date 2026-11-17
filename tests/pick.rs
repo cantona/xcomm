@@ -8,13 +8,18 @@ use std::time::Duration;
 use support::{lock_dir, read_until, spawn_with_env, write_all};
 use xcomm::list::PortInfo;
 use xcomm::pick::{
-    PLUGIN_ID, PickAction, PickKey, PickState, Placement, decode_keys, incomplete, open_command,
-    render,
+    PLUGIN_ID, PickAction, PickKey, PickState, Placement, decode_keys, incomplete,
+    open_command, render,
 };
 
 const T: Duration = Duration::from_secs(5);
 
-fn port(tty: &str, by_id: Option<&str>, pane: Option<&str>, lock: Option<i32>) -> PortInfo {
+fn port(
+    tty: &str,
+    by_id: Option<&str>,
+    pane: Option<&str>,
+    lock: Option<i32>,
+) -> PortInfo {
     PortInfo {
         tty: tty.into(),
         path: format!("/dev/{tty}"),
@@ -294,7 +299,8 @@ fn esc_closes_and_gives_the_terminal_back() {
     read_until(s.host.master.as_fd(), b"Esc close", T);
     write_all(s.host.master.as_fd(), b"\x1b");
     let mut got =
-        String::from_utf8_lossy(&read_until(s.host.master.as_fd(), b"status=0", T)).into_owned();
+        String::from_utf8_lossy(&read_until(s.host.master.as_fd(), b"status=0", T))
+            .into_owned();
     got += &String::from_utf8_lossy(&s.read_after_exit(b"icanon", T));
     assert!(!got.contains("-icanon"), "{got}");
     // Alt-j or a split arrow does not close it; Ctrl-C does.

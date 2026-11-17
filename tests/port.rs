@@ -65,7 +65,11 @@ fn every_line_format_is_applied_or_reported_as_different() {
                         Applied::Different(applied) => {
                             assert_ne!(applied, s);
                             assert_eq!(port.read_settings().unwrap(), applied);
-                            assert_eq!(port.settings(), applied, "settings() must be the truth");
+                            assert_eq!(
+                                port.settings(),
+                                applied,
+                                "settings() must be the truth"
+                            );
                         }
                     }
                 }
@@ -85,8 +89,8 @@ fn standard_and_odd_bauds_round_trip() {
     let p = support::pty();
     let port = open(&p, &LineSettings::default());
     for baud in [
-        50, 300, 9600, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 3_000_000, 31_250,
-        74_880,
+        50, 300, 9600, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 3_000_000,
+        31_250, 74_880,
     ] {
         let s = LineSettings {
             baud,
@@ -253,8 +257,9 @@ fn dirty(p: &support::Pty) {
     let mut t = tcgetattr(p.slave.as_fd()).unwrap();
     #[cfg(target_os = "linux")]
     t.control_modes.insert(ControlModes::CMSPAR);
-    t.input_modes
-        .insert(InputModes::INPCK | InputModes::IGNPAR | InputModes::ISTRIP | InputModes::PARMRK);
+    t.input_modes.insert(
+        InputModes::INPCK | InputModes::IGNPAR | InputModes::ISTRIP | InputModes::PARMRK,
+    );
     t.special_codes[SpecialCodeIndex::VSTOP] = 0;
     tcsetattr(p.slave.as_fd(), OptionalActions::Now, &t).unwrap();
 }
@@ -332,7 +337,8 @@ fn device_flocked_by_another_program_is_refused() {
     // picocom built with USE_FLOCK only flocks the device.
     let p = support::pty();
     let other = std::fs::File::open(&p.slave_path).unwrap();
-    rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .unwrap();
     let e = Port::open(&p.slave_path, &LineSettings::default(), false)
         .err()
         .unwrap()
@@ -344,7 +350,8 @@ fn device_flocked_by_another_program_is_refused() {
     let (port, _) = Port::open(&p.slave_path, &LineSettings::default(), false).unwrap();
     // And xcomm holds one too, so such a program is kept off.
     assert!(
-        rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err()
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .is_err()
     );
     drop(port);
 }

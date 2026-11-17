@@ -59,7 +59,8 @@ fn has_marker(md: &str) -> bool {
 /// an earlier install wrote it: anything else is someone's own.
 pub fn install(dir: &Path) -> Result<PathBuf, SkillError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let err = |what: &Path, e: std::io::Error| SkillError(format!("{}: {e}", what.display()));
+    let err =
+        |what: &Path, e: std::io::Error| SkillError(format!("{}: {e}", what.display()));
     std::fs::create_dir_all(dir).map_err(|e| err(dir, e))?;
     let path = dir.join("SKILL.md");
     let mode = match std::fs::symlink_metadata(&path) {
@@ -124,9 +125,9 @@ pub fn install(dir: &Path) -> Result<PathBuf, SkillError> {
 /// `$HOME/.agents/skills/xcomm`, unless that looks managed by a dotfiles
 /// repository: that is the user's to change, so it takes `--dir`.
 pub fn default_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, SkillError> {
-    let home = env("HOME")
-        .filter(|h| h.starts_with('/'))
-        .ok_or_else(|| SkillError("HOME is not set to an absolute path: give --dir".into()))?;
+    let home = env("HOME").filter(|h| h.starts_with('/')).ok_or_else(|| {
+        SkillError("HOME is not set to an absolute path: give --dir".into())
+    })?;
     let dir = Path::new(&home).join(".agents/skills/xcomm");
     match dotfiles_owner(&dir, Path::new(&home), env) {
         Some(why) => Err(SkillError(format!(
@@ -204,7 +205,9 @@ fn home_repo(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option<PathBu
             let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
             match key.as_str() {
                 "bare" => bare = value.eq_ignore_ascii_case("true"),
-                "showuntrackedfiles" => hides_untracked = value.eq_ignore_ascii_case("no"),
+                "showuntrackedfiles" => {
+                    hides_untracked = value.eq_ignore_ascii_case("no")
+                }
                 "worktree" => worktree = Some(value.trim_matches('"').to_string()),
                 _ => {}
             }
@@ -267,7 +270,9 @@ pub fn commands_in(md: &str) -> Vec<Vec<String>> {
         for segment in words.split(|w| w.operator) {
             let segment: Vec<&Word> = segment
                 .iter()
-                .skip_while(|w| is_assignment(&w.text) || PREFIXES.contains(&w.text.as_str()))
+                .skip_while(|w| {
+                    is_assignment(&w.text) || PREFIXES.contains(&w.text.as_str())
+                })
                 .collect();
             if segment.first().is_some_and(|w| w.text == "xcomm") {
                 commands.push(

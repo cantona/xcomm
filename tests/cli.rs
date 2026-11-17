@@ -346,11 +346,15 @@ fn prefix_time_bounds() {
 #[test]
 fn show_prefix_needs_no_device_and_honours_flags() {
     match parse_with(&["--show-prefix"], &[("STY", "1")]).unwrap() {
-        Command::ShowPrefix(p) => assert_eq!(p.source, PrefixSource::Multiplexer("screen")),
+        Command::ShowPrefix(p) => {
+            assert_eq!(p.source, PrefixSource::Multiplexer("screen"))
+        }
         c => panic!("{c:?}"),
     }
     match parse_with(&["--show-prefix", "-m"], &[]).unwrap() {
-        Command::ShowPrefix(p) => assert_eq!((p.key, p.source), (ALT_A, PrefixSource::Flag)),
+        Command::ShowPrefix(p) => {
+            assert_eq!((p.key, p.source), (ALT_A, PrefixSource::Flag))
+        }
         c => panic!("{c:?}"),
     }
 }
@@ -819,7 +823,9 @@ fn ctl_unicode_needs_the_feature() {
             panic!("not wait");
         };
         assert!(opts.unicode);
-        assert!(ctl_err(&["d", "send", "x", "--unicode"]).contains("ctl wait or ctl run"));
+        assert!(
+            ctl_err(&["d", "send", "x", "--unicode"]).contains("ctl wait or ctl run")
+        );
     } else {
         assert!(ctl_err(&v).contains("--features unicode"));
     }
@@ -1025,8 +1031,13 @@ fn pick_prompt_and_ctl_pane_parse() {
             pane: "w1:p2".into()
         }
     );
-    assert!(err(&["pick", "--prompt", "frob", "--pane", "p"], &[]).contains("expected capture"));
-    assert!(err(&["pick", "--prompt", "baud", "--pane", ""], &[]).contains("needs a pane id"));
+    assert!(
+        err(&["pick", "--prompt", "frob", "--pane", "p"], &[])
+            .contains("expected capture")
+    );
+    assert!(
+        err(&["pick", "--prompt", "baud", "--pane", ""], &[]).contains("needs a pane id")
+    );
     let c = ctl(&["--pane", "w1:p2", "dtr", "toggle"]);
     assert_eq!((c.device, c.pane.as_deref()), (None, Some("w1:p2")));
     assert_eq!(ctl(&["--pane-from-context"]).cmd, CtlCmd::PaneFromContext);
@@ -1050,7 +1061,9 @@ fn skill_commands() {
         Ok(Command::SkillInstall { dir: None })
     ));
     match parse_with(&["skill", "install", "--dir", "/x/y"], &[]) {
-        Ok(Command::SkillInstall { dir: Some(d) }) => assert_eq!(d, std::path::Path::new("/x/y")),
+        Ok(Command::SkillInstall { dir: Some(d) }) => {
+            assert_eq!(d, std::path::Path::new("/x/y"))
+        }
         other => panic!("{other:?}"),
     }
     for v in [
@@ -1064,7 +1077,9 @@ fn skill_commands() {
         assert!(parse_with(v, &[]).is_err(), "{v:?}");
     }
     match parse_with(&["skill", "install", "--dir=/x/z"], &[]) {
-        Ok(Command::SkillInstall { dir: Some(d) }) => assert_eq!(d, std::path::Path::new("/x/z")),
+        Ok(Command::SkillInstall { dir: Some(d) }) => {
+            assert_eq!(d, std::path::Path::new("/x/z"))
+        }
         other => panic!("{other:?}"),
     }
     assert!(parse_with(&["skill", "install", "--dir="], &[]).is_err());

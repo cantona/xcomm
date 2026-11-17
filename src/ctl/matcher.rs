@@ -261,7 +261,8 @@ mod tests {
 
     #[test]
     fn a_match_at_the_end_waits_for_more() {
-        let mut m = Matcher::new(Some(r"inet (\d+\.\d+)"), &[], false, false, false).unwrap();
+        let mut m =
+            Matcher::new(Some(r"inet (\d+\.\d+)"), &[], false, false, false).unwrap();
         assert_eq!(m.feed(0, b"inet 10.1"), None);
         assert!(m.tentative());
         let (_, _, end, text, groups) = matched(m.feed(9, b"2/24"));
@@ -289,7 +290,8 @@ mod tests {
         assert_eq!(m.feed(0, "日本 ".as_bytes()), None);
         let unicode = Matcher::new(Some(r"\w+"), &[], false, false, true);
         if cfg!(feature = "unicode") {
-            let (_, _, _, text, _) = matched(unicode.unwrap().feed(0, "日本 ".as_bytes()));
+            let (_, _, _, text, _) =
+                matched(unicode.unwrap().feed(0, "日本 ".as_bytes()));
             assert_eq!(text, "日本");
         } else {
             assert!(unicode.is_err());
@@ -299,7 +301,8 @@ mod tests {
     #[test]
     fn a_tie_goes_to_fail_on() {
         let mut m =
-            Matcher::new(Some("err"), &["e".into(), "er".into()], false, false, false).unwrap();
+            Matcher::new(Some("err"), &["e".into(), "er".into()], false, false, false)
+                .unwrap();
         let (which, start, end, text, _) = matched(m.feed(0, b"xx error"));
         assert_eq!(which, Which::FailOn(0));
         assert_eq!((start, end, text.as_str()), (3, 4, "e"));
@@ -307,14 +310,16 @@ mod tests {
 
     #[test]
     fn the_earliest_match_wins() {
-        let mut m = Matcher::new(Some("ok"), &["fail".into()], false, false, false).unwrap();
+        let mut m =
+            Matcher::new(Some("ok"), &["fail".into()], false, false, false).unwrap();
         let (which, ..) = matched(m.feed(0, b"ok then fail"));
         assert_eq!(which, Which::Until);
     }
 
     #[test]
     fn groups_are_returned() {
-        let mut m = Matcher::new(Some(r"ip (\d+)\.(\d+)(x)?"), &[], false, false, false).unwrap();
+        let mut m =
+            Matcher::new(Some(r"ip (\d+)\.(\d+)(x)?"), &[], false, false, false).unwrap();
         let (_, _, _, text, groups) = matched(m.feed(10, b"my ip 10.2 here"));
         assert_eq!(text, "ip 10.2");
         assert_eq!(

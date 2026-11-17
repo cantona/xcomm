@@ -139,7 +139,9 @@ pub fn resolve_prefix(
     // Validated even when a flag overrides it, so a broken setting is reported
     // rather than hidden.
     let from_env = match set("XCOMM_PREFIX") {
-        Some(v) => Some(PrefixKey::parse(&v).map_err(|e| CliError(format!("XCOMM_PREFIX: {e}")))?),
+        Some(v) => Some(
+            PrefixKey::parse(&v).map_err(|e| CliError(format!("XCOMM_PREFIX: {e}")))?,
+        ),
         None => None,
     };
     if let Some(key) = flag {
@@ -393,12 +395,19 @@ pub enum Command {
 
 /// The text for `--help`. `commands` is what the keys after the prefix do,
 /// as the in-session help lists them.
-pub fn help(version: &str, prefix: &PrefixChoice, broken: Option<&str>, commands: &str) -> String {
+pub fn help(
+    version: &str,
+    prefix: &PrefixChoice,
+    broken: Option<&str>,
+    commands: &str,
+) -> String {
     let key = prefix.key.display();
     let multiplexers = {
         let names: Vec<&str> = MULTIPLEXERS.iter().map(|(_, name)| *name).collect();
         match names.split_last() {
-            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            Some((last, rest)) if !rest.is_empty() => {
+                format!("{} and {last}", rest.join(", "))
+            }
             _ => names.concat(),
         }
     };
@@ -562,7 +571,9 @@ to the device as it is):
         broken = broken
             .map(|e| {
                 let why = e.strip_prefix("XCOMM_PREFIX: ").unwrap_or(e);
-                format!("\nA session would not start: XCOMM_PREFIX is not usable:\n  {why}")
+                format!(
+                    "\nA session would not start: XCOMM_PREFIX is not usable:\n  {why}"
+                )
             })
             .unwrap_or_default(),
     );
@@ -863,7 +874,9 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
     };
     let extra = |n: usize| -> Result<(), CliError> {
         match rest.get(n) {
-            Some(word) => Err(CliError(format!("ctl {cmd}: unexpected argument '{word}'"))),
+            Some(word) => {
+                Err(CliError(format!("ctl {cmd}: unexpected argument '{word}'")))
+            }
             None => Ok(()),
         }
     };
@@ -1034,9 +1047,13 @@ fn parse_ctl(args: &[OsString]) -> Result<Command, CliError> {
                     return Err(CliError("ctl xfer send needs a file".into()));
                 }
                 (XferDir::Recv, XferProto::Xmodem) if files.len() != 1 => {
-                    return Err(CliError("ctl xfer recv xmodem needs one file name".into()));
+                    return Err(CliError(
+                        "ctl xfer recv xmodem needs one file name".into(),
+                    ));
                 }
-                (XferDir::Recv, XferProto::Zmodem | XferProto::Ymodem) if !files.is_empty() => {
+                (XferDir::Recv, XferProto::Zmodem | XferProto::Ymodem)
+                    if !files.is_empty() =>
+                {
                     return Err(CliError(
                         "ctl xfer recv: the sender names the files; give none".into(),
                     ));
@@ -1099,12 +1116,16 @@ fn parse_hold(value: &str, what: &str) -> Result<u32, CliError> {
         .parse::<u32>()
         .ok()
         .filter(|ms| digits(value) && (1..=max).contains(ms))
-        .ok_or_else(|| CliError(format!("invalid {what} length '{value}': 1 to {max} ms")))
+        .ok_or_else(|| {
+            CliError(format!("invalid {what} length '{value}': 1 to {max} ms"))
+        })
 }
 
 /// `baud=N databits=N parity=P stopbits=N flow=F`, named and valued as
 /// the session's options are.
-fn parse_settings_patch(words: &[String]) -> Result<crate::ctl::proto::SettingsPatch, CliError> {
+fn parse_settings_patch(
+    words: &[String],
+) -> Result<crate::ctl::proto::SettingsPatch, CliError> {
     let mut patch = crate::ctl::proto::SettingsPatch::default();
     if words.is_empty() {
         return Err(CliError(
@@ -1117,8 +1138,9 @@ fn parse_settings_patch(words: &[String]) -> Result<crate::ctl::proto::SettingsP
         };
         match key {
             "baud" => {
-                let v = parse_baud(value)
-                    .map_err(|_| CliError(format!("ctl set: invalid baud rate '{value}'")))?;
+                let v = parse_baud(value).map_err(|_| {
+                    CliError(format!("ctl set: invalid baud rate '{value}'"))
+                })?;
                 set_once(&mut patch.baud, v, "baud=")?;
             }
             "databits" => {
@@ -1226,9 +1248,12 @@ pub fn parse(
         }
         let dir = match (words.next(), words.next(), words.next()) {
             (None, ..) => None,
-            (Some(o), Some(d), None) if o == "--dir" && !d.is_empty() => Some(PathBuf::from(d)),
+            (Some(o), Some(d), None) if o == "--dir" && !d.is_empty() => {
+                Some(PathBuf::from(d))
+            }
             (Some(o), None, None)
-                if o.as_encoded_bytes().starts_with(b"--dir=") && o.len() > "--dir=".len() =>
+                if o.as_encoded_bytes().starts_with(b"--dir=")
+                    && o.len() > "--dir=".len() =>
             {
                 use std::os::unix::ffi::OsStrExt;
                 Some(PathBuf::from(std::ffi::OsStr::from_bytes(
@@ -1322,7 +1347,9 @@ pub fn parse(
                 set_device(&mut device, v)?;
             }
             Value(v) => set_device(&mut device, text(v, "device")?)?,
-            Short('b') => set_once(&mut baud, parse_baud(&text(p.value()?, "-b")?)?, "-b")?,
+            Short('b') => {
+                set_once(&mut baud, parse_baud(&text(p.value()?, "-b")?)?, "-b")?
+            }
             Long("databits") => {
                 let v = choose(
                     &text(p.value()?, "--databits")?,
@@ -1436,7 +1463,9 @@ pub fn parse(
                 let key = PrefixKey::parse(&text(p.value()?, name)?)?;
                 set_once(&mut prefix, key, "prefix key")?;
             }
-            Short('m') | Long("metakey") => set_once(&mut prefix, PrefixKey::ALT_A, "prefix key")?,
+            Short('m') | Long("metakey") => {
+                set_once(&mut prefix, PrefixKey::ALT_A, "prefix key")?
+            }
             Short('M') | Long("metakey8") => {
                 return Err(CliError(
                     "-M/--metakey8 is not supported: 8-bit meta collides with UTF-8; use -m".into(),
@@ -1460,7 +1489,8 @@ pub fn parse(
         return Ok(match resolve_prefix(prefix, env) {
             Ok(choice) => Command::Help(choice, None),
             Err(e) => {
-                let without = |name: &str| (name != "XCOMM_PREFIX").then(|| env(name)).flatten();
+                let without =
+                    |name: &str| (name != "XCOMM_PREFIX").then(|| env(name)).flatten();
                 Command::Help(resolve_prefix(prefix, &without)?, Some(e.0))
             }
         });

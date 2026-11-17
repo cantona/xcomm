@@ -162,7 +162,10 @@ fn revents(e: &libc::pollfd) -> PollFlags {
 
 /// poll(2), with the timeout rounded up to whole milliseconds so that a
 /// deadline is never woken for early.
-fn poll_entries(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> rustix::io::Result<()> {
+fn poll_entries(
+    fds: &mut [libc::pollfd],
+    timeout: Option<Duration>,
+) -> rustix::io::Result<()> {
     let ms = match timeout {
         None => -1,
         Some(t) => t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int,
@@ -466,8 +469,9 @@ fn drain_queue(
                 Ok(_) => {}
                 // Gone: nothing more can reach it, and the session is ending.
                 Err(e)
-                    if e.raw_os_error()
-                        .is_some_and(|c| gone(rustix::io::Errno::from_raw_os_error(c))) =>
+                    if e.raw_os_error().is_some_and(|c| {
+                        gone(rustix::io::Errno::from_raw_os_error(c))
+                    }) =>
                 {
                     break;
                 }
@@ -687,7 +691,9 @@ fn pump_with(
                     match shown? {
                         Signaled::Exit(exit) => return Ok(exit),
                         Signaled::Resumed => continue,
-                        Signaled::Nothing if matches!(before, Signaled::Resumed) => continue,
+                        Signaled::Nothing if matches!(before, Signaled::Resumed) => {
+                            continue;
+                        }
                         Signaled::Nothing => {}
                     }
                 }
@@ -698,7 +704,8 @@ fn pump_with(
         }
 
         if dev_ready.contains(PollFlags::OUT)
-            && let Some(exit) = write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
+            && let Some(exit) =
+                write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
         {
             return Ok(exit);
         }
@@ -749,7 +756,9 @@ fn pump_with(
                                 ctl.dropping_input();
                             }
                             if let Some(stdout) = p.stdout.filter(|_| !echo.is_empty()) {
-                                if let Signaled::Exit(exit) = finish_shown(stdout, p, ctl)? {
+                                if let Signaled::Exit(exit) =
+                                    finish_shown(stdout, p, ctl)?
+                                {
                                     return Ok(exit);
                                 }
                                 let r = write_out(stdout, &echo, p, ctl)?;
@@ -801,7 +810,8 @@ fn pump_with(
             && stdin_ready.intersects(PollFlags::IN)
             && !queue.is_empty()
             && ctl.keys_go_at_once()
-            && let Some(exit) = write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
+            && let Some(exit) =
+                write_queue(&mut queue, p.device, &mut full_since, &mut stalled)?
         {
             return Ok(exit);
         }
@@ -832,13 +842,16 @@ fn pump_with(
                 match rustix::termios::tcdrain(p.device) {
                     Ok(()) => return Ok(ExitReason::StdinClosed),
                     Err(rustix::io::Errno::INTR) => {
-                        let bits = p.signals.drain().map_err(|e| SessionError(e.to_string()))?;
+                        let bits =
+                            p.signals.drain().map_err(|e| SessionError(e.to_string()))?;
                         if let Signaled::Exit(exit) = on_signals(bits, p.signals, ctl)? {
                             return Ok(exit);
                         }
                     }
                     Err(e) if gone(e) => return Ok(ExitReason::DeviceGone),
-                    Err(e) => return Err(SessionError(format!("drain device output: {e}"))),
+                    Err(e) => {
+                        return Err(SessionError(format!("drain device output: {e}")));
+                    }
                 }
             }
         }
@@ -896,7 +909,10 @@ struct Notices {
 impl Notices {
     fn say(&self, msg: &str) {
         let end = if self.raw { "\r\n" } else { "\n" };
-        let _ = io::Write::write_all(&mut io::stderr(), format!("xcomm: {msg}{end}").as_bytes());
+        let _ = io::Write::write_all(
+            &mut io::stderr(),
+            format!("xcomm: {msg}{end}").as_bytes(),
+        );
     }
 }
 
@@ -928,20 +944,24 @@ struct Held {
 }
 
 /// Runs an interactive session on the process's own stdin and stdout.
-pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<ExitReason, Failure> {
+pub fn run(
+    opts: &TermOpts,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<ExitReason, Failure> {
     let path = device_path(&opts.device);
     // First: nothing to undo yet if the memory cannot be had.
     let ring = crate::ring::Ring::try_new(opts.ring_size)
         .map_err(|e| Failure::Other(format!("--ring-size {}: {e}", opts.ring_size)))?;
     // Before the lock: a SIGINT or SIGHUP while taking it must not kill the
     // process with lock files half made.
-    let signals =
-        SignalPipe::install(&signals()).map_err(|e| Failure::Other(format!("signals: {e}")))?;
+    let signals = SignalPipe::install(&signals())
+        .map_err(|e| Failure::Other(format!("signals: {e}")))?;
     let (mut held, cleared) = if opts.no_lock {
         (None, None)
     } else {
-        let real = std::fs::canonicalize(&path)
-            .map_err(|e| Failure::Other(format!("cannot open {}: {e}", path.display())))?;
+        let real = std::fs::canonicalize(&path).map_err(|e| {
+            Failure::Other(format!("cannot open {}: {e}", path.display()))
+        })?;
         let (held, cleared) = take_lock(&real, env).map_err(|e| match e {
             LockFailure::Busy(msg) => Failure::Busy(msg),
             LockFailure::Other(msg) => Failure::Other(msg),
@@ -953,12 +973,15 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     let mut resolved = std::fs::canonicalize(&stable).unwrap_or_else(|_| stable.clone());
     // The link the path went through, if it is one.
     let mut link = through_link(&stable);
-    let (port, applied) = Port::open(&path, &opts.line, !opts.no_init).map_err(|e| match &e {
-        port::PortError::Open { source, .. } if source.kind() == io::ErrorKind::ResourceBusy => {
-            Failure::Busy(e.to_string())
-        }
-        _ => Failure::Other(e.to_string()),
-    })?;
+    let (port, applied) =
+        Port::open(&path, &opts.line, !opts.no_init).map_err(|e| match &e {
+            port::PortError::Open { source, .. }
+                if source.kind() == io::ErrorKind::ResourceBusy =>
+            {
+                Failure::Busy(e.to_string())
+            }
+            _ => Failure::Other(e.to_string()),
+        })?;
     if through_link(&stable) != link {
         return Err(Failure::Other(format!(
             "{} changed while being opened",
@@ -977,7 +1000,8 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     let server = match opts.ctl {
         crate::ctl::CtlMode::Off => None,
         mode => {
-            let dir = crate::ctl::path::make_socket_dir(env).map_err(|e| Failure::Other(e.0))?;
+            let dir = crate::ctl::path::make_socket_dir(env)
+                .map_err(|e| Failure::Other(e.0))?;
             Some(
                 crate::ctl::server::CtlServer::bind(&dir, &tty, mode)
                     .map_err(|e| Failure::Other(e.0))?,
@@ -998,7 +1022,8 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
                 if let Some(held) = held
                     && let Err(e) = held.lock.release()
                 {
-                    Notices { raw: false }.say(&format!("could not remove the lock: {e}"));
+                    Notices { raw: false }
+                        .say(&format!("could not remove the lock: {e}"));
                 }
                 return Ok(ExitReason::Requested);
             }
@@ -1044,11 +1069,15 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     // stream: a disconnect ends such a session, as it always did.
     let piped = !keys_on && stdin_fd.is_some();
     let prefix = keys_on.then_some((opts.prefix.key, opts.prefix_time));
-    let color =
-        crate::ansi::device_color_enabled(opts.color, rustix::termios::isatty(stdout.as_fd()), env);
+    let color = crate::ansi::device_color_enabled(
+        opts.color,
+        rustix::termios::isatty(stdout.as_fd()),
+        env,
+    );
     let strip_color = !color;
     // What control clients send, shown in the terminal the user watches.
-    let marker = (opts.ctl_marker && shown.is_some_and(rustix::termios::isatty)).then_some(color);
+    let marker =
+        (opts.ctl_marker && shown.is_some_and(rustix::termios::isatty)).then_some(color);
     let names = commands::Names {
         device: path.display().to_string(),
         stable: stable.display().to_string(),
@@ -1064,8 +1093,9 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
     let nested = ["TMUX", "STY", "ZELLIJ"]
         .iter()
         .any(|v| env(v).is_some_and(|s| !s.is_empty()));
-    let herdr =
-        commands::PaneLabel::new(crate::herdr::Herdr::from_env(env).filter(|_| keys_on && !nested));
+    let herdr = commands::PaneLabel::new(
+        crate::herdr::Herdr::from_env(env).filter(|_| keys_on && !nested),
+    );
     let mut kept = commands::Kept::new(capture, ring, server, names, marker, herdr);
     let mut port_tty = port.tty_name().to_string();
     // Taken at the open: a descriptor revoked by a hangup cannot be asked
@@ -1101,8 +1131,12 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
         // to the next terminal made.
         // XCOMM_TEST_PTY_AS_DEVICE (test-only) treats a pty as a device
         // that can come back, so tests can take the path of a real one.
-        let pty = reconnect::is_pty(&resolved) && env("XCOMM_TEST_PTY_AS_DEVICE").is_none();
-        if !matches!(reason, Ok(ExitReason::DeviceGone)) || piped || (pty && link.is_none()) {
+        let pty =
+            reconnect::is_pty(&resolved) && env("XCOMM_TEST_PTY_AS_DEVICE").is_none();
+        if !matches!(reason, Ok(ExitReason::DeviceGone))
+            || piped
+            || (pty && link.is_none())
+        {
             live.finish();
             break (reason, Some(port));
         }
@@ -1229,7 +1263,10 @@ pub fn run(opts: &TermOpts, env: &dyn Fn(&str) -> Option<String>) -> Result<Exit
 /// SIGTTOU until brought to the foreground; a termination signal while
 /// stopped (`kill %1` sends SIGTERM and SIGCONT) interrupts the call and
 /// ends the session instead (None). SIGTSTP is honoured the same way.
-fn enter_raw(fd: BorrowedFd<'_>, signals: &SignalPipe) -> Result<Option<RawMode>, Failure> {
+fn enter_raw(
+    fd: BorrowedFd<'_>,
+    signals: &SignalPipe,
+) -> Result<Option<RawMode>, Failure> {
     loop {
         match RawMode::enter(fd) {
             Ok(raw) => return Ok(Some(raw)),
@@ -1258,9 +1295,11 @@ fn take_lock(
     real: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(Held, Option<Cleared>), LockFailure> {
-    let name = lock::lock_name(real)
-        .ok_or_else(|| LockFailure::Other(format!("cannot name a lock for {}", real.display())))?;
-    let dir = lock::default_lock_dir(env).map_err(|e| LockFailure::Other(e.to_string()))?;
+    let name = lock::lock_name(real).ok_or_else(|| {
+        LockFailure::Other(format!("cannot name a lock for {}", real.display()))
+    })?;
+    let dir =
+        lock::default_lock_dir(env).map_err(|e| LockFailure::Other(e.to_string()))?;
     let (lock, cleared) = lock::acquire(&dir, &name).map_err(|e| match e {
         lock::LockError::Held { .. } | lock::LockError::Contended { .. } => {
             LockFailure::Busy(e.to_string())
@@ -1314,8 +1353,9 @@ fn reopen(
     let mut notes = Vec::new();
     let mut new_lock = None;
     let link = through_link(stable);
-    let real = std::fs::canonicalize(stable)
-        .map_err(|e| open_failed(e.kind(), format!("cannot open {}: {e}", stable.display())))?;
+    let real = std::fs::canonicalize(stable).map_err(|e| {
+        open_failed(e.kind(), format!("cannot open {}: {e}", stable.display()))
+    })?;
     if !opts.no_lock {
         let name = lock::lock_name(&real);
         if held.as_ref().map(|h| h.name.as_str()) != name.as_deref() {
@@ -1327,16 +1367,21 @@ fn reopen(
                 Some(Cleared::DeadPid(pid)) => {
                     notes.push(format!("removed a stale lock of process {pid}"))
                 }
-                Some(Cleared::Empty) => notes.push("removed an abandoned empty lock".to_string()),
+                Some(Cleared::Empty) => {
+                    notes.push("removed an abandoned empty lock".to_string())
+                }
                 None => {}
             }
             new_lock = Some(lock);
         }
     }
-    let (port, applied) = Port::open(stable, settings, !opts.no_init).map_err(|e| match &e {
-        port::PortError::Open { source, .. } => open_failed(source.kind(), e.to_string()),
-        _ => ReopenError::Failed(e.to_string()),
-    })?;
+    let (port, applied) =
+        Port::open(stable, settings, !opts.no_init).map_err(|e| match &e {
+            port::PortError::Open { source, .. } => {
+                open_failed(source.kind(), e.to_string())
+            }
+            _ => ReopenError::Failed(e.to_string()),
+        })?;
     // The lock is for `real`: the link must not have moved on since.
     let same = |port: &Port| -> io::Result<bool> {
         Ok(rustix::fs::fstat(port.fd())?.st_rdev == rustix::fs::stat(&real)?.st_rdev)

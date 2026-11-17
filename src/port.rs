@@ -10,8 +10,8 @@ use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl};
 use std::os::unix::ffi::OsStrExt;
 
 use rustix::termios::{
-    ControlModes, InputModes, LocalModes, OptionalActions, OutputModes, SpecialCodeIndex, Termios,
-    tcgetattr, tcsetattr,
+    ControlModes, InputModes, LocalModes, OptionalActions, OutputModes, SpecialCodeIndex,
+    Termios, tcgetattr, tcsetattr,
 };
 
 use crate::cli::{DataBits, Flow, LineSettings, Parity, StopBits};
@@ -136,7 +136,11 @@ fn unsupported(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOTTY) | Some(libc::EINVAL))
 }
 
-fn ioctl_int(fd: BorrowedFd<'_>, request: libc::c_ulong, arg: &mut libc::c_int) -> io::Result<()> {
+fn ioctl_int(
+    fd: BorrowedFd<'_>,
+    request: libc::c_ulong,
+    arg: &mut libc::c_int,
+) -> io::Result<()> {
     // SAFETY: every request passed here takes a pointer to an int.
     if unsafe { libc::ioctl(fd.as_raw_fd(), request as _, arg as *mut libc::c_int) } < 0 {
         return Err(io::Error::last_os_error());
@@ -277,7 +281,8 @@ impl Port {
         #[cfg(target_os = "linux")]
         {
             let mut excl: libc::c_int = 0;
-            ioctl_int(fd.as_fd(), libc::TIOCGEXCL as libc::c_ulong, &mut excl).map_err(open_err)?;
+            ioctl_int(fd.as_fd(), libc::TIOCGEXCL as libc::c_ulong, &mut excl)
+                .map_err(open_err)?;
             if excl != 0 {
                 return Err(open_err(io::Error::new(
                     io::ErrorKind::ResourceBusy,
@@ -288,7 +293,8 @@ impl Port {
         // picocom (built with USE_FLOCK, as on Ubuntu) takes no UUCP lock
         // and no TIOCEXCL; it only flocks the device. Honour that, and hold
         // the flock ourselves for as long as the fd is open.
-        match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        {
             Ok(()) => {}
             Err(rustix::io::Errno::WOULDBLOCK) => {
                 return Err(open_err(io::Error::new(
@@ -479,9 +485,12 @@ impl Port {
     /// port matches settings() again; reports both failures if that fails.
     fn revert(&self, prior: &Termios, cause: PortError) -> PortError {
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut result = tcsetattr(&self.fd, OptionalActions::Now, prior).map_err(io::Error::from);
+        let mut result =
+            tcsetattr(&self.fd, OptionalActions::Now, prior).map_err(io::Error::from);
         #[cfg(target_os = "macos")]
-        if result.is_ok() && termios_rate(self.settings.get().baud) != self.settings.get().baud {
+        if result.is_ok()
+            && termios_rate(self.settings.get().baud) != self.settings.get().baud
+        {
             result = self.set_macos_speed(self.settings.get().baud);
         }
         match result {
@@ -597,7 +606,10 @@ impl Port {
     /// Runs `f` with RTS/CTS and IXON (output flow control) switched off,
     /// then restores them. IXOFF stays on, so xcomm still sends XOFF when
     /// its own input fills up.
-    fn without_output_flow_control<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    fn without_output_flow_control<T>(
+        &self,
+        f: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         if self.settings.get().flow == Flow::None {
             return f();
         }
@@ -785,7 +797,8 @@ impl Drop for Port {
             let _ = self.write_termios(&mut t);
         }
         let deadline = std::time::Instant::now() + CLOSE_DRAIN;
-        while matches!(self.output_queued(), Ok(n) if n > 0) && std::time::Instant::now() < deadline
+        while matches!(self.output_queued(), Ok(n) if n > 0)
+            && std::time::Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -793,7 +806,10 @@ impl Drop for Port {
         // is nothing to drop, and on a pty TCOFLUSH would also throw away
         // what the other end has not read yet.
         if matches!(self.output_queued(), Ok(n) if n > 0) {
-            let _ = rustix::termios::tcflush(&self.fd, rustix::termios::QueueSelector::OFlush);
+            let _ = rustix::termios::tcflush(
+                &self.fd,
+                rustix::termios::QueueSelector::OFlush,
+            );
         }
         // TIOCEXCL outlives this fd if another fd on the tty is still open.
         // macOS has no TIOCGEXCL, so a root-only second opener there can

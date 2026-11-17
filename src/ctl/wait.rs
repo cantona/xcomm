@@ -6,7 +6,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use super::client::{self, Conn, Dirs, Failed, ending_bytes, print_json, print_out, send_after};
+use super::client::{
+    self, Conn, Dirs, Failed, ending_bytes, print_json, print_out, send_after,
+};
 use super::code;
 use super::matcher::{Matcher, Outcome, Which};
 use super::proto::{self, Request};
@@ -46,7 +48,8 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
             let start = reply["start"]
                 .as_u64()
                 .ok_or((code::FAILED, "the session sent a bad reply".to_string()))?;
-            let outcome = watch(&mut conn, &mut matcher, start, opts, None, &still_there)?;
+            let outcome =
+                watch(&mut conn, &mut matcher, start, opts, None, &still_there)?;
             finish(args.json, &outcome, started, start, None)
         }
         CtlCmd::Run {
@@ -146,7 +149,8 @@ fn watch(
         }
         let n = match conn.reader.read(&mut buf) {
             Ok(0) => {
-                if let Some(found) = matcher.feed(at, &held).or_else(|| matcher.settle()) {
+                if let Some(found) = matcher.feed(at, &held).or_else(|| matcher.settle())
+                {
                     return Ok(found);
                 }
                 at += held.len() as u64;
@@ -162,7 +166,9 @@ fn watch(
             }
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err((code::FAILED, format!("reading from the session: {e}"))),
+            Err(e) => {
+                return Err((code::FAILED, format!("reading from the session: {e}")));
+            }
         };
         heard = Instant::now();
         held.extend_from_slice(&buf[..n]);
@@ -172,7 +178,9 @@ fn watch(
         if let Some((len, dropped)) = proto::dropped_at(&held)
             && closed_next(&mut conn.reader)?
         {
-            if let Some(found) = matcher.feed(at, &held[..len]).or_else(|| matcher.settle()) {
+            if let Some(found) =
+                matcher.feed(at, &held[..len]).or_else(|| matcher.settle())
+            {
                 return Ok(found);
             }
             return Err((
@@ -192,7 +200,9 @@ fn watch(
         {
             return Err((
                 code::USAGE,
-                format!("more than {limit} bytes of output without a match (--max-bytes)"),
+                format!(
+                    "more than {limit} bytes of output without a match (--max-bytes)"
+                ),
             ));
         }
     }
@@ -214,7 +224,10 @@ fn session_runs(path: &std::path::Path, dirs: &Dirs, pid: &serde_json::Value) ->
 /// Whether there is something to read (or the end) within `wait`; None
 /// waits as long as it takes. Not a socket timeout: macOS refuses to set
 /// one once the peer has closed.
-fn readable(reader: &BufReader<UnixStream>, wait: Option<Duration>) -> Result<bool, Failed> {
+fn readable(
+    reader: &BufReader<UnixStream>,
+    wait: Option<Duration>,
+) -> Result<bool, Failed> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     if !reader.buffer().is_empty() {
         return Ok(true);
@@ -298,7 +311,9 @@ fn finish(
     } else {
         match (output, outcome) {
             (Some(output), _) => print_out(output)?,
-            (None, Outcome::Matched { text, .. }) => print_out(format!("{text}\n").as_bytes())?,
+            (None, Outcome::Matched { text, .. }) => {
+                print_out(format!("{text}\n").as_bytes())?
+            }
             (None, _) => {}
         }
     }
@@ -339,14 +354,17 @@ mod tests {
     }
 
     /// `watch` over a connection whose other end runs `peer`.
-    fn watch_peer(peer: impl FnOnce(UnixStream) + Send + 'static) -> Result<Outcome, Failed> {
+    fn watch_peer(
+        peer: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> Result<Outcome, Failed> {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || peer(theirs));
         // No socket there: a close the session's last words do not explain
         // reads as the session gone.
         let mut conn = Conn::new(Path::new("/nonexistent/x.sock"), ours, None).unwrap();
         let o = opts();
-        let mut m = Matcher::new(o.until.as_deref(), &o.fail_on, false, false, false).unwrap();
+        let mut m =
+            Matcher::new(o.until.as_deref(), &o.fail_on, false, false, false).unwrap();
         let got = watch(&mut conn, &mut m, 0, &o, None, &|| false);
         t.join().unwrap();
         got

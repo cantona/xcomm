@@ -416,7 +416,8 @@ fn reads_cut_anywhere_give_the_same_result() {
     for prefix in [CTRL_A, ALT_A] {
         for _ in 0..20_000 {
             let len = next(40);
-            let input: Vec<u8> = (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
+            let input: Vec<u8> =
+                (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
             let mut whole = parser(prefix);
             let mut expect = run(&mut whole, &input, t);
             expect.extend(flush(&mut whole, t + ms(100)));

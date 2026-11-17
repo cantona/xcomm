@@ -86,11 +86,15 @@ impl std::fmt::Display for XferError {
                 write!(f, "cannot keep {p} to the working directory: {e}")
             }
             XferError::Port(e) => write!(f, "port: {e}"),
-            XferError::Failed { program, status } => match (status.code(), status.signal()) {
-                (Some(code), _) => write!(f, "{program} exited with status {code}"),
-                (None, Some(sig)) => write!(f, "{program} was killed by signal {sig}"),
-                (None, None) => write!(f, "{program} ended: {status}"),
-            },
+            XferError::Failed { program, status } => {
+                match (status.code(), status.signal()) {
+                    (Some(code), _) => write!(f, "{program} exited with status {code}"),
+                    (None, Some(sig)) => {
+                        write!(f, "{program} was killed by signal {sig}")
+                    }
+                    (None, None) => write!(f, "{program} ended: {status}"),
+                }
+            }
         }
     }
 }
@@ -260,7 +264,8 @@ fn find_program(name: &str) -> Option<PathBuf> {
             }
         })
         .find(|p| {
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            std::fs::metadata(p)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
 }
 
@@ -356,7 +361,9 @@ impl Jail {
                 rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC | extra,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(|e| io::Error::new(io::Error::from(e).kind(), format!("{}: {e}", p.display())))
+            .map_err(|e| {
+                io::Error::new(io::Error::from(e).kind(), format!("{}: {e}", p.display()))
+            })
         };
         Ok(Jail {
             cwd: path(cwd, rustix::fs::OFlags::DIRECTORY)?,

@@ -31,7 +31,8 @@ pub fn stable_path(path: &Path) -> PathBuf {
 
 /// [`stable_path`] with the by-path directory given (tests).
 pub fn stable_path_in(by_path: &Path, path: &Path) -> PathBuf {
-    let chosen = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let chosen =
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
     let real = match std::fs::canonicalize(path) {
         Ok(real) if !chosen => real,
         _ => return path.to_path_buf(),
@@ -185,7 +186,12 @@ impl DeviceWatch {
     /// Watches `path`, which resolved to `resolved` and whose identity (as
     /// `track` takes it) was `gone`. The first check looks at the path at
     /// once: the device may be back already.
-    pub fn new(path: &Path, resolved: &Path, gone: Option<NodeId>, track: Track) -> DeviceWatch {
+    pub fn new(
+        path: &Path,
+        resolved: &Path,
+        gone: Option<NodeId>,
+        track: Track,
+    ) -> DeviceWatch {
         #[cfg(target_os = "linux")]
         let entries = {
             let mut entries = Vec::new();
@@ -217,7 +223,8 @@ impl DeviceWatch {
         let _ = resolved;
         #[cfg(target_os = "linux")]
         let inotify = rustix::fs::inotify::init(
-            rustix::fs::inotify::CreateFlags::CLOEXEC | rustix::fs::inotify::CreateFlags::NONBLOCK,
+            rustix::fs::inotify::CreateFlags::CLOEXEC
+                | rustix::fs::inotify::CreateFlags::NONBLOCK,
         )
         .ok();
         let mut watch = DeviceWatch {
@@ -278,7 +285,9 @@ impl DeviceWatch {
         }
         let id = match self.track {
             Track::Node => NodeId::at(&self.path),
-            Track::Link => NodeId::at(&self.path).and_then(|_| NodeId::link_at(&self.path)),
+            Track::Link => {
+                NodeId::at(&self.path).and_then(|_| NodeId::link_at(&self.path))
+            }
         };
         match id {
             Ok(id) if Some(id) != self.last => {

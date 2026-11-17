@@ -47,7 +47,8 @@ fn headless(
     loop {
         line.clear();
         assert!(err.read_line(&mut line).unwrap() > 0, "no startup line");
-        if let Some(rest) = line.strip_prefix(&format!("xcomm: headless session on {dev}, socket "))
+        if let Some(rest) =
+            line.strip_prefix(&format!("xcomm: headless session on {dev}, socket "))
         {
             break (child, PathBuf::from(rest.trim_end()), err);
         }
@@ -117,7 +118,8 @@ fn a_headless_session_ends_on_sigint_and_sighup_too() {
         let path = dev.slave_path.to_str().unwrap().to_string();
         let dir = lock_dir("headless-sig");
         let (mut child, sock, _err) = headless(&path, &dir, &[]);
-        rustix::process::kill_process(rustix::process::Pid::from_child(&child.0), sig).unwrap();
+        rustix::process::kill_process(rustix::process::Pid::from_child(&child.0), sig)
+            .unwrap();
         let status = support::wait_exit(&mut child.0, T);
         assert!(status.code().is_some(), "{sig:?}: killed by it: {status:?}");
         assert!(!sock.exists(), "{sig:?}: the socket was left behind");
@@ -134,7 +136,8 @@ fn headless_with_ctl_off_is_a_usage_error() {
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&o.stderr).contains("--headless needs the control socket"),
+        String::from_utf8_lossy(&o.stderr)
+            .contains("--headless needs the control socket"),
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );

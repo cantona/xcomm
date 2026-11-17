@@ -123,7 +123,9 @@ impl Drop for Fake {
 }
 
 fn titled(label: &str) -> impl Fn(&Value) -> bool + '_ {
-    move |v: &Value| v["method"] == "pane.report_metadata" && v["params"]["title"] == label
+    move |v: &Value| {
+        v["method"] == "pane.report_metadata" && v["params"]["title"] == label
+    }
 }
 
 fn session(dev: &str, env: &[(&str, &str)]) -> Spawned {

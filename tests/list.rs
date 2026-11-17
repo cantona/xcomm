@@ -187,7 +187,10 @@ fn enumerate_on_this_machine_is_ok() {
 }
 
 /// A socket in a fresh runtime directory answering one status with `reply`.
-fn one_session(tty: &str, reply: &'static [u8]) -> (PathBuf, std::thread::JoinHandle<()>) {
+fn one_session(
+    tty: &str,
+    reply: &'static [u8],
+) -> (PathBuf, std::thread::JoinHandle<()>) {
     let runtime = support::lock_dir("list-run");
     std::fs::DirBuilder::new()
         .mode(0o700)

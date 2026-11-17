@@ -220,7 +220,9 @@ pub fn plain_char(key: Key) -> Option<char> {
             code: code @ 0x80..,
             mods: 0,
             event,
-        } if event != RELEASE && !(0xe000..=0xf8ff).contains(&code) => char::from_u32(code),
+        } if event != RELEASE && !(0xe000..=0xf8ff).contains(&code) => {
+            char::from_u32(code)
+        }
         _ => None,
     }
 }
@@ -351,7 +353,9 @@ impl KeyParser {
             Some(k) if self.is_prefix(k) => None,
             Some(Key::Esc) => Some(ESC),
             Some(Key::Alt(b)) => Some(b),
-            Some(Key::Coded { code, mods, .. }) => Some(coded_byte(code, mods).unwrap_or(NO_KEY)),
+            Some(Key::Coded { code, mods, .. }) => {
+                Some(coded_byte(code, mods).unwrap_or(NO_KEY))
+            }
             Some(Key::Other) => Some(NO_KEY),
         };
         match command {

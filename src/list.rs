@@ -146,7 +146,9 @@ fn by_id_links(dev: &Path) -> io::Result<Vec<(String, String)>> {
             continue;
         };
         let resolved = dir.join(&target);
-        if resolved.parent().and_then(|p| p.canonicalize().ok()) == dev.canonicalize().ok() {
+        if resolved.parent().and_then(|p| p.canonicalize().ok())
+            == dev.canonicalize().ok()
+        {
             links.push((link, tty.to_string()));
         }
     }
@@ -243,7 +245,8 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                 let db = b.iter().take_while(|c| c.is_ascii_digit()).count();
                 let (na, nb) = (&a[..da], &b[..db]);
                 // Without leading zeros, a longer run is a bigger number.
-                let strip = |n: &[u8]| -> usize { n.iter().take_while(|&&c| c == b'0').count() };
+                let strip =
+                    |n: &[u8]| -> usize { n.iter().take_while(|&&c| c == b'0').count() };
                 let (ta, tb) = (&na[strip(na)..], &nb[strip(nb)..]);
                 let ord = ta.len().cmp(&tb.len()).then(ta.cmp(tb)).then(da.cmp(&db));
                 if ord.is_ne() {
@@ -271,7 +274,8 @@ pub fn table(ports: &[PortInfo]) -> String {
     let head = ["TTY", "VID:PID", "PRODUCT", "LOCK", "HERDR", "BY-ID"].map(String::from);
     let rows: Vec<[String; 6]> = std::iter::once(head)
         .chain(ports.iter().map(|p| {
-            let or = |v: &Option<String>| v.as_deref().map_or_else(|| "-".into(), printable);
+            let or =
+                |v: &Option<String>| v.as_deref().map_or_else(|| "-".into(), printable);
             [
                 p.tty.clone(),
                 or(&p.vid_pid),

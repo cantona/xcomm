@@ -40,7 +40,8 @@ fn every_long_option_is_documented() {
         // As a whole option: --prefix is not found inside --prefix-time,
         // nor --color inside --colors.
         let word =
-            regex::Regex::new(&format!(r"{}(?:[^A-Za-z0-9-]|$)", regex::escape(&opt))).unwrap();
+            regex::Regex::new(&format!(r"{}(?:[^A-Za-z0-9-]|$)", regex::escape(&opt)))
+                .unwrap();
         assert!(word.is_match(&readme), "README.md lacks {opt}");
         assert!(word.is_match(&man), "xcomm.1 lacks {opt}");
     }

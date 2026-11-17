@@ -28,7 +28,8 @@ fn lock_file(dir: &Path, device: &Path) -> PathBuf {
 
 #[test]
 fn a_device_unplugged_and_plugged_back() {
-    let dir = std::env::temp_dir().join(format!("xcomm-reconnect-node-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("xcomm-reconnect-node-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let link = dir.join("by-id-usb-X");

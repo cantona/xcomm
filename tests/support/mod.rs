@@ -240,7 +240,8 @@ fn in_exit(pid: u32) -> bool {
 /// Reports an in_exit failure the first time only: Drop asks every 10 ms.
 #[cfg(target_os = "macos")]
 fn in_exit_failure(msg: &str) {
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static REPORTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         harness_failure(msg);
     }
@@ -331,7 +332,10 @@ pub fn spawn_with(
         // Control sockets go under the test's own directory.
         .env("XDG_RUNTIME_DIR", lock_dir)
         .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
-        .stdout(stdout.unwrap_or_else(|| std::process::Stdio::from(slave.try_clone().unwrap())))
+        .stdout(
+            stdout
+                .unwrap_or_else(|| std::process::Stdio::from(slave.try_clone().unwrap())),
+        )
         .stderr(std::process::Stdio::from(slave));
     for v in [
         "XCOMM_PREFIX",
@@ -369,7 +373,10 @@ pub fn spawn_with(
 
 /// Waits for a child not started by `spawn_with` to exit, killing it after
 /// `timeout`.
-pub fn wait_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+pub fn wait_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(s) = child.try_wait().unwrap() {

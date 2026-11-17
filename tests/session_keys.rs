@@ -12,7 +12,10 @@ use support::{lock_dir, read_until, spawn_with, spawn_with_env, wait_exit, write
 const T: Duration = Duration::from_secs(5);
 
 /// Starts xcomm on a fake device and returns it with its banner.
-fn start(extra: &[&str], env: &[(&str, &str)]) -> (support::Pty, support::Spawned, String) {
+fn start(
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (support::Pty, support::Spawned, String) {
     let dev = support::pty();
     let path = dev.slave_path.to_str().unwrap().to_string();
     let mut args: Vec<&str> = extra.to_vec();

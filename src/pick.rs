@@ -111,7 +111,9 @@ impl PickState {
     pub fn apply(&mut self, key: PickKey) -> PickAction {
         if let Some(typed) = &mut self.prompt {
             match key {
-                PickKey::Digit(d) if typed.len() < BAUD_DIGITS => typed.push(char::from(d)),
+                PickKey::Digit(d) if typed.len() < BAUD_DIGITS => {
+                    typed.push(char::from(d))
+                }
                 PickKey::Backspace => {
                     typed.pop();
                 }
@@ -121,7 +123,9 @@ impl PickState {
                             self.baud = baud;
                             self.message = None;
                         }
-                        None => self.message = Some(format!("not a baud rate: '{typed}'")),
+                        None => {
+                            self.message = Some(format!("not a baud rate: '{typed}'"))
+                        }
                     }
                     self.prompt = None;
                 }
@@ -133,7 +137,8 @@ impl PickState {
         match key {
             PickKey::Up => self.selected = self.selected.saturating_sub(1),
             PickKey::Down => {
-                self.selected = (self.selected + 1).min(self.ports.len().saturating_sub(1));
+                self.selected =
+                    (self.selected + 1).min(self.ports.len().saturating_sub(1));
             }
             PickKey::Baud => {
                 self.prompt = Some(String::new());
@@ -151,7 +156,8 @@ impl PickState {
                     // session too slow to answer): a new session would
                     // only fail on the lock.
                     (None, Some(pid)) => {
-                        self.message = Some(format!("{} is in use by process {pid}", port.tty));
+                        self.message =
+                            Some(format!("{} is in use by process {pid}", port.tty));
                         PickAction::Redraw
                     }
                     (None, None) => PickAction::Open,
@@ -272,7 +278,8 @@ pub fn render(state: &PickState, width: u16, height: u16, out: &mut Vec<u8>) {
     }
     // A name longer than the room left loses its front, not the serial and
     // interface at its end.
-    let room_for_name = width.saturating_sub(2 + widths[..3].iter().map(|w| w + 1).sum::<usize>());
+    let room_for_name =
+        width.saturating_sub(2 + widths[..3].iter().map(|w| w + 1).sum::<usize>());
     widths[3] = widths[3].min(room_for_name);
     let rows: Vec<[String; 5]> = rows
         .into_iter()
@@ -324,7 +331,11 @@ fn printable(c: char) -> char {
 }
 
 /// The arguments to `herdr` that open the selected port in a new pane.
-pub fn open_command(state: &PickState, plugin_id: &str, target_pane: Option<&str>) -> Vec<String> {
+pub fn open_command(
+    state: &PickState,
+    plugin_id: &str,
+    target_pane: Option<&str>,
+) -> Vec<String> {
     let port = &state.ports[state.selected];
     let mut argv: Vec<String> = [
         "plugin",
@@ -340,8 +351,12 @@ pub fn open_command(state: &PickState, plugin_id: &str, target_pane: Option<&str
     .map(|s| s.to_string())
     .collect();
     match state.placement {
-        Placement::SplitRight => argv.extend(["split", "--direction", "right"].map(String::from)),
-        Placement::SplitDown => argv.extend(["split", "--direction", "down"].map(String::from)),
+        Placement::SplitRight => {
+            argv.extend(["split", "--direction", "right"].map(String::from))
+        }
+        Placement::SplitDown => {
+            argv.extend(["split", "--direction", "down"].map(String::from))
+        }
         Placement::Tab => argv.push("tab".into()),
     }
     if let Some(pane) = target_pane {
@@ -399,7 +414,8 @@ pub fn run(
     let herdr_bin = env("HERDR_BIN_PATH")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "herdr".into());
-    let mut state = PickState::new(crate::list::enumerate(env).map_err(|e| err("ports", e))?);
+    let mut state =
+        PickState::new(crate::list::enumerate(env).map_err(|e| err("ports", e))?);
     // Listing asks each session for its pane, which a busy one may take
     // its time over: off the thread that reads keys.
     let lister = Lister::start(env).map_err(|e| err("lister", e))?;
@@ -472,7 +488,9 @@ pub fn run(
         }
         // A key that may still be coming waits ESC_WAIT, whatever else woke
         // the loop.
-        if pending.is_empty() || (incomplete(&pending) && pending_since.elapsed() < ESC_WAIT) {
+        if pending.is_empty()
+            || (incomplete(&pending) && pending_since.elapsed() < ESC_WAIT)
+        {
             continue;
         }
         let keys = decode_keys(&pending);
@@ -485,14 +503,18 @@ pub fn run(
                     done = Some(0);
                     break;
                 }
-                PickAction::Focus(pane) => match herdr.as_ref().map(|h| h.focus_pane(&pane)) {
-                    Some(Ok(())) => {
-                        done = Some(0);
-                        break;
+                PickAction::Focus(pane) => {
+                    match herdr.as_ref().map(|h| h.focus_pane(&pane)) {
+                        Some(Ok(())) => {
+                            done = Some(0);
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            state.message = Some(format!("cannot focus {pane}: {e}"))
+                        }
+                        None => state.message = Some("not inside herdr".into()),
                     }
-                    Some(Err(e)) => state.message = Some(format!("cannot focus {pane}: {e}")),
-                    None => state.message = Some("not inside herdr".into()),
-                },
+                }
                 PickAction::Open => {
                     // udev makes the by-id link a little after the node:
                     // the session should follow the adapter, not the name.
@@ -512,8 +534,11 @@ pub fn run(
                         }
                         Ok(o) => {
                             let why = String::from_utf8_lossy(&o.stderr);
-                            state.message =
-                                Some(format!("{herdr_bin} failed ({}): {}", o.status, why.trim()));
+                            state.message = Some(format!(
+                                "{herdr_bin} failed ({}): {}",
+                                o.status,
+                                why.trim()
+                            ));
                         }
                         Err(e) => state.message = Some(format!("{herdr_bin}: {e}")),
                     }
@@ -562,7 +587,8 @@ impl Lister {
         let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
         let shared = latest.clone();
         std::thread::spawn(move || {
-            let env = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+            let env =
+                |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
             let watch = crate::devwatch::DevWatch::new(std::path::Path::new("/"));
             loop {
                 watch.wait(REFRESH);
@@ -831,7 +857,9 @@ pub fn run_prompt(
                 &input,
                 rustix::event::PollFlags::IN,
             )];
-            if left.is_zero() || !matches!(rustix::event::poll(&mut fds, Some(&timeout)), Ok(1..)) {
+            if left.is_zero()
+                || !matches!(rustix::event::poll(&mut fds, Some(&timeout)), Ok(1..))
+            {
                 break;
             }
             match rustix::io::read(input, &mut buf) {

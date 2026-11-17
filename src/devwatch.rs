@@ -37,7 +37,8 @@ impl DevWatch {
             // Without /dev itself (the user's watch limit reached, say),
             // nothing is watched: callers look on a timer then.
             if let Err(e) = w.add() {
-                w.problem = Some(format!("watching {}: {e}", w.root.join("dev").display()));
+                w.problem =
+                    Some(format!("watching {}: {e}", w.root.join("dev").display()));
                 w.fd = None;
             }
             w
@@ -72,8 +73,10 @@ impl DevWatch {
         let Some(fd) = &self.fd else {
             return Ok(());
         };
-        let flags =
-            WatchFlags::CREATE | WatchFlags::DELETE | WatchFlags::MOVED_TO | WatchFlags::MOVED_FROM;
+        let flags = WatchFlags::CREATE
+            | WatchFlags::DELETE
+            | WatchFlags::MOVED_TO
+            | WatchFlags::MOVED_FROM;
         add_watch(fd, self.root.join("dev"), flags)?;
         for dir in ["dev/serial", "dev/serial/by-id"] {
             let _ = add_watch(fd, self.root.join(dir), flags);

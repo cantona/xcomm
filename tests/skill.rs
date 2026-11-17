@@ -21,7 +21,8 @@ use xcomm::skill::{SKILL_MD, commands_in, default_dir, install, render_for_insta
 const T: Duration = Duration::from_secs(30);
 
 fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("xcomm-skill-{tag}-{}", std::process::id()));
+    let d =
+        std::env::temp_dir().join(format!("xcomm-skill-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -143,8 +144,11 @@ fn the_exit_codes_and_names_are_xcomms() {
     }
     // The herdr plugin and action the skill names.
     let manifest: toml::Table = toml::from_str(
-        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/herdr-plugin.toml"))
-            .unwrap(),
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/herdr-plugin.toml"
+        ))
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(manifest["id"].as_str(), Some(xcomm::pick::PLUGIN_ID));
@@ -324,7 +328,9 @@ fn the_default_dir_is_not_in_a_git_work_tree() {
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(git_dir.join("config"), config).unwrap();
     };
-    let managed = |make: &dyn Fn(&Path), xdg_config: Option<&str>| -> Result<PathBuf, String> {
+    let managed = |make: &dyn Fn(&Path),
+                   xdg_config: Option<&str>|
+     -> Result<PathBuf, String> {
         let home = scratch("home-repo");
         make(&home);
         let env = |k: &str| match k {
@@ -442,7 +448,12 @@ struct Started {
 /// Runs the headless start block for `path` in `cwd`, with sockets and
 /// locks under `lock`. The session it starts goes in `started`. Fails,
 /// rather than hangs, when the block's output stays open.
-fn start_headless(path: &str, cwd: &Path, lock: &Path, started: &mut Vec<Killed>) -> Started {
+fn start_headless(
+    path: &str,
+    cwd: &Path,
+    lock: &Path,
+    started: &mut Vec<Killed>,
+) -> Started {
     let bin = Path::new(env!("CARGO_BIN_EXE_xcomm"));
     let mut child = Command::new("/bin/sh")
         .args(["-c", &headless_block().replace("<dev>", path)])
@@ -742,7 +753,9 @@ fn example_stop_u_boot_autoboot() {
                 if !counted && reset.exists() {
                     counted = true;
                     std::thread::sleep(Duration::from_millis(50));
-                    return Some(b"U-Boot 2024.01\r\nHit any key to stop autoboot:  3 ".to_vec());
+                    return Some(
+                        b"U-Boot 2024.01\r\nHit any key to stop autoboot:  3 ".to_vec(),
+                    );
                 }
                 if counted && !printed.exists() {
                     // Written by now: the step's reply goes out before the

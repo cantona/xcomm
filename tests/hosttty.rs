@@ -4,7 +4,8 @@ use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
 use rustix::termios::{
-    ControlModes, InputModes, LocalModes, OutputModes, SpecialCodeIndex, Termios, tcgetattr,
+    ControlModes, InputModes, LocalModes, OutputModes, SpecialCodeIndex, Termios,
+    tcgetattr,
 };
 use xcomm::hosttty::{RawMode, SignalPipe};
 
@@ -28,11 +29,9 @@ fn same_modes(a: &Termios, b: &Termios) -> bool {
 }
 
 fn assert_raw(t: &Termios) {
-    assert!(
-        !t.local_modes.intersects(
-            LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG | LocalModes::IEXTEN
-        )
-    );
+    assert!(!t.local_modes.intersects(
+        LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG | LocalModes::IEXTEN
+    ));
     assert!(!t.input_modes.intersects(
         InputModes::ICRNL
             | InputModes::IXON
@@ -66,7 +65,12 @@ fn raw_mode_clears_input_flow_control() {
     let p = support::pty();
     let mut t = tcgetattr(p.slave.as_fd()).unwrap();
     t.input_modes.insert(InputModes::IXOFF | InputModes::IXANY);
-    rustix::termios::tcsetattr(p.slave.as_fd(), rustix::termios::OptionalActions::Now, &t).unwrap();
+    rustix::termios::tcsetattr(
+        p.slave.as_fd(),
+        rustix::termios::OptionalActions::Now,
+        &t,
+    )
+    .unwrap();
     let _raw = RawMode::enter(p.slave.as_fd()).unwrap();
     let now = tcgetattr(p.slave.as_fd()).unwrap();
     assert!(
@@ -135,7 +139,9 @@ fn death_child() {
             let msg = b"XCOMM-EARLIER-HANDLER\n";
             unsafe { libc::write(1, msg.as_ptr().cast(), msg.len()) };
         }
-        unsafe { libc::signal(libc::SIGABRT, earlier as *const () as libc::sighandler_t) };
+        unsafe {
+            libc::signal(libc::SIGABRT, earlier as *const () as libc::sighandler_t)
+        };
     }
     // What macOS exec leaves when the parent had an SA_SIGINFO handler:
     // the handler reset, the flag kept.
@@ -182,7 +188,9 @@ fn death_child() {
         "abort" | "abort-chained" | "abort-siginfo-default" | "abort-ignored" => {
             std::process::abort()
         }
-        "alloc" => std::alloc::handle_alloc_error(std::alloc::Layout::new::<[u8; 4096]>()),
+        "alloc" => {
+            std::alloc::handle_alloc_error(std::alloc::Layout::new::<[u8; 4096]>())
+        }
         "overflow" => {
             std::hint::black_box(recurse(0));
         }
@@ -436,7 +444,8 @@ fn eintr_child() {
     if std::env::var_os("XCOMM_TEST_EINTR_CHILD").is_none() {
         return;
     }
-    let _sp = SignalPipe::install(&[libc::SIGTERM, libc::SIGTSTP, libc::SIGWINCH]).unwrap();
+    let _sp =
+        SignalPipe::install(&[libc::SIGTERM, libc::SIGTSTP, libc::SIGWINCH]).unwrap();
     assert_eq!(flags_of(libc::SIGTERM) & libc::SA_RESTART, 0);
     assert_eq!(flags_of(libc::SIGTSTP) & libc::SA_RESTART, 0);
     assert_ne!(flags_of(libc::SIGWINCH) & libc::SA_RESTART, 0);

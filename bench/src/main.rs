@@ -90,7 +90,8 @@ fn pty() -> Result<Pty, String> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY;
     let master = openpt(flags).map_err(|e| format!("openpt: {e}"))?;
     #[cfg(not(target_os = "linux"))]
-    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC).map_err(|e| e.to_string())?;
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)
+        .map_err(|e| e.to_string())?;
     grantpt(&master).map_err(|e| format!("grantpt: {e}"))?;
     unlockpt(&master).map_err(|e| format!("unlockpt: {e}"))?;
     let name = ptsname(&master, Vec::new()).map_err(|e| format!("ptsname: {e}"))?;
@@ -193,7 +194,8 @@ fn throughput(
         if !wait_readable(host.master.as_fd(), Duration::from_secs(5)) {
             return Err(format!("terminal side went quiet after {got} bytes"));
         }
-        let n = rustix::io::read(host.master.as_fd(), &mut buf[..]).map_err(|e| e.to_string())?;
+        let n = rustix::io::read(host.master.as_fd(), &mut buf[..])
+            .map_err(|e| e.to_string())?;
         got += n;
         match count_bytes {
             Some(want) if got >= want => break,
@@ -223,7 +225,8 @@ fn latency(dev: &Pty, host: &Pty, samples: usize) -> Result<Vec<f64>, String> {
         if !wait_readable(dev.master.as_fd(), Duration::from_secs(2)) {
             return Err("a keystroke did not reach the device".into());
         }
-        let n = rustix::io::read(dev.master.as_fd(), &mut b).map_err(|e| e.to_string())?;
+        let n =
+            rustix::io::read(dev.master.as_fd(), &mut b).map_err(|e| e.to_string())?;
         out.push(t.elapsed().as_secs_f64() * 1e6);
         // Anything but exactly the one byte would leave data that makes the
         // next sample return at once.
@@ -443,7 +446,8 @@ fn one_run(o: &Opts) -> Result<Sample, String> {
             Duration::from_millis(200),
             Duration::from_secs(5),
         );
-        let lat = latency(&dev, &host, o.samples).map_err(|e| crashed(e, &mut running))?;
+        let lat =
+            latency(&dev, &host, o.samples).map_err(|e| crashed(e, &mut running))?;
         Ok::<_, String>((text, binary, cpu, lat))
     })();
     // VmHWM, not ru_maxrss: the forked child counts the harness's own pages
@@ -498,12 +502,13 @@ fn syscalls(o: &Opts) -> Result<Option<f64>, String> {
         return Err(e);
     }
     let size = o.size_mib << 20;
-    let r = throughput(&dev, &host, text_payload(size), None).map_err(|e| {
-        match still_running(&mut running, "during the strace run", b"") {
-            Err(why) => format!("{e}; {why}"),
-            Ok(()) => e,
-        }
-    });
+    let r =
+        throughput(&dev, &host, text_payload(size), None).map_err(
+            |e| match still_running(&mut running, "during the strace run", b"") {
+                Err(why) => format!("{e}; {why}"),
+                Ok(()) => e,
+            },
+        );
     // strace does not pass SIGTERM on: end the traced program, and strace
     // writes its summary and exits after it.
     let traced = match children(running.pid) {
@@ -522,7 +527,8 @@ fn syscalls(o: &Opts) -> Result<Option<f64>, String> {
         unsafe { libc::kill(child, libc::SIGTERM) };
     }
     let finished = finish(running);
-    let report = std::fs::read_to_string(&trace).map_err(|e| format!("{}: {e}", trace.display()));
+    let report =
+        std::fs::read_to_string(&trace).map_err(|e| format!("{}: {e}", trace.display()));
     finished?;
     r?;
     let report = report?;
@@ -636,7 +642,8 @@ fn report(o: &Opts, samples: &[Sample]) -> Result<Value, String> {
 }
 
 fn run(o: &Opts) -> Result<Value, String> {
-    let samples: Vec<Sample> = (0..o.runs).map(|_| one_run(o)).collect::<Result<_, _>>()?;
+    let samples: Vec<Sample> =
+        (0..o.runs).map(|_| one_run(o)).collect::<Result<_, _>>()?;
     report(o, &samples)
 }
 
@@ -703,7 +710,9 @@ fn compare(base: &Value, new: &Value, threshold: f64) -> Vec<String> {
                     worse.push(format!("{name} {r:+.1}%"));
                 }
             }
-            (None, None) => println!("{name:<24} {:>12} {:>12} {:>9}", "-", "-", "skipped"),
+            (None, None) => {
+                println!("{name:<24} {:>12} {:>12} {:>9}", "-", "-", "skipped")
+            }
             (b, n) => {
                 println!("{name:<24} {b:>12?} {n:>12?} {:>9}", "MISSING");
                 worse.push(format!("{name} missing on one side"));
@@ -771,7 +780,8 @@ fn number(s: &str, name: &str) -> Result<usize, String> {
 fn main_inner() -> Result<ExitCode, String> {
     if !cfg!(target_os = "linux") {
         return Err(
-            "xcomm-bench measures through Linux /proc and strace; it runs on Linux only".into(),
+            "xcomm-bench measures through Linux /proc and strace; it runs on Linux only"
+                .into(),
         );
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -843,15 +853,18 @@ fn main_inner() -> Result<ExitCode, String> {
             };
             // Before the runs: a bad --out must not cost a whole benchmark.
             if let Some(dir) = &out {
-                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?;
             }
             let (b, n) = ab(&base_opts, &new_opts)?;
             let worse = compare(&b, &n, threshold);
             if let Some(dir) = out {
                 for (name, v) in [("base.json", &b), ("new.json", &n)] {
                     let path = dir.join(name);
-                    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
-                    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+                    let text =
+                        serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+                    std::fs::write(&path, text)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
                 }
             }
             if worse.is_empty() {
@@ -873,7 +886,8 @@ fn main_inner() -> Result<ExitCode, String> {
             }
             let load = |p: Option<String>, what: &str| -> Result<Value, String> {
                 let p = p.ok_or(format!("{what} is required\n{}", usage()))?;
-                let text = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
+                let text =
+                    std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
                 serde_json::from_str(&text).map_err(|e| format!("{p}: {e}"))
             };
             let (b, n) = (load(base, "--base")?, load(new, "--new")?);
@@ -919,7 +933,10 @@ mod tests {
 
     #[test]
     fn equal_reports_pass() {
-        assert!(compare(&report(100.0, 10.0, 80.0), &report(100.0, 10.0, 80.0), 5.0).is_empty());
+        assert!(
+            compare(&report(100.0, 10.0, 80.0), &report(100.0, 10.0, 80.0), 5.0)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -939,7 +956,10 @@ mod tests {
 
     #[test]
     fn improvements_pass() {
-        assert!(compare(&report(100.0, 10.0, 80.0), &report(120.0, 8.0, 60.0), 5.0).is_empty());
+        assert!(
+            compare(&report(100.0, 10.0, 80.0), &report(120.0, 8.0, 60.0), 5.0)
+                .is_empty()
+        );
     }
 
     #[test]

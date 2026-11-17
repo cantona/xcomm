@@ -13,7 +13,9 @@ use xcomm::ctl::CtlMode;
 use xcomm::ctl::proto::Status;
 use xcomm::ctl::server::{CtlServer, Session};
 use xcomm::hosttty::SignalPipe;
-use xcomm::session::{CommandOutcome, Control, ExitReason, OutQueue, Pump, SessionError, pump};
+use xcomm::session::{
+    CommandOutcome, Control, ExitReason, OutQueue, Pump, SessionError, pump,
+};
 
 struct Counting;
 
@@ -261,19 +263,23 @@ fn run_full(
     });
     let port_fd = rustix::fs::open(
         &dev.slave_path,
-        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::NOCTTY
+            | rustix::fs::OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
     )
     .unwrap();
     let mut t = rustix::termios::tcgetattr(&port_fd).unwrap();
     t.make_raw();
-    rustix::termios::tcsetattr(&port_fd, rustix::termios::OptionalActions::Now, &t).unwrap();
+    rustix::termios::tcsetattr(&port_fd, rustix::termios::OptionalActions::Now, &t)
+        .unwrap();
     let mut count = Count {
         iterations: 0,
         warm: None,
         end: 0,
         echo,
-        capture: colored.map(|_| Capture::start(std::path::Path::new("/dev/null")).unwrap()),
+        capture: colored
+            .map(|_| Capture::start(std::path::Path::new("/dev/null")).unwrap()),
         // Small, so it wraps many times while counted.
         ring: xcomm::ring::Ring::new(ring_size),
         server,

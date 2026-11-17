@@ -52,7 +52,8 @@ impl Env {
         let state = env("XDG_STATE_HOME")
             .filter(|s| s.starts_with('/'))
             .map_or_else(|| home.join(".local/state"), PathBuf::from);
-        let absolute = |var: &str| env(var).filter(|v| v.starts_with('/')).map(PathBuf::from);
+        let absolute =
+            |var: &str| env(var).filter(|v| v.starts_with('/')).map(PathBuf::from);
         let mut cargo_roots = vec![home.join(".local")];
         cargo_roots.extend(absolute("CARGO_INSTALL_ROOT"));
         cargo_roots.push(absolute("CARGO_HOME").unwrap_or_else(|| home.join(".cargo")));
@@ -103,7 +104,9 @@ fn skill_state(env: &Env) -> Result<SkillState, InstallError> {
     let err = |e: std::io::Error| InstallError(format!("{}: {e}", path.display()));
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SkillState::Absent),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SkillState::Absent);
+        }
         Err(e) => return Err(err(e)),
     };
     if !meta.file_type().is_file() {
@@ -113,7 +116,8 @@ fn skill_state(env: &Env) -> Result<SkillState, InstallError> {
         ));
     }
     let text = std::fs::read(&path).map_err(err)?;
-    let Some(version) = crate::skill::marker_version(&String::from_utf8_lossy(&text)) else {
+    let Some(version) = crate::skill::marker_version(&String::from_utf8_lossy(&text))
+    else {
         return Ok(SkillState::NotOurs(
             "not written by xcomm (no generated-by marker): left as it is".into(),
             None,
@@ -252,7 +256,9 @@ fn stop_watchers(env: &Env) -> Result<Step, InstallError> {
 fn remove_skill(env: &Env) -> Result<Step, InstallError> {
     let path = env.skill();
     match skill_state(env)? {
-        SkillState::Absent => Ok(Step::Skipped(format!("no skill at {}", path.display()))),
+        SkillState::Absent => {
+            Ok(Step::Skipped(format!("no skill at {}", path.display())))
+        }
         SkillState::NotOurs(why, _) => Ok(Step::Skipped(why)),
         SkillState::Ours(_) => {
             std::fs::remove_file(&path)
@@ -271,9 +277,15 @@ fn remove_plugin(env: &Env) -> Result<Step, InstallError> {
         return Ok(Step::Skipped("herdr is not on PATH".into()));
     };
     match plugin_state(env)? {
-        PluginState::NotRegistered => Ok(Step::Skipped("not registered with herdr".into())),
-        PluginState::Github => run(herdr, &["plugin", "uninstall", PLUGIN_ID]).map(|_| Step::Done),
-        PluginState::Linked(_) => run(herdr, &["plugin", "unlink", PLUGIN_ID]).map(|_| Step::Done),
+        PluginState::NotRegistered => {
+            Ok(Step::Skipped("not registered with herdr".into()))
+        }
+        PluginState::Github => {
+            run(herdr, &["plugin", "uninstall", PLUGIN_ID]).map(|_| Step::Done)
+        }
+        PluginState::Linked(_) => {
+            run(herdr, &["plugin", "unlink", PLUGIN_ID]).map(|_| Step::Done)
+        }
     }
 }
 
@@ -357,9 +369,9 @@ fn quote(s: &str) -> String {
 
 /// Whether cargo has xcomm installed under `root`.
 fn cargo_has_xcomm(root: &Path) -> bool {
-    [".crates.toml", ".crates2.json"]
-        .iter()
-        .any(|f| std::fs::read_to_string(root.join(f)).is_ok_and(|t| t.contains("\"xcomm ")))
+    [".crates.toml", ".crates2.json"].iter().any(|f| {
+        std::fs::read_to_string(root.join(f)).is_ok_and(|t| t.contains("\"xcomm "))
+    })
 }
 
 fn remove_binary(env: &Env) -> Result<Step, InstallError> {
@@ -428,7 +440,9 @@ pub fn uninstall(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
     for (i, (name, action)) in steps.iter().enumerate() {
         match action(env) {
             Ok(Step::Done) => writeln!(out, "{name}: ok").map_err(io)?,
-            Ok(Step::Skipped(why)) => writeln!(out, "{name}: skip ({why})").map_err(io)?,
+            Ok(Step::Skipped(why)) => {
+                writeln!(out, "{name}: skip ({why})").map_err(io)?
+            }
             Err(e) => {
                 writeln!(out, "{name}: FAILED: {e}").map_err(io)?;
                 let left: Vec<&str> = steps[i..].iter().map(|(n, _)| *n).collect();
@@ -659,7 +673,8 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
             problems.push(format!(
                 "the skill is xcomm {v}'s, the binary is not: run xcomm skill install{}",
                 match &env.dotfiles {
-                    Some(_) => format!(" --dir {}", skill.parent().unwrap_or(&skill).display()),
+                    Some(_) =>
+                        format!(" --dir {}", skill.parent().unwrap_or(&skill).display()),
                     None => String::new(),
                 }
             ));
@@ -669,8 +684,12 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<bool, InstallError> {
     let registered = !matches!(plugin, Ok(PluginState::NotRegistered));
     match (&env.herdr, plugin) {
         (None, _) => lines.push("herdr plugin: herdr is not on PATH".into()),
-        (_, Ok(PluginState::NotRegistered)) => lines.push("herdr plugin: not registered".into()),
-        (_, Ok(PluginState::Github)) => lines.push("herdr plugin: installed from GitHub".into()),
+        (_, Ok(PluginState::NotRegistered)) => {
+            lines.push("herdr plugin: not registered".into())
+        }
+        (_, Ok(PluginState::Github)) => {
+            lines.push("herdr plugin: installed from GitHub".into())
+        }
         (_, Ok(PluginState::Linked(root))) => {
             lines.push(format!("herdr plugin: linked to {}", root.display()));
             if !root.join("herdr-plugin.toml").is_file() {

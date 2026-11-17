@@ -85,14 +85,18 @@ impl Herdr {
             deadline
                 .checked_duration_since(std::time::Instant::now())
                 .filter(|d| !d.is_zero())
-                .ok_or_else(|| HerdrError::Io(format!("{method}: no reply within {TIMEOUT:?}")))
+                .ok_or_else(|| {
+                    HerdrError::Io(format!("{method}: no reply within {TIMEOUT:?}"))
+                })
         };
-        let stream = crate::sock::connect_now(&self.socket).map_err(|e| io("connect", e))?;
+        let stream =
+            crate::sock::connect_now(&self.socket).map_err(|e| io("connect", e))?;
         stream
             .set_write_timeout(Some(left()?))
             .map_err(|e| io("timeout on", e))?;
-        let mut line = serde_json::to_vec(&json!({ "id": id, "method": method, "params": params }))
-            .expect("a request serializes");
+        let mut line =
+            serde_json::to_vec(&json!({ "id": id, "method": method, "params": params }))
+                .expect("a request serializes");
         line.push(b'\n');
         (&stream).write_all(&line).map_err(|e| io("write to", e))?;
         let mut reply = Vec::new();

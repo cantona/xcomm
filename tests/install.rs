@@ -18,12 +18,17 @@ struct Home {
 
 impl Home {
     fn new(tag: &str) -> Home {
-        let root = std::env::temp_dir().join(format!("xcomm-install-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("xcomm-install-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for d in ["home", "bin", "run", "locks", "state"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
-        std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            root.join("run"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         Home { root }
     }
 
@@ -183,7 +188,8 @@ fn a_skill_in_a_dotfiles_repository_or_a_link_is_left() {
     let dotfiles = h.home().join("dotfiles");
     std::fs::create_dir_all(dotfiles.join(".git")).unwrap();
     std::fs::create_dir_all(dotfiles.join("agents")).unwrap();
-    std::os::unix::fs::symlink(dotfiles.join("agents"), h.home().join(".agents")).unwrap();
+    std::os::unix::fs::symlink(dotfiles.join("agents"), h.home().join(".agents"))
+        .unwrap();
     h.install_skill();
     let o = h.run("uninstall", &[]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
@@ -197,7 +203,8 @@ fn a_skill_in_a_dotfiles_repository_or_a_link_is_left() {
     let o = h.run("doctor", &[]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     assert!(
-        stdout(&o).contains("problem: the skill at ") && stdout(&o).contains("no xcomm is on PATH"),
+        stdout(&o).contains("problem: the skill at ")
+            && stdout(&o).contains("no xcomm is on PATH"),
         "{}",
         stdout(&o)
     );
@@ -348,7 +355,8 @@ fn a_failing_cargo_is_reported_with_what_is_left() {
         ),
         (
             "git+https://example.com/xcomm?rev=0123abc#0123abc".to_string(),
-            "cargo install --git https://example.com/xcomm --rev 0123abc --root ".to_string(),
+            "cargo install --git https://example.com/xcomm --rev 0123abc --root "
+                .to_string(),
         ),
     ] {
         std::fs::write(
@@ -423,10 +431,12 @@ fn doctor_flags_a_stale_socket_and_a_dangling_skill() {
     // A skill that cannot be read is not "none".
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(h.skill(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(h.skill(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
         let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
         assert!(stdout(&o).contains("problem: skill: "), "{}", stdout(&o));
-        std::fs::set_permissions(h.skill(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(h.skill(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
     }
     // A live socket is not stale.
     std::fs::remove_file(&sock).unwrap();
@@ -493,7 +503,8 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
     let bin = h.root.join("bin");
     // First on PATH, and broken: the shell would run this one.
     std::fs::write(bin.join("xcomm"), "#!/bin/sh\nkill -SEGV $$\n").unwrap();
-    std::fs::set_permissions(bin.join("xcomm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(bin.join("xcomm"), std::fs::Permissions::from_mode(0o755))
+        .unwrap();
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     assert!(
@@ -529,7 +540,9 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
         .parse()
         .unwrap();
     let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok() {
+    while rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
+        .is_ok()
+    {
         assert!(
             std::time::Instant::now() < until,
             "its child {pid} still runs"
@@ -610,7 +623,8 @@ fn uninstall_stops_a_running_hotplug_watcher() {
                     .read_line(&mut line)
                     .is_ok()
                 {
-                    let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+                    let req: serde_json::Value =
+                        serde_json::from_str(&line).unwrap_or_default();
                     let reply = serde_json::json!({ "id": req["id"], "result": { "type": "ok" } });
                     let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
                 }
@@ -644,8 +658,10 @@ fn uninstall_stops_a_running_hotplug_watcher() {
         assert!(std::time::Instant::now() < until, "no watch.pid");
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let alive =
-        || rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok();
+    let alive = || {
+        rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
+            .is_ok()
+    };
     assert!(alive());
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     let out = stdout(&o);
