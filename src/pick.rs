@@ -746,6 +746,16 @@ pub fn tail_cols(text: &str, cols: usize) -> String {
     tail.into_iter().collect()
 }
 
+/// Shows `text` and "press Enter to close", and waits for a key. Keys
+/// typed before it is shown are dropped first, so that none of them closes
+/// it: dropping them after it is shown could drop the Enter that answers it.
+fn hold_open(input: BorrowedFd<'_>, output: BorrowedFd<'_>, text: &str) {
+    let _ = rustix::termios::tcflush(input, rustix::termios::QueueSelector::IFlush);
+    let _ = write_all(output, format!("{text}\r\npress Enter to close").as_bytes());
+    let mut buf = [0u8; 16];
+    let _ = rustix::io::read(input, &mut buf);
+}
+
 /// The prompt popup: asks for one line, runs the request it makes on the
 /// session in `pane`, and on a failure shows why until a key is pressed.
 pub fn run_prompt(
@@ -758,14 +768,7 @@ pub fn run_prompt(
     // The popup pane closes the moment this returns, so what went wrong is
     // shown here and held: on stderr it would be gone before it was read.
     let hold = |text: &str| -> Result<i32, PickError> {
-        let _ = write_all(
-            output,
-            format!("\r\nxcomm: {text}\r\npress Enter to close").as_bytes(),
-        );
-        // Keys typed before the message was up must not close it.
-        let _ = rustix::termios::tcflush(input, rustix::termios::QueueSelector::IFlush);
-        let mut buf = [0u8; 16];
-        let _ = rustix::io::read(input, &mut buf);
+        hold_open(input, output, &format!("\r\nxcomm: {text}"));
         Ok(1)
     };
     let Some(home) = env("HOME")
@@ -892,12 +895,8 @@ pub fn run_prompt(
     }
     let status = crate::ctl::client::run(&args, env);
     if status != 0 {
-        // The error is above, on stderr: leave it in view. Keys typed
-        // while the command ran must not close it.
-        let _ = write_all(output, b"\r\npress Enter to close");
-        let _ = rustix::termios::tcflush(input, rustix::termios::QueueSelector::IFlush);
-        let mut buf = [0u8; 16];
-        let _ = rustix::io::read(input, &mut buf);
+        // The error is above, on stderr: leave it in view.
+        hold_open(input, output, "");
     }
     Ok(i32::from(status))
 }
