@@ -2,7 +2,7 @@
 # first with `sh scripts/build.sh` (scripts/install.sh also links it).
 id = "cantona.herdr-xcomm"
 name = "herdr-xcomm"
-version = "0.1.1"
+version = "0.1.2"
 description = "Serial terminal panes: port picker, line control actions, hotplug notifications, agent control."
 min_herdr_version = "0.9.5"
 platforms = ["linux", "macos"]
