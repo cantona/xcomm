@@ -65,6 +65,23 @@ console one keystroke away.
 
 ## Install
 
+**With Homebrew** (macOS, Linux; man page included):
+
+```sh
+brew install cantona/tap/xcomm
+xcomm skill install        # the agent skill, if you use one
+```
+
+**With cargo** (from [crates.io](https://crates.io/crates/xcomm)):
+
+```sh
+cargo install --locked xcomm
+xcomm skill install        # the agent skill, if you use one
+```
+
+For what is on master but not released yet:
+`cargo install --locked --git https://github.com/cantona/xcomm xcomm`.
+
 **As a herdr plugin** (builds and installs the binaries and the agent skill):
 
 ```sh
@@ -78,16 +95,11 @@ git clone https://github.com/cantona/xcomm && cd xcomm
 sh scripts/install.sh      # build, cargo install to ~/.local, link the plugin
 ```
 
-**Without herdr:**
-
-```sh
-cargo install --git https://github.com/cantona/xcomm --locked xcomm
-xcomm skill install        # the agent skill, if you use one
-```
-
-Needs Rust 1.96 or later to build. File transfers need
-[lrzsz](https://ohse.de/uwe/software/lrzsz.html) (`sz`/`rz`); the herdr plugin
-needs herdr 0.9.5 or later.
+Building needs Rust 1.96 or later (the Homebrew formula uses its own; the
+herdr plugin and cargo use yours). File transfers
+need [lrzsz](https://ohse.de/uwe/software/lrzsz.html) (`sz`/`rz`;
+`brew install lrzsz` or `apt install lrzsz`); the herdr plugin needs herdr
+0.9.5 or later.
 
 ## Quick start
 
@@ -391,6 +403,9 @@ unregisters the herdr plugin, then runs `cargo uninstall`, printing each step,
 and stops at the first failure saying what is left. Use it rather than
 `herdr plugin uninstall`, which has no uninstall hook and leaves the binaries
 and the skill behind. `xcomm doctor` reports anything left over.
+
+Installed with Homebrew: run `xcomm uninstall` for the watchers and the skill
+(it then says the binary is not cargo's), then `brew uninstall xcomm`.
 
 ## Benchmarks
 
