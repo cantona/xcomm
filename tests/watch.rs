@@ -505,23 +505,40 @@ fn an_older_xcomms_watcher_is_this_servers_or_left_alone() {
 #[test]
 fn without_a_herdr_socket_it_does_not_start() {
     let env = Env::new();
-    let o = Command::new(env!("CARGO_BIN_EXE_xcomm"))
-        .args(["watch", "start"])
-        .env_remove("HERDR_SOCKET_PATH")
-        .envs(
-            env.vars
-                .iter()
-                .filter(|(k, _)| *k != "HERDR_SOCKET_PATH")
-                .map(|(k, v)| (*k, v.as_str())),
-        )
-        .output()
-        .unwrap();
+    let without_socket = |action: &str| {
+        Command::new(env!("CARGO_BIN_EXE_xcomm"))
+            .args(["watch", action])
+            .env_remove("HERDR_SOCKET_PATH")
+            .envs(
+                env.vars
+                    .iter()
+                    .filter(|(k, _)| *k != "HERDR_SOCKET_PATH")
+                    .map(|(k, v)| (*k, v.as_str())),
+            )
+            .output()
+            .unwrap()
+    };
+    let o = without_socket("start");
     assert_eq!(o.status.code(), Some(1));
     assert!(
         out(&o).contains("HERDR_SOCKET_PATH is not set"),
         "{}",
         out(&o)
     );
+    // Neither it nor a look at a watcher that is not there leaves a state
+    // directory or lock behind, which doctor and uninstall would then
+    // count as a watcher's.
+    let state = env.dir.join("state");
+    for o in [
+        without_socket("status"),
+        without_socket("stop"),
+        env.watch(&["status"]),
+        env.watch(&["stop"]),
+    ] {
+        assert!(out(&o).contains("not running"), "{}", out(&o));
+    }
+    let left: Vec<_> = std::fs::read_dir(&state).unwrap().flatten().collect();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 #[test]

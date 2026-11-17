@@ -545,15 +545,24 @@ pub fn act_in(
     action: WatchAction,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, WatchError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| WatchError(format!("{}: {e}", dir.display())))?;
+    // Only what starts a watcher makes its directory and lock: looking at
+    // one, or stopping one that is not there, leaves nothing behind.
+    let make_dir = || {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| WatchError(format!("{}: {e}", dir.display())))
+    };
     let files = Files::new(dir);
     match action {
-        WatchAction::Start => start(&files, env),
+        WatchAction::Start => {
+            herdr(env)?;
+            make_dir()?;
+            start(&files, env)
+        }
         WatchAction::Stop => stop(&files),
         WatchAction::Status => Ok(status(&files, env)),
         WatchAction::Run => {
             herdr(env)?;
+            make_dir()?;
             let lock = files.lock()?;
             if !try_lock(&lock)? {
                 return Ok(already(&files));
@@ -591,6 +600,17 @@ impl Files {
             .write(true)
             .open(&self.pid)
             .map_err(|e| WatchError(format!("{}: {e}", self.pid.display())))
+    }
+
+    /// The lock as it is, if there is one; a watcher makes it before it
+    /// takes it. Writable as `lock` opens it: on NFS an exclusive flock
+    /// needs a file open for writing.
+    fn existing_lock(&self) -> Option<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.pid)
+            .ok()
     }
 
     /// The pid the lock's holder wrote; None until it has.
@@ -637,7 +657,7 @@ fn herdr(
 /// Whether a watcher runs: its lock is held.
 fn running(files: &Files) -> bool {
     use rustix::fs::{FlockOperation, flock};
-    let Ok(file) = files.lock() else {
+    let Some(file) = files.existing_lock() else {
         return false;
     };
     match try_lock(&file) {
@@ -661,7 +681,6 @@ fn start(
     files: &Files,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, WatchError> {
-    herdr(env)?;
     let lock = files.lock()?;
     if !try_lock(&lock)? {
         return Ok(already(files));

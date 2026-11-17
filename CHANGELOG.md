@@ -20,6 +20,10 @@ What changed in each release of xcomm.
   carries an SPDX copyright and license header.
 
 ### Fixed
+- `xcomm watch status` and `stop` no longer make an empty `watch.pid` (and its
+  directory) where no watcher is, nor a refused `watch start` the directory:
+  `xcomm doctor` listed them as a watcher, and `xcomm uninstall` reported
+  removing one.
 - `xcomm uninstall` takes a linked herdr plugin away when no herdr server is
   running, which `herdr plugin unlink` refuses to do; it stopped there before,
   leaving the binaries in place.
