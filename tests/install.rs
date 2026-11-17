@@ -11,6 +11,25 @@ const LINKED: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"ca
 const GITHUB: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"cantona.herdr-xcomm","plugin_root":"/x","source":{"kind":"github","owner":"cantona","repo":"xcomm"}}],"type":"plugin_list"}}"#;
 const NONE: &str = r#"{"id":"cli:plugin","result":{"plugins":[],"type":"plugin_list"}}"#;
 
+/// Whether `pid` runs. A zombie does not: where nothing reaps orphans, as in
+/// an autopkgtest unshare testbed, a killed process stays one, and kill(0)
+/// still finds it.
+fn running(pid: i32) -> bool {
+    let pid_ = rustix::process::Pid::from_raw(pid).unwrap();
+    if rustix::process::test_kill_process(pid_).is_err() {
+        return false;
+    }
+    // The state is the field after the ")" that ends the command name.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some((_, rest)) = stat.rsplit_once(')')
+        && rest.trim_start().starts_with('Z')
+    {
+        return false;
+    }
+    true
+}
+
 /// A HOME as an install leaves it, with fakes on PATH.
 struct Home {
     root: PathBuf,
@@ -21,8 +40,21 @@ impl Home {
         let root = std::env::temp_dir()
             .join(format!("xcomm-install-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for d in ["home", "bin", "run", "locks", "state"] {
+        for d in ["home", "bin", "tools", "run", "locks", "state"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        // The system's tools the fakes run, and nothing else from /usr/bin:
+        // an xcomm installed there (a distribution package) would otherwise
+        // be on PATH too, and doctor and uninstall would report it.
+        // (macOS has no setsid; the fake that runs it does without.)
+        for tool in ["sleep", "setsid", "head", "tr"] {
+            if let Some(found) = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.exists())
+            {
+                std::os::unix::fs::symlink(found, root.join("tools").join(tool)).unwrap();
+            }
         }
         std::fs::set_permissions(
             root.join("run"),
@@ -78,7 +110,11 @@ impl Home {
     }
 
     fn run(&self, cmd: &str, env: &[(&str, &str)]) -> Output {
-        let path = format!("{}:/usr/bin:/bin", self.root.join("bin").display());
+        let path = format!(
+            "{}:{}",
+            self.root.join("bin").display(),
+            self.root.join("tools").display()
+        );
         Command::new(env!("CARGO_BIN_EXE_xcomm"))
             .arg(cmd)
             .env_clear()
@@ -461,9 +497,10 @@ fn doctor_reports_an_install_and_a_broken_link() {
     }
     h.install_skill();
     let path = format!(
-        "{}:{}:/usr/bin:/bin",
+        "{}:{}:{}",
         h.root.join("bin").display(),
-        bin.display()
+        bin.display(),
+        h.root.join("tools").display()
     );
     let o = h.run("doctor", &[("FAKE_LIST", LINKED), ("PATH", &path)]);
     let out = stdout(&o);
@@ -540,9 +577,7 @@ fn doctor_reports_an_xcomm_that_does_not_run_and_does_not_wait_for_it() {
         .parse()
         .unwrap();
     let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
-        .is_ok()
-    {
+    while running(pid) {
         assert!(
             std::time::Instant::now() < until,
             "its child {pid} still runs"
@@ -658,10 +693,7 @@ fn uninstall_stops_a_running_hotplug_watcher() {
         assert!(std::time::Instant::now() < until, "no watch.pid");
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let alive = || {
-        rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
-            .is_ok()
-    };
+    let alive = || running(pid);
     assert!(alive());
     let o = h.run("doctor", &[("FAKE_LIST", NONE)]);
     let out = stdout(&o);
