@@ -450,6 +450,10 @@ impl ctl::server::Session for View<'_> {
         }
     }
 
+    fn written(&self) -> u64 {
+        self.queue.as_ref().map_or(0, |q| q.written())
+    }
+
     fn sent(&mut self, bytes: &[u8]) {
         if self.marker.is_none() {
             return;

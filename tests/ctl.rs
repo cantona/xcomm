@@ -768,6 +768,181 @@ fn rename_replaces_a_socket_a_killed_session_left() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A session whose line takes `per_pass` bytes per serve pass, everyone's
+/// sends together, and nothing of a send longer than `stuck_over` (a line
+/// held off while that one is due); it notes each whole send.
+struct Line {
+    ring: xcomm::ring::Ring,
+    per_pass: usize,
+    stuck_over: usize,
+    room: usize,
+    written: u64,
+    sent: Vec<usize>,
+}
+
+impl Line {
+    fn new(per_pass: usize) -> Line {
+        Line {
+            ring: xcomm::ring::Ring::new(4096),
+            per_pass,
+            stuck_over: usize::MAX,
+            room: 0,
+            written: 0,
+            sent: Vec::new(),
+        }
+    }
+}
+
+impl xcomm::ctl::server::Session for Line {
+    fn status(&self) -> xcomm::ctl::proto::Status {
+        xcomm::ctl::proto::Status {
+            device: String::new(),
+            tty: String::new(),
+            stable: String::new(),
+            settings: None,
+            modem: None,
+            connected: true,
+            offset: 0,
+            oldest: 0,
+            capture: None,
+            transfer: false,
+            ctl: String::new(),
+            herdr_pane: None,
+            pid: 0,
+        }
+    }
+    fn ring(&self) -> &xcomm::ring::Ring {
+        &self.ring
+    }
+    fn send(&mut self, bytes: &[u8]) -> Result<usize, (u8, String)> {
+        let n = if bytes.len() > self.stuck_over {
+            0
+        } else {
+            bytes.len().min(self.room)
+        };
+        self.room -= n;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn sent(&mut self, bytes: &[u8]) {
+        self.sent.push(bytes.len());
+    }
+    fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+/// A client that sends `sizes` as sends, one request each, then closes
+/// unless `stay` (its stream is kept until the thread is joined).
+fn client(
+    server: &xcomm::ctl::server::CtlServer,
+    sizes: &[usize],
+    stay: Option<std::sync::mpsc::Receiver<()>>,
+) -> std::thread::JoinHandle<()> {
+    let path = server.path().to_path_buf();
+    let req: String = sizes
+        .iter()
+        .map(|&n| {
+            let data = xcomm::ctl::proto::base64_encode(&vec![b'x'; n]);
+            format!("{{\"cmd\":\"send\",\"data_b64\":\"{data}\"}}\n")
+        })
+        .collect();
+    std::thread::spawn(move || {
+        let mut c = UnixStream::connect(&path).unwrap();
+        c.write_all(req.as_bytes()).unwrap();
+        if let Some(stay) = stay {
+            let _ = stay.recv();
+        }
+    })
+}
+
+/// Serves `server` until `done`, for 30 s at most (a loaded machine); the
+/// line has `per_pass` of room on each pass.
+fn serve_until(
+    server: &mut xcomm::ctl::server::CtlServer,
+    line: &mut Line,
+    done: impl Fn(&Line, usize) -> bool,
+) {
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let mut fds = Vec::new();
+    loop {
+        fds.clear();
+        let wake = server.poll_fds(0, &mut fds);
+        // fds: the listener, then one per client.
+        if done(line, fds.len() - 1) {
+            return;
+        }
+        assert!(std::time::Instant::now() < until, "sent {:?}", line.sent);
+        let ms = wake.map_or(20, |t| {
+            t.saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(20) as i32
+        });
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        // A line's pace: per_pass every 10 ms at most.
+        std::thread::sleep(Duration::from_millis(10));
+        line.room = line.per_pass;
+        server.serve(&fds, line);
+    }
+}
+
+#[test]
+fn a_send_left_behind_goes_while_the_line_moves_and_is_dropped_when_it_does_not() {
+    use xcomm::ctl::{CtlMode, server::CtlServer};
+    let dir = lock_dir("ctl-stall");
+    let mut server = CtlServer::bind(&dir, "ttyS", CtlMode::ReadWrite).unwrap();
+    server.set_unattended_stall(Duration::from_millis(300));
+    // A first send longer than one read pass is read after the close. On a
+    // slow line that takes some each pass, all of it goes, however long.
+    let mut line = Line::new(64 << 10);
+    let c = client(&server, &[350_000, 2], None);
+    serve_until(&mut server, &mut line, |l, _| l.sent.len() == 2);
+    c.join().unwrap();
+    assert_eq!(line.sent, [350_000, 2]);
+    // Behind another client's send, it gets no room for a long while (about
+    // 1 s, three times the stall), but the line moves: it waits its turn
+    // rather than being dropped.
+    let mut line = Line::new(500);
+    let (go, stay) = std::sync::mpsc::channel();
+    let a = client(&server, &[50_000], Some(stay));
+    // Its send under way (its request can come slowly: macOS's socket
+    // buffer is small), so the other one is behind it.
+    serve_until(&mut server, &mut line, |l, _| l.written > 0);
+    let b = client(&server, &[2], None);
+    serve_until(&mut server, &mut line, |l, _| l.sent.len() == 2);
+    assert_eq!(line.sent, [50_000, 2]);
+    go.send(()).unwrap();
+    a.join().unwrap();
+    b.join().unwrap();
+    serve_until(&mut server, &mut line, |_, clients| clients == 0);
+    // A line held off while the long send is due: once it has taken nothing
+    // for the stall, the client goes, and its later request (which the
+    // line would take) does not run after the send cut short.
+    let mut line = Line::new(64 << 10);
+    line.stuck_over = 1000;
+    let c = client(&server, &[350_000, 2], None);
+    serve_until(&mut server, &mut line, |_, clients| clients == 1);
+    // Its long first request read whole (a few passes), well within the stall.
+    let t = std::time::Instant::now();
+    serve_until(&mut server, &mut line, |_, _| {
+        t.elapsed() >= Duration::from_millis(200)
+    });
+    // Time the server was away (its loop blocked elsewhere) is not counted:
+    // a pass after a long gap does not drop it.
+    std::thread::sleep(Duration::from_millis(2500));
+    let mut fds = Vec::new();
+    server.poll_fds(0, &mut fds);
+    server.serve(&fds, &mut line);
+    fds.clear();
+    server.poll_fds(0, &mut fds);
+    assert_eq!(fds.len(), 2, "the client was dropped after the gap");
+    serve_until(&mut server, &mut line, |_, clients| clients == 0);
+    c.join().unwrap();
+    assert_eq!(line.sent, [0usize; 0]);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn break_on_a_pty_succeeds_and_the_session_goes_on() {
     let (dev, s, path) = start(&[]);

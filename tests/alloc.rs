@@ -82,6 +82,9 @@ impl Session for View<'_> {
         assert!(self.queue.push(&bytes[..n]));
         Ok(n)
     }
+    fn written(&self) -> u64 {
+        self.queue.written()
+    }
 }
 
 impl Control for Count {

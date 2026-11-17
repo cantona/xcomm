@@ -23,6 +23,16 @@ const READS_PER_STEP: usize = 4;
 /// How long accepting waits after it failed for want of descriptors: the
 /// pending connection keeps the listener readable, and poll would spin.
 const ACCEPT_PAUSE: Duration = Duration::from_secs(1);
+/// How long a send whose client has closed may wait with the line taking
+/// nothing at all (of anyone's) before the client is dropped. Not a limit
+/// on the whole send: a slow line takes some all the time (350 KB at 9600
+/// baud takes six minutes). One held off for good would otherwise keep the
+/// client's place forever.
+const UNATTENDED_STALL: Duration = Duration::from_secs(30);
+/// While such a send waits, the server looks at the line this often; a
+/// longer gap between two looks (the session loop blocked elsewhere, on a
+/// terminal nobody reads) is not counted as the line taking nothing.
+const STALL_LOOK: Duration = Duration::from_secs(1);
 
 /// A request that acts on the session rather than on the server: the
 /// session takes it with [`CtlServer::next_action`] and answers it with
@@ -59,6 +69,10 @@ pub trait Session {
     fn send(&mut self, bytes: &[u8]) -> Result<usize, (u8, String)>;
     /// All of a client's send has been taken for the device.
     fn sent(&mut self, _bytes: &[u8]) {}
+    /// Bytes the line has taken so far, anyone's (clients' and the keys'):
+    /// a send waiting its turn behind others tells a busy line from a
+    /// stuck one by it.
+    fn written(&self) -> u64;
 }
 
 pub struct CtlServer {
@@ -74,12 +88,20 @@ pub struct CtlServer {
     accept_paused: Option<Instant>,
     /// The id the next client gets.
     next_id: u64,
+    /// UNATTENDED_STALL, shorter in tests.
+    unattended_stall: Duration,
 }
 
 /// Bytes the session has taken from a client for the device.
 struct Sending {
     bytes: Vec<u8>,
     done: usize,
+    /// When the line last took anything, this send's or anyone's.
+    moved: Instant,
+    /// The line's [`Session::written`] then.
+    line: u64,
+    /// When the server last looked.
+    looked: Instant,
     /// The ring's end when the request came: the send's offset.
     offset: u64,
 }
@@ -308,7 +330,13 @@ impl Client {
     }
 
     /// Moves the client on: queued bytes to the device, the next request.
-    fn step(&mut self, revents: libc::c_short, mode: CtlMode, s: &mut dyn Session) {
+    fn step(
+        &mut self,
+        revents: libc::c_short,
+        mode: CtlMode,
+        stall: Duration,
+        s: &mut dyn Session,
+    ) {
         if revents & libc::POLLNVAL != 0 {
             self.dead = true;
             return;
@@ -336,6 +364,25 @@ impl Client {
         }
         loop {
             self.send_more(s);
+            if self.unattended
+                && let Some(x) = &mut self.sending
+            {
+                let (line, now) = (s.written(), Instant::now());
+                let away = now.duration_since(x.looked) > 2 * STALL_LOOK;
+                x.looked = now;
+                if line != x.line || away {
+                    x.line = line;
+                    x.moved = now;
+                } else if now.duration_since(x.moved) >= stall {
+                    // No one is waiting for it, and the line has taken
+                    // nothing of anyone's that long. The client goes with
+                    // its unread requests: run after a send cut short,
+                    // they would join its bytes on the device.
+                    self.sending = None;
+                    self.dead = true;
+                    break;
+                }
+            }
             while !self.busy() && self.cursor.is_none() {
                 let Some(end) = self.line_end() else {
                     break;
@@ -393,6 +440,9 @@ impl Client {
         match s.send(&sending.bytes[sending.done..]) {
             Ok(n) => {
                 sending.done += n;
+                if n > 0 {
+                    sending.moved = Instant::now();
+                }
                 if sending.done == sending.bytes.len() {
                     if !sending.bytes.is_empty() {
                         s.sent(&sending.bytes);
@@ -470,6 +520,9 @@ impl Client {
                         self.sending = Some(Sending {
                             bytes,
                             done: 0,
+                            moved: Instant::now(),
+                            line: s.written(),
+                            looked: Instant::now(),
                             offset: ring.end(),
                         });
                     }
@@ -632,7 +685,14 @@ impl CtlServer {
             clients: Vec::new(),
             accept_paused: None,
             next_id: 0,
+            unattended_stall: UNATTENDED_STALL,
         })
+    }
+
+    /// How long a send whose client has closed may go with the line taking
+    /// none of it before it is dropped (30 s): for tests.
+    pub fn set_unattended_stall(&mut self, stall: Duration) {
+        self.unattended_stall = stall;
     }
 
     /// The next request that acts on the session, not taken yet, with its
@@ -752,7 +812,23 @@ impl CtlServer {
         let ready = self.clients.iter().any(|c| {
             !c.busy() && (c.unwritable || (c.cursor.is_none() && c.has_request()))
         });
-        if ready { Some(Instant::now()) } else { paused }
+        // An unattended send is dropped once it has stalled long enough,
+        // and nothing else may come to wake the loop then.
+        let stalled = self
+            .clients
+            .iter()
+            .filter(|c| c.unattended)
+            .filter_map(|c| {
+                c.sending
+                    .as_ref()
+                    .map(|x| (x.moved + self.unattended_stall).min(x.looked + STALL_LOOK))
+            })
+            .min();
+        if ready {
+            Some(Instant::now())
+        } else {
+            [paused, stalled].into_iter().flatten().min()
+        }
     }
 
     /// Acts on what poll found, `ready` being what
@@ -762,7 +838,7 @@ impl CtlServer {
         let n = self.clients.len().min(ready.len().saturating_sub(1));
         for (i, c) in self.clients.iter_mut().enumerate() {
             let revents = if i < n { ready[i + 1].revents } else { 0 };
-            c.step(revents, self.mode, s);
+            c.step(revents, self.mode, self.unattended_stall, s);
         }
         self.clients.retain(|c| !c.dead);
         if self.accept_paused.is_some_and(|t| Instant::now() >= t) {
@@ -820,7 +896,7 @@ impl CtlServer {
             // A request may already be there, and the close with it: then
             // it is unread at the close like any other, not given up on.
             let hup = if c.peer_gone() { libc::POLLHUP } else { 0 };
-            c.step(libc::POLLIN | hup, self.mode, s);
+            c.step(libc::POLLIN | hup, self.mode, self.unattended_stall, s);
             if !c.dead {
                 self.clients.push(c);
             }

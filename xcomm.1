@@ -281,7 +281,11 @@ for another;
 .BI \-\-hex " hex"
 or
 .BI \-\-file " path"
-send bytes as they are.
+send bytes as they are. A client that closes the socket gives up the request it
+was waiting on; requests still unread then (a pipe into
+.BR socat ,
+say) run anyway. Such a client is dropped, with what it has not run yet, only
+once the device has taken nothing at all for 30 seconds.
 .TP
 .BI "xcomm ctl " device " read"
 The device output the session keeps (escape sequences removed when piped, see
