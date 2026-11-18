@@ -10,7 +10,10 @@ GIF's console capture: real xcomm output on the simulated board.
     scripts/agent-gif-capture.sh target/release/xcomm CAPTURES
     scripts/social-preview.py CAPTURES/07-console.ansi assets/social-preview.png
 
-Needs Pillow, Noto Sans and JetBrains Mono.
+It refuses an image that is not what this project uploads (a PNG under
+1 MB, 1280x640, no transparency), within GitHub's limits for a social
+preview, and leaves OUT as it was. Needs Pillow, Noto Sans and JetBrains
+Mono.
 """
 
 import importlib.util
@@ -203,7 +206,38 @@ def main():
     d.text((lx, yy + 1 * S), "←", font=af, fill=(14, 30, 20))
     d.text((lx + aw, yy), label, font=lf, fill=(14, 30, 20))
 
-    img.resize((W // S, H // S), Image.LANCZOS).save(sys.argv[2], optimize=True)
+    out = sys.argv[2]
+    if not out.lower().endswith(".png"):
+        sys.exit(f"social-preview: {out}: write a .png")
+    # Checked before it takes OUT's place: a refused image replaces nothing.
+    tmp = out + ".new.png"
+    try:
+        img.resize((W // S, H // S), Image.LANCZOS).save(tmp, optimize=True)
+        bad = problems(tmp)
+        if not bad:
+            os.replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    if bad:
+        sys.exit(f"social-preview: {out} not written, left as it was: " + "; ".join(bad))
+
+
+def problems(path):
+    """What this project uploads: a PNG under 1 MB at 1280x640, GitHub's
+    recommended size, with no transparency, which shows differently on light
+    and dark backgrounds. GitHub itself also takes JPG and GIF, from
+    640x320 up, and transparency."""
+    with Image.open(path) as im:
+        size, mode, fmt = im.size, im.mode, im.format
+    n = os.path.getsize(path)
+    bad = [why for ok, why in [
+        (fmt == "PNG", f"format {fmt}, not PNG"),
+        (size == (1280, 640), f"{size[0]}x{size[1]}, not 1280x640"),
+        ("A" not in mode and mode != "P", f"mode {mode}: transparency possible"),
+        (n < 1_000_000, f"{n} bytes, not under 1 MB"),
+    ] if not ok]
+    return bad
 
 
 if __name__ == "__main__":
