@@ -91,10 +91,10 @@ fn non_utf8_prefix_env_is_an_error() {
 }
 
 #[test]
-fn version_to_closed_pipe_reports_error_without_aborting() {
+fn version_to_unwritable_stdout_reports_error_without_aborting() {
     let out = cmd()
         .arg("--version")
-        .stdout(closed_pipe())
+        .stdout(refuses_writes())
         .stderr(Stdio::piped())
         .output()
         .unwrap();
@@ -103,15 +103,20 @@ fn version_to_closed_pipe_reports_error_without_aborting() {
     assert!(err.starts_with("xcomm: cannot write to stdout: "), "{err}");
 }
 
-fn closed_pipe() -> std::io::PipeWriter {
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    writer
+/// Where every write fails (EPIPE), as on a pipe with no reader. Not a pipe:
+/// macOS has no pipe2, so a process another test spawns at the wrong moment
+/// inherits the read end before it is marked close-on-exec, and the pipe
+/// then has a reader after all. A socket shut down for writing refuses
+/// writes whoever holds its peer.
+fn refuses_writes() -> std::os::fd::OwnedFd {
+    let (end, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    end.shutdown(std::net::Shutdown::Write).unwrap();
+    end.into()
 }
 
 #[test]
 fn usage_error_with_closed_stderr_still_exits_2() {
-    let out = cmd().stderr(closed_pipe()).output().unwrap();
+    let out = cmd().stderr(refuses_writes()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -119,8 +124,8 @@ fn usage_error_with_closed_stderr_still_exits_2() {
 fn version_with_stdout_and_stderr_closed_exits_1() {
     let out = cmd()
         .arg("--version")
-        .stdout(closed_pipe())
-        .stderr(closed_pipe())
+        .stdout(refuses_writes())
+        .stderr(refuses_writes())
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
