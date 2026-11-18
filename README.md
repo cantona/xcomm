@@ -299,6 +299,13 @@ stopping U-Boot's autoboot, logging in, parsing `--json`, capturing a boot log
 and a zmodem upload. `xcomm skill install` refuses a directory a dotfiles
 repository may own unless you give `--dir`, and replaces only a copy it wrote.
 
+<p align="center"><img src="assets/agent.gif" alt="An xcomm session on a board's console (left) and a shell beside it (right) running commands adapted from the skill's examples: xcomm ctl catches U-Boot's countdown and stops autoboot, boots the board, logs in, runs uname -a and picks eth0's address out; each line sent shows as [ctl] in the console" width="900"></p>
+
+> Commands adapted from the skill's examples, typed into a shell beside a real
+> xcomm session on a simulated board, which boots on its first input; on a real
+> board the skill has the agent ask you before a reset
+> (`scripts/agent-gif-capture.sh`, `scripts/agent-gif.py`).
+
 ## herdr plugin
 
 <p align="center"><img src="assets/picker.svg" alt="The xcomm port picker in a herdr popup" width="771"></p>
