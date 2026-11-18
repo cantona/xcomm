@@ -157,8 +157,9 @@ def main():
     x2 = L + 250 * S
     d.text((x2, y), "1/50", font=big, fill=CYAN)
     d.text((x2 + 2 * S, y + 60 * S), "of its CPU per MiB", font=lab, fill=FG)
-    d.text((L, y + 90 * S), "through a pty · method and numbers in the README",
-           font=font(JB, "Regular", 12), fill=MUTED)
+    # Big enough to read wherever the numbers are: at README width too.
+    d.text((L, y + 88 * S), "measured through a pty · method in the README",
+           font=font(JB, "Medium", 16), fill=FG)
 
     cf = font(NOTO, "SemiBold", 15)
     x, cy = L, 456 * S
