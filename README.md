@@ -8,6 +8,8 @@
 <a href="#license"><img src="https://img.shields.io/badge/license-GPL--2.0--only-blue.svg" alt="License: GPL-2.0-only"></a>
 </p>
 
+<p align="center"><img src="assets/social-preview.png" alt="The xcomm banner: Linux and macOS, open source; the headline numbers, measured through a pty; agent control socket, reconnects on unplug, minicom-style keys; install lines for Homebrew, cargo and the herdr plugin; and a console where the lines sent over the control socket show as [ctl]." width="900"></p>
+
 <p align="center">
 <a href="#benchmarks">40× minicom's throughput on a fiftieth of its CPU</a>.
 The keys your fingers already know. A control socket that lets scripts and
@@ -20,7 +22,7 @@ console one keystroke away.
 
 > The pictures in this README, and its `xcomm list` output, are of a simulated
 > board (`scripts/demo-board.py`) and made-up USB adapters, captured from a real
-> xcomm.
+> xcomm; window frames and labels around them are drawn.
 
 ## Why xcomm
 
