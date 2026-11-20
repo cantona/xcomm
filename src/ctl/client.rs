@@ -257,6 +257,9 @@ pub(super) fn send_after(
         let reply = conn
             .request(&Request::Send {
                 data_b64: proto::base64_encode(chunk),
+                drops: first
+                    .as_ref()
+                    .and_then(|r: &serde_json::Value| r["drops"].as_u64()),
             })
             .map_err(|(status, msg)| match first {
                 // Closing cancels the send: what the session had not yet
@@ -739,4 +742,36 @@ fn sessions(dirs: &Dirs, json: bool) -> Result<u8, Failed> {
     }
     print_out(out.as_bytes())?;
     Ok(code::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn later_parts_of_a_send_carry_the_first_parts_drops() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut w = theirs.try_clone().unwrap();
+            let mut r = BufReader::new(theirs);
+            let mut seen = Vec::new();
+            for offset in [5, 9] {
+                let mut l = String::new();
+                r.read_line(&mut l).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&l).unwrap();
+                seen.push(v["drops"].clone());
+                let reply = serde_json::json!({"offset": offset, "drops": 3});
+                w.write_all(&proto::ok(reply)).unwrap();
+            }
+            seen
+        });
+        let mut conn = Conn::new(Path::new("/nonexistent/x.sock"), ours, None).unwrap();
+        let bytes = vec![b'a'; SEND_CHUNK + 1];
+        let first = send_after(&mut conn, &bytes, &serde_json::Value::Null).unwrap();
+        assert_eq!(first["offset"], 5);
+        assert_eq!(
+            peer.join().unwrap(),
+            [serde_json::Value::Null, serde_json::json!(3)]
+        );
+    }
 }

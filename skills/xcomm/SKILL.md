@@ -188,7 +188,8 @@ echo "kernel: $ver, eth0: $ip"
 
 `--json` gives the same as one object: `which` (`until`, `fail_on`,
 `idle`, `timeout`, or `gone` when the port went away during the wait),
-`text` and `groups` of the match, `end`, and `output`.
+`text` and `groups` of the match, `end`, and `output`. A `run` whose
+send the port cut prints no object: it exits 4 with the reason on stderr.
 
 ### Capture a boot log
 

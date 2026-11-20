@@ -116,9 +116,9 @@ struct Sending {
     looked: Instant,
     /// The ring's end when the request came: the send's offset.
     offset: u64,
-    /// How many times the device had gone away then. Not when the reply
-    /// goes: a send still waiting for room when the device went away and
-    /// came back has its offset before that drop.
+    /// How many times the device had gone away then, with `offset` the
+    /// connection the send went to: its later parts and its `run` give it
+    /// back.
     drops: usize,
 }
 
@@ -561,7 +561,17 @@ impl Client {
                     Err(e) => self.reply(proto::err(code::EVICTED, &e.to_string())),
                 }
             }
-            Request::Send { data_b64 } => {
+            Request::Send {
+                data_b64,
+                drops: first,
+            } => {
+                if first.is_some_and(|k| usize::try_from(k).ok() != Some(drops.len())) {
+                    self.reply(proto::err(
+                        code::DISCONNECTED,
+                        "the device went away during the send",
+                    ));
+                    return;
+                }
                 if mode != CtlMode::ReadWrite {
                     self.reply(proto::err(
                         code::DENIED,
@@ -950,6 +960,19 @@ impl CtlServer {
         self.drops.push(at);
         let mut gone = false;
         for c in &mut self.clients {
+            // A send not yet all queued ends here: what was queued went
+            // with the device, and the rest must not reach a device that
+            // comes back. One no one waits for goes with the requests it
+            // left unread, which would follow the cut send.
+            if c.sending.take().is_some() {
+                c.reply(proto::err(
+                    code::DISCONNECTED,
+                    "the device went away during the send",
+                ));
+                c.flush();
+                c.dead |= c.unattended;
+                gone |= c.dead;
+            }
             if c.until_drop.is_some() {
                 c.feed(ring, &self.drops);
                 gone |= c.dead;

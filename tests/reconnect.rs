@@ -644,7 +644,7 @@ fn a_wait_goes_on_across_a_reconnect() {
 }
 
 #[test]
-fn a_run_whose_send_waited_across_a_fast_reconnect_ends_with_4() {
+fn a_run_whose_send_waited_at_a_fast_reconnect_ends_with_4() {
     let dir = temp_dir();
     let (d1, link, s) = start(&dir);
     let d2 = support::pty();
@@ -659,21 +659,23 @@ fn a_run_whose_send_waited_across_a_fast_reconnect_ends_with_4() {
         &["run", "mycmd", "--until", "PROMPT> $", "--timeout", "20"],
     );
     std::thread::sleep(Duration::from_millis(800));
-    // Back before the session first looks: its send goes on to d2.
+    // Back before the session first looks: the send still waiting ends
+    // with the drop, and nothing of it reaches d2.
     relink(&link, &d2.slave_path);
     drop(d1);
     read_until(s.host.master.as_fd(), b"reconnected", T);
     write_all(d2.master.as_fd(), b"booting\r\nPROMPT> ");
-    read_until(d2.master.as_fd(), b"mycmd\r", Duration::from_secs(30));
     let o = client.wait_with_output().unwrap();
     for f in fill {
         let _ = f.wait_with_output();
     }
-    assert_eq!(
-        o.status.code(),
-        Some(xcomm::ctl::code::DISCONNECTED as i32),
-        "{o:?}"
-    );
+    says_gone(&o);
+    let o = ctl(&s, &link, &["send", "-n", "after"])
+        .wait_with_output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let got = read_until(d2.master.as_fd(), b"after", T);
+    assert_eq!(String::from_utf8_lossy(&got), "after");
 }
 
 /// A connection to the control socket of session `s`.
@@ -781,4 +783,95 @@ fn a_subscriber_behind_at_the_drop_gets_the_rest_then_ends() {
     let (before, _, _) = xcomm::ctl::proto::last_words(&got).expect("last words");
     assert_eq!(before, 150 * 4096);
     assert!(got[..before].iter().all(|&b| b == b'y'));
+}
+
+/// A 400 KB `ctl send --file` that `d1` reads only the start of, so it is
+/// still being queued when the test pulls the device.
+fn long_send(s: &Spawned, link: &Path, dir: &TempDir, d1: &Pty) -> std::process::Child {
+    let file = dir.0.join("long.txt");
+    fs::write(&file, vec![b'a'; 400_000]).unwrap();
+    let client = ctl(s, link, &["send", "--file", file.to_str().unwrap()]);
+    read_until(d1.master.as_fd(), b"a", T);
+    client
+}
+
+fn says_gone(o: &std::process::Output) {
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("went away during the send"),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn a_send_cut_by_the_drop_ends_with_4() {
+    let dir = temp_dir();
+    let (d1, link, _s) = start(&dir);
+    let client = long_send(&_s, &link, &dir, &d1);
+    let gone = Instant::now();
+    drop(d1);
+    let o = client.wait_with_output().unwrap();
+    says_gone(&o);
+    assert!(gone.elapsed() < T, "took {:?}", gone.elapsed());
+}
+
+#[test]
+fn a_send_cut_by_a_fast_reconnect_ends_and_sends_no_more() {
+    let dir = temp_dir();
+    let (d1, link, mut s) = start(&dir);
+    let d2 = support::pty();
+    let client = long_send(&s, &link, &dir, &d1);
+    // Back before the session first looks.
+    relink(&link, &d2.slave_path);
+    let gone = Instant::now();
+    drop(d1);
+    let o = client.wait_with_output().unwrap();
+    says_gone(&o);
+    assert!(gone.elapsed() < T, "took {:?}", gone.elapsed());
+    read_until(s.host.master.as_fd(), b"reconnected", T);
+    // None of the cut send reaches the device that came back; what is
+    // sent after it does.
+    let o = ctl(&s, &link, &["send", "-n", "after"])
+        .wait_with_output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let got = read_until(d2.master.as_fd(), b"after", T);
+    assert_eq!(String::from_utf8_lossy(&got), "after");
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
+}
+
+#[test]
+fn a_later_part_of_a_send_is_refused_after_a_drop() {
+    use std::io::Write;
+    let dir = temp_dir();
+    let (d1, link, mut s) = start(&dir);
+    let d2 = support::pty();
+    // The first part went out on d1; the device is back as d2 before the
+    // next part comes.
+    let (mut r, mut w, sent) = raw_send(&s);
+    read_until(d1.master.as_fd(), b"x", T);
+    relink(&link, &d2.slave_path);
+    drop(d1);
+    read_until(s.host.master.as_fd(), b"reconnected", T);
+    let line = format!(
+        "{{\"cmd\":\"send\",\"data_b64\":\"Yg==\",\"drops\":{}}}\n",
+        sent["drops"]
+    );
+    w.write_all(line.as_bytes()).unwrap();
+    let got = reply(&mut r);
+    assert_eq!(got["code"], xcomm::ctl::code::DISCONNECTED, "{got}");
+    // Not "b": only what is sent after it reaches d2.
+    let o = ctl(&s, &link, &["send", "-n", "after"])
+        .wait_with_output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let got = read_until(d2.master.as_fd(), b"after", T);
+    assert_eq!(String::from_utf8_lossy(&got), "after");
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
 }

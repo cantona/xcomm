@@ -11,6 +11,13 @@ What changed in each release of xcomm.
   pass for the answer to a command it never ran. `xcomm ctl wait` still
   waits across a reconnect.
 
+### Fixed
+- `xcomm ctl send` cut by the port going away exits 4 at once. It waited for
+  a reply that never came (79 s for a 400 KB send at 115200 baud), and when
+  the port came back before the session looked, the rest of it went to the
+  device that came back. A `run` whose own send is cut so ends the same way,
+  printing nothing.
+
 ## [0.1.3] - 2026-11-18
 
 ### Added

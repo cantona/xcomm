@@ -288,8 +288,12 @@ or
 send bytes as they are. A client that closes the socket gives up the request it
 was waiting on; requests still unread then (a pipe into
 .BR socat ,
-say) run anyway. Such a client is dropped, with what it has not run yet, only
-once the device has taken nothing at all for 30 seconds.
+say) run anyway. Such a client is dropped, with what it has not run yet, once
+the device has taken nothing at all for 30 seconds, or when the port goes away
+during its send.
+A send the session has not yet taken whole when the port goes away exits 4,
+and the rest is not sent, also to a device that comes back; what it had taken
+may not have reached the device either.
 .TP
 .BI "xcomm ctl " device " read"
 The device output the session keeps (escape sequences removed when piped, see
@@ -355,6 +359,9 @@ If the port goes away while it waits for the match,
 prints what came before it and exits 4, as on a timeout with 1: a
 prompt from the device that comes back is not the answer, and the
 command may not have run.
+A run whose own send the port cuts ends there as
+.B send
+does, printing nothing.
 Its
 .B end=
 line is kept apart from the output as

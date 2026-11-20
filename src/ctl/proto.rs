@@ -21,6 +21,11 @@ pub enum Request {
     /// Raw bytes for the device; the client has added any line ending.
     Send {
         data_b64: String,
+        /// The `drops` the reply to this send's first part gave, on each
+        /// later part: refused with code 4 if the device has gone away
+        /// since, so a send never ends on a device that came back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drops: Option<u64>,
     },
     /// From `since`, or the last `last` bytes, or (neither) the oldest held.
     Read {
