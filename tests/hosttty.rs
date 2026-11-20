@@ -456,7 +456,10 @@ fn eintr_child() {
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        tid_tx.send(unsafe { libc::pthread_self() }).unwrap();
+        // As an integer: pthread_t is a pointer on musl, not Send.
+        tid_tx
+            .send(unsafe { libc::pthread_self() } as usize)
+            .unwrap();
         let mut b = [0u8; 1];
         let n = unsafe {
             libc::read(
@@ -469,7 +472,7 @@ fn eintr_child() {
             .send((n, std::io::Error::last_os_error().raw_os_error()))
             .unwrap();
     });
-    let tid = tid_rx.recv().unwrap();
+    let tid = tid_rx.recv().unwrap() as libc::pthread_t;
     // A signal that lands before the thread is inside read() is consumed
     // without an EINTR, so keep signalling until the read returns.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
