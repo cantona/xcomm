@@ -93,6 +93,10 @@ pub struct CtlServer {
     next_id: u64,
     /// UNATTENDED_STALL, shorter in tests.
     unattended_stall: Duration,
+    /// Where the device went away, as ring offsets, in order: a send's
+    /// reply counts them, and a subscription that gave that count ends at
+    /// the next.
+    drops: Vec<u64>,
     /// The clients [`poll_fds`](Self::poll_fds) appended, by id, in order:
     /// [`serve`](Self::serve) gives each its own result even if the list
     /// changed in between (a subscriber dropped, clients served during a
@@ -112,6 +116,10 @@ struct Sending {
     looked: Instant,
     /// The ring's end when the request came: the send's offset.
     offset: u64,
+    /// How many times the device had gone away then. Not when the reply
+    /// goes: a send still waiting for room when the device went away and
+    /// came back has its offset before that drop.
+    drops: usize,
 }
 
 struct Client {
@@ -127,6 +135,9 @@ struct Client {
     sending: Option<Sending>,
     /// Subscribed: the offset of the next device byte to write.
     cursor: Option<u64>,
+    /// The subscription ends where the device goes away after this many
+    /// drops (the `drops` of the client's send).
+    until_drop: Option<u64>,
     /// A request for the session, not taken yet.
     action: Option<Action>,
     /// Its deadline (`deadline_ms`), if the client gave one.
@@ -157,6 +168,7 @@ impl Client {
             written: 0,
             sending: None,
             cursor: None,
+            until_drop: None,
             action: None,
             action_deadline: None,
             awaiting: false,
@@ -284,6 +296,9 @@ impl Client {
                     self.unwritable = true;
                     self.output = Vec::new();
                     self.written = 0;
+                    // Closing: nothing more it sent runs, as for one whose
+                    // last bytes were written.
+                    self.dead |= self.closing && self.cursor.is_none();
                     return;
                 }
             }
@@ -295,15 +310,29 @@ impl Client {
         }
     }
 
-    /// Writes device bytes from the ring to a subscriber.
-    fn feed(&mut self, ring: &Ring) {
+    /// Writes device bytes from the ring to a subscriber; one that ends
+    /// where the device went away gets the bytes before it, then
+    /// [`proto::gone_line`], and is closed.
+    fn feed(&mut self, ring: &Ring, drops: &[u64]) {
         let Some(at) = self.cursor else {
             return;
         };
-        if self.busy() || at >= ring.end() {
+        if self.busy() {
             return;
         }
-        match ring.slices(at, usize::MAX) {
+        let gone = self
+            .until_drop
+            .and_then(|k| drops.get(usize::try_from(k).ok()?))
+            .copied();
+        let end = gone.map_or(ring.end(), |g| g.min(ring.end()));
+        if at >= end {
+            if let Some(g) = gone {
+                self.end_at_drop(g);
+            }
+            return;
+        }
+        let max = usize::try_from(end - at).unwrap_or(usize::MAX);
+        match ring.slices(at, max) {
             Ok((a, b)) => {
                 let mut sent = 0;
                 for part in [a, b] {
@@ -326,6 +355,11 @@ impl Client {
                     }
                 }
                 self.cursor = Some(at + sent as u64);
+                // Its last bytes before the drop are out: no event may come
+                // to finish it while the device is away.
+                if let Some(g) = gone.filter(|&g| at + sent as u64 >= g) {
+                    self.end_at_drop(g);
+                }
             }
             // The ring moved past what it had not taken yet.
             Err(_) => {
@@ -337,12 +371,22 @@ impl Client {
         }
     }
 
+    /// A subscriber that has had every byte before the drop at `g`: its
+    /// last words, then the close.
+    fn end_at_drop(&mut self, g: u64) {
+        self.cursor = None;
+        self.closing = true;
+        self.reply(proto::gone_line(g).into_bytes());
+        self.flush();
+    }
+
     /// Moves the client on: queued bytes to the device, the next request.
     fn step(
         &mut self,
         revents: libc::c_short,
         mode: CtlMode,
         stall: Duration,
+        drops: &[u64],
         s: &mut dyn Session,
     ) {
         if revents & libc::POLLNVAL != 0 {
@@ -397,7 +441,7 @@ impl Client {
                 };
                 let line: Vec<u8> = self.input.drain(..=end).collect();
                 self.scanned = 0;
-                self.handle(&line[..end], mode, s);
+                self.handle(&line[..end], mode, drops, s);
                 // Now, not at the next event: there may be none until it is.
                 self.send_more(s);
             }
@@ -436,7 +480,7 @@ impl Client {
             self.dead = true;
             return;
         }
-        self.feed(s.ring());
+        self.feed(s.ring(), drops);
     }
 
     /// Gives the session what it has room for of a send; replies once all
@@ -455,9 +499,11 @@ impl Client {
                     if !sending.bytes.is_empty() {
                         s.sent(&sending.bytes);
                     }
-                    let offset = sending.offset;
+                    let (offset, drops) = (sending.offset, sending.drops);
                     self.sending = None;
-                    self.reply(proto::ok(serde_json::json!({ "offset": offset })));
+                    self.reply(proto::ok(
+                        serde_json::json!({ "offset": offset, "drops": drops }),
+                    ));
                 }
             }
             Err((code, msg)) => {
@@ -467,7 +513,7 @@ impl Client {
         }
     }
 
-    fn handle(&mut self, line: &[u8], mode: CtlMode, s: &mut dyn Session) {
+    fn handle(&mut self, line: &[u8], mode: CtlMode, drops: &[u64], s: &mut dyn Session) {
         let (request, deadline) = match serde_json::from_slice::<proto::Envelope>(line) {
             Ok(e) => (e.request, e.deadline_ms),
             Err(e) => {
@@ -532,12 +578,17 @@ impl Client {
                             line: s.written(),
                             looked: Instant::now(),
                             offset: ring.end(),
+                            drops: drops.len(),
                         });
                     }
                     None => self.reply(proto::err(code::USAGE, "data_b64 is not base64")),
                 }
             }
-            Request::Subscribe { since, from_oldest } => {
+            Request::Subscribe {
+                since,
+                from_oldest,
+                drops: until_drop,
+            } => {
                 let start = match since {
                     None => ring.end(),
                     Some(at) if at < ring.oldest() && from_oldest => ring.oldest(),
@@ -554,6 +605,7 @@ impl Client {
                 };
                 self.reply(proto::ok(serde_json::json!({ "start": start })));
                 self.cursor = Some(start);
+                self.until_drop = until_drop;
             }
             Request::Break { ms } => {
                 if let Some(e) = hold_error(ms, "break") {
@@ -694,6 +746,7 @@ impl CtlServer {
             accept_paused: None,
             next_id: 0,
             unattended_stall: UNATTENDED_STALL,
+            drops: Vec::new(),
             polled: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -862,7 +915,7 @@ impl CtlServer {
                 // their clients over these, which may not be `ready`'s.
                 .filter(|fd| fd.fd == c.stream.as_raw_fd())
                 .map_or(0, |fd| fd.revents);
-            c.step(revents, self.mode, self.unattended_stall, s);
+            c.step(revents, self.mode, self.unattended_stall, &self.drops, s);
         }
         drop(polled);
         self.clients.retain(|c| !c.dead);
@@ -882,7 +935,23 @@ impl CtlServer {
         let mut gone = false;
         for c in &mut self.clients {
             if c.cursor.is_some() {
-                c.feed(ring);
+                c.feed(ring, &self.drops);
+                gone |= c.dead;
+            }
+        }
+        if gone {
+            self.clients.retain(|c| !c.dead);
+        }
+    }
+
+    /// The device has gone away with the ring ending at `at`: subscribers
+    /// that end there get the rest of their bytes and their last words.
+    pub fn device_gone(&mut self, at: u64, ring: &Ring) {
+        self.drops.push(at);
+        let mut gone = false;
+        for c in &mut self.clients {
+            if c.until_drop.is_some() {
+                c.feed(ring, &self.drops);
                 gone |= c.dead;
             }
         }
@@ -921,7 +990,13 @@ impl CtlServer {
             // A request may already be there, and the close with it: then
             // it is unread at the close like any other, not given up on.
             let hup = if c.peer_gone() { libc::POLLHUP } else { 0 };
-            c.step(libc::POLLIN | hup, self.mode, self.unattended_stall, s);
+            c.step(
+                libc::POLLIN | hup,
+                self.mode,
+                self.unattended_stall,
+                &self.drops,
+                s,
+            );
             if !c.dead {
                 self.clients.push(c);
             }

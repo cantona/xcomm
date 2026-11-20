@@ -48,6 +48,7 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
             let reply = conn.request(&Request::Subscribe {
                 since: *since,
                 from_oldest: false,
+                drops: None,
             })?;
             let start = reply["start"]
                 .as_u64()
@@ -65,14 +66,18 @@ fn run_inner(args: &CtlArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<u8,
             let mut bytes = text.as_bytes().to_vec();
             bytes.extend_from_slice(ending_bytes(*ending));
             let started = Instant::now();
-            let offset = send_after(&mut conn, &bytes, &status)?["offset"]
+            let sent = send_after(&mut conn, &bytes, &status)?;
+            let offset = sent["offset"]
                 .as_u64()
                 .ok_or((code::FAILED, "the session sent a bad reply".to_string()))?;
             // From the offset of the send: what the device answers cannot
-            // come before it, so none of it is missed.
+            // come before it, so none of it is missed. Until the device
+            // goes away: a prompt after it comes back is not the answer.
+            // A session before 0.1.4 gives no `drops`, and waits on.
             conn.request(&Request::Subscribe {
                 since: Some(offset),
                 from_oldest: false,
+                drops: sent["drops"].as_u64(),
             })?;
             let limit = usize::try_from(*max_bytes).unwrap_or(usize::MAX);
             let outcome = watch(
@@ -183,10 +188,11 @@ fn watch(
         };
         heard = Instant::now();
         held.extend_from_slice(&buf[..n]);
-        // The session's last words to a subscriber that fell behind, or
-        // device output that reads the same: only the first is followed by
-        // the close.
-        if let Some((len, dropped)) = proto::dropped_at(&held)
+        // The session's last words (a subscriber that fell behind, a device
+        // that went away), or device output that reads the same: only the
+        // first is followed by the close. What came before them still
+        // counts.
+        if let Some((len, why, end)) = proto::last_words(&held)
             && closed_next(&mut conn.reader)?
         {
             if let Some(found) =
@@ -194,12 +200,18 @@ fn watch(
             {
                 return Ok(found);
             }
-            return Err((
-                code::DROPPED,
-                format!("subscriber too slow at offset {dropped}"),
-            ));
+            if why == code::DISCONNECTED {
+                // As without it: too much output before the end is that.
+                if let Some(limit) = limit
+                    && matcher.held() > limit
+                {
+                    return Err(over_max_bytes(limit));
+                }
+                return Ok(Outcome::Gone { end });
+            }
+            return Err((why, format!("subscriber too slow at offset {end}")));
         }
-        let ready = held.len() - proto::dropped_start(&held);
+        let ready = held.len() - proto::last_words_start(&held);
         let found = matcher.feed(at, &held[..ready]);
         at += ready as u64;
         held.drain(..ready);
@@ -209,14 +221,16 @@ fn watch(
         if let Some(limit) = limit
             && matcher.held() > limit
         {
-            return Err((
-                code::USAGE,
-                format!(
-                    "more than {limit} bytes of output without a match (--max-bytes)"
-                ),
-            ));
+            return Err(over_max_bytes(limit));
         }
     }
+}
+
+fn over_max_bytes(limit: usize) -> Failed {
+    (
+        code::USAGE,
+        format!("more than {limit} bytes of output without a match (--max-bytes)"),
+    )
 }
 
 /// Whether the session with process id `pid`, first found on `path`, goes
@@ -291,6 +305,7 @@ fn finish(
         } => ("fail_on", code::FAIL_ON, *end),
         Outcome::Idle { end } => ("idle", code::OK, *end),
         Outcome::Timeout { end } => ("timeout", code::FAILED, *end),
+        Outcome::Gone { end } => ("gone", code::DISCONNECTED, *end),
     };
     if json {
         let mut v = serde_json::json!({
@@ -327,6 +342,7 @@ fn finish(
                 let message = matches!(
                     outcome,
                     Outcome::Timeout { .. }
+                        | Outcome::Gone { .. }
                         | Outcome::Matched {
                             which: Which::FailOn(_),
                             ..
@@ -351,6 +367,9 @@ fn finish(
             "timed out after {:.1} s",
             started.elapsed().as_secs_f64()
         )),
+        Outcome::Gone { end } => {
+            crate::out::report(&format!("the device went away at offset {end}"))
+        }
         _ => {}
     }
     if !json && !quiet {
@@ -442,6 +461,51 @@ mod tests {
             got,
             Err((code::DROPPED, "subscriber too slow at offset 7".into()))
         );
+    }
+
+    #[test]
+    fn the_device_going_away_ends_the_wait() {
+        let line = proto::gone_line(7);
+        let got = watch_peer(move |mut s| {
+            s.write_all(&[b"abcdefg", line.as_bytes()].concat())
+                .unwrap();
+        });
+        assert_eq!(got, Ok(Outcome::Gone { end: 7 }));
+    }
+
+    #[test]
+    fn too_much_output_before_the_device_went_away_is_that() {
+        let line = proto::gone_line(1000);
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut s = theirs;
+            s.write_all(&[&[b'x'; 1000][..], line.as_bytes()].concat())
+                .unwrap();
+        });
+        let mut conn = Conn::new(Path::new("/nonexistent/x.sock"), ours, None).unwrap();
+        let o = opts();
+        let mut m =
+            Matcher::new(o.until.as_deref(), &o.fail_on, true, false, false).unwrap();
+        let got = watch(&mut conn, &mut m, 0, &o, Some(100), &|| false);
+        t.join().unwrap();
+        assert_eq!(got.map_err(|(c, _)| c), Err(code::USAGE));
+    }
+
+    #[test]
+    fn a_match_before_the_device_went_away_counts() {
+        let line = proto::gone_line(9);
+        let o = WaitOpts {
+            until: Some("done".into()),
+            ..opts()
+        };
+        let got = watch_peer_with(o, move |mut s| {
+            s.write_all(&[b"ok done\n", line.as_bytes()].concat())
+                .unwrap();
+        });
+        let Ok(Outcome::Matched { which, .. }) = got else {
+            panic!("{got:?}");
+        };
+        assert_eq!(which, Which::Until);
     }
 
     #[test]

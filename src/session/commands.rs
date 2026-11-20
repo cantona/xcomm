@@ -1083,7 +1083,13 @@ impl<'a> Live<'a> {
     /// is no break to end on it, and the error trying would say (EIO, "DTR
     /// is left on") only misleads.
     pub(super) fn device_gone(&mut self) {
-        self.port = None;
+        // Once per drop: the Live that waited for the device to come back
+        // never had it.
+        if self.port.take().is_some()
+            && let Some(server) = self.server.as_mut()
+        {
+            server.device_gone(self.ring.end(), &self.ring);
+        }
         self.end_hold(Some((
             ctl::code::DISCONNECTED,
             "the device went away during it".into(),

@@ -548,7 +548,10 @@ Control socket (for scripts and agents, from another terminal):
                              does from the offset of the send (or --idle
                              instead of --until); prints the output between
                              the echoed line and the match; more than
-                             --max-bytes <n> of it (default 16 MiB) exits 2
+                             --max-bytes <n> of it (default 16 MiB) exits 2,
+                             and the port going away while it waits for
+                             the match exits 4 (a prompt after it comes
+                             back is not the answer)
   xcomm ctl <device> break [ms]
                              send a break (default 250 ms, at most 5000)
   xcomm ctl <device> dtr|rts on|off|toggle|pulse [ms]

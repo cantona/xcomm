@@ -141,7 +141,7 @@ xcomm ctl <dev> send --hex 03
 | 1 | `wait`/`run` timed out, or another error | read the output, then decide; do not just retry |
 | 2 | usage error; or `run` had more than `--max-bytes` before the match; or xcomm-wait is missing beside xcomm | read the message |
 | 3 | no session for the device (or one started with `--ctl off`, or another user's) | `xcomm ctl sessions` and `xcomm list` (who holds the port); ask before starting one |
-| 4 | port disconnected | the board was unplugged or reset; wait and check `status` |
+| 4 | port disconnected, or it went away while `run` waited for its match | the adapter was unplugged, or a board with its own USB port reset; the command may not have run: check `status`, then read what the board says |
 | 5 | busy (file transfer) | wait for the transfer to end |
 | 6 | offset evicted | the output left the buffer; read from `oldest` in `status` |
 | 7 | a `--fail-on` pattern matched | the command failed; read the match |
@@ -162,7 +162,9 @@ xcomm ctl <dev> wait 'Hit any key' --since "$off" --timeout 60 && xcomm ctl <dev
 ```
 
 `run` waits from the offset of its own send, so the prompt cannot come
-before its wait starts.
+before its wait starts. If the port goes away while it waits, `run`
+exits 4: the prompt of a board that comes back after a reset is not the
+answer.
 
 ### Log in
 
@@ -185,8 +187,8 @@ echo "kernel: $ver, eth0: $ip"
 ```
 
 `--json` gives the same as one object: `which` (`until`, `fail_on`,
-`idle` or `timeout`), `text` and `groups` of the match, `end`, and
-`output`.
+`idle`, `timeout`, or `gone` when the port went away during the wait),
+`text` and `groups` of the match, `end`, and `output`.
 
 ### Capture a boot log
 

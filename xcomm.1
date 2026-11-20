@@ -350,6 +350,11 @@ instead of
 and print the output between the echoed line and the match. More than
 .BI \-\-max\-bytes " n"
 (default 16 MiB) of it exits 2.
+If the port goes away while it waits for the match,
+.B run
+prints what came before it and exits 4, as on a timeout with 1: a
+prompt from the device that comes back is not the answer, and the
+command may not have run.
 Its
 .B end=
 line is kept apart from the output as

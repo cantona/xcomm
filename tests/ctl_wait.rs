@@ -703,28 +703,30 @@ fn falls_behind() -> Output {
 }
 
 #[test]
-fn the_dropped_line_is_what_the_session_sends() {
-    use xcomm::ctl::proto::{dropped_at, dropped_line, dropped_start};
-    let line = dropped_line(1234);
-    assert!(
-        line.contains(&format!("\"code\":{}", xcomm::ctl::code::DROPPED)),
-        "{line}"
-    );
-    let mut bytes = b"device bytes".to_vec();
-    bytes.extend_from_slice(line.as_bytes());
-    assert_eq!(dropped_at(&bytes), Some((12, 1234)));
-    assert_eq!(dropped_at(&bytes[..bytes.len() - 1]), None);
-    assert_eq!(dropped_at(b"\"}\n"), None);
-    // Its start, cut short anywhere, is held back; device output is not.
-    for cut in 2..line.len() {
-        let mut bytes = b"abc".to_vec();
-        bytes.extend_from_slice(&line.as_bytes()[..cut]);
-        assert_eq!(dropped_start(&bytes), cut, "cut at {cut}");
+fn the_last_words_are_what_the_session_sends() {
+    use xcomm::ctl::code::{DISCONNECTED, DROPPED};
+    use xcomm::ctl::proto::{dropped_line, gone_line, last_words, last_words_start};
+    for (line, code) in [
+        (dropped_line(1234), DROPPED),
+        (gone_line(1234), DISCONNECTED),
+    ] {
+        assert!(line.contains(&format!("\"code\":{code}")), "{line}");
+        let mut bytes = b"device bytes".to_vec();
+        bytes.extend_from_slice(line.as_bytes());
+        assert_eq!(last_words(&bytes), Some((12, code, 1234)));
+        assert_eq!(last_words(&bytes[..bytes.len() - 1]), None);
+        // Its start, cut short anywhere, is held back; device output is not.
+        for cut in 2..line.len() {
+            let mut bytes = b"abc".to_vec();
+            bytes.extend_from_slice(&line.as_bytes()[..cut]);
+            assert_eq!(last_words_start(&bytes), cut, "cut at {cut}");
+        }
+        assert_eq!(last_words_start(&bytes), 0);
     }
-    assert_eq!(dropped_start(&bytes), 0);
-    assert_eq!(dropped_start(b"line\n"), 0);
-    assert_eq!(dropped_start(b"line\n{"), 2);
-    assert_eq!(dropped_start(b"line\n{\"ok\":true"), 0);
+    assert_eq!(last_words(b"\"}\n"), None);
+    assert_eq!(last_words_start(b"line\n"), 0);
+    assert_eq!(last_words_start(b"line\n{"), 2);
+    assert_eq!(last_words_start(b"line\n{\"ok\":true"), 0);
 }
 
 #[test]

@@ -518,3 +518,267 @@ fn same_node_ignores_a_ctime_change() {
     fs::write(&other, b"").unwrap();
     assert!(!NodeId::at(&other).unwrap().same_node(&after));
 }
+
+/// `xcomm ctl` on `link` for session `s`, output piped.
+fn ctl(s: &Spawned, link: &Path, args: &[&str]) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_xcomm"))
+        .arg("ctl")
+        .arg(link)
+        .args(args)
+        .env("XDG_RUNTIME_DIR", &s.lock_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// A run's command reached the device; then the device goes away.
+fn run_then_unplug(prompt_first: bool) -> (std::process::Output, Duration) {
+    run_then_unplug_with(prompt_first, &[])
+}
+
+fn run_then_unplug_with(
+    prompt_first: bool,
+    extra: &[&str],
+) -> (std::process::Output, Duration) {
+    let dir = temp_dir();
+    let (d1, link, s) = start(&dir);
+    let mut args = vec!["run", "mycmd", "--until", "PROMPT> $", "--timeout", "20"];
+    args.extend_from_slice(extra);
+    let client = ctl(&s, &link, &args);
+    read_until(d1.master.as_fd(), b"mycmd\r", T);
+    // The echo, and output that is not the prompt.
+    write_all(d1.master.as_fd(), b"mycmd\r\nbusy\r\n");
+    if prompt_first {
+        write_all(d1.master.as_fd(), b"out\r\nPROMPT> ");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let gone = Instant::now();
+    drop(d1);
+    let o = client.wait_with_output().unwrap();
+    (o, gone.elapsed())
+}
+
+#[test]
+fn a_run_ends_with_4_when_the_device_goes_away() {
+    let (o, took) = run_then_unplug(false);
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+    // What came before the drop is printed, as on a timeout.
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "busy\r\n", "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("the device went away at offset"),
+        "{o:?}"
+    );
+    assert!(
+        took < Duration::from_secs(10),
+        "waited {took:?} for the drop"
+    );
+}
+
+#[test]
+fn a_run_cut_by_the_drop_says_gone_in_json() {
+    let (o, _) = run_then_unplug_with(false, &["--json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["which"], "gone", "{v}");
+    assert_eq!(v["output"], "busy\r\n", "{v}");
+}
+
+#[test]
+fn a_run_answered_before_the_device_went_away_succeeds() {
+    let (o, _) = run_then_unplug(true);
+    assert!(o.status.success(), "{o:?}");
+}
+
+#[test]
+fn a_run_does_not_take_a_prompt_from_the_device_that_came_back() {
+    let dir = temp_dir();
+    let (d1, link, mut s) = start(&dir);
+    let d2 = support::pty();
+    let client = ctl(
+        &s,
+        &link,
+        &["run", "mycmd", "--until", "PROMPT> $", "--timeout", "20"],
+    );
+    read_until(d1.master.as_fd(), b"mycmd\r", T);
+    drop(d1);
+    read_until(s.host.master.as_fd(), b"waiting", T);
+    relink(&link, &d2.slave_path);
+    read_until(s.host.master.as_fd(), b"reconnected", T);
+    write_all(d2.master.as_fd(), b"booting\r\nPROMPT> ");
+    let o = client.wait_with_output().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
+}
+
+#[test]
+fn a_wait_goes_on_across_a_reconnect() {
+    let dir = temp_dir();
+    let (d1, link, mut s) = start(&dir);
+    let d2 = support::pty();
+    let client = ctl(&s, &link, &["wait", "login: $", "--timeout", "20"]);
+    // The wait has subscribed once the session holds its connection.
+    std::thread::sleep(Duration::from_millis(300));
+    drop(d1);
+    read_until(s.host.master.as_fd(), b"waiting", T);
+    relink(&link, &d2.slave_path);
+    read_until(s.host.master.as_fd(), b"reconnected", T);
+    write_all(d2.master.as_fd(), b"board login: ");
+    let o = client.wait_with_output().unwrap();
+    assert!(o.status.success(), "{o:?}");
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
+}
+
+#[test]
+fn a_run_whose_send_waited_across_a_fast_reconnect_ends_with_4() {
+    let dir = temp_dir();
+    let (d1, link, s) = start(&dir);
+    let d2 = support::pty();
+    // Nothing reads d1: these fill the line, and the run's send waits for
+    // room in the session's queue.
+    let big = "a".repeat(120_000);
+    let fill: Vec<_> = (0..2).map(|_| ctl(&s, &link, &["send", &big])).collect();
+    std::thread::sleep(Duration::from_millis(800));
+    let client = ctl(
+        &s,
+        &link,
+        &["run", "mycmd", "--until", "PROMPT> $", "--timeout", "20"],
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    // Back before the session first looks: its send goes on to d2.
+    relink(&link, &d2.slave_path);
+    drop(d1);
+    read_until(s.host.master.as_fd(), b"reconnected", T);
+    write_all(d2.master.as_fd(), b"booting\r\nPROMPT> ");
+    read_until(d2.master.as_fd(), b"mycmd\r", Duration::from_secs(30));
+    let o = client.wait_with_output().unwrap();
+    for f in fill {
+        let _ = f.wait_with_output();
+    }
+    assert_eq!(
+        o.status.code(),
+        Some(xcomm::ctl::code::DISCONNECTED as i32),
+        "{o:?}"
+    );
+}
+
+/// A connection to the control socket of session `s`.
+fn socket(s: &Spawned) -> std::os::unix::net::UnixStream {
+    let dir = s.lock_dir.join("xcomm");
+    for _ in 0..50 {
+        if let Some(e) = fs::read_dir(&dir).ok().and_then(|rd| {
+            rd.flatten()
+                .find(|e| e.path().extension().is_some_and(|x| x == "sock"))
+        }) {
+            return std::os::unix::net::UnixStream::connect(e.path()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("no socket in {}", dir.display());
+}
+
+fn reply(r: &mut impl std::io::BufRead) -> serde_json::Value {
+    let mut l = String::new();
+    r.read_line(&mut l).unwrap();
+    serde_json::from_str(&l).unwrap()
+}
+
+/// Sends "x" as `run` does, and returns the reader, the writer and the
+/// send's reply.
+fn raw_send(
+    s: &Spawned,
+) -> (
+    std::io::BufReader<std::os::unix::net::UnixStream>,
+    std::os::unix::net::UnixStream,
+    serde_json::Value,
+) {
+    use std::io::Write;
+    let sock = socket(s);
+    sock.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    let mut w = sock.try_clone().unwrap();
+    let mut r = std::io::BufReader::new(sock);
+    w.write_all(b"{\"cmd\":\"send\",\"data_b64\":\"eA==\"}\n")
+        .unwrap();
+    let sent = reply(&mut r);
+    (r, w, sent)
+}
+
+fn subscribe_until_drop(
+    w: &mut std::os::unix::net::UnixStream,
+    sent: &serde_json::Value,
+) {
+    use std::io::Write;
+    let line = format!(
+        "{{\"cmd\":\"subscribe\",\"since\":{},\"drops\":{}}}\n",
+        sent["offset"], sent["drops"]
+    );
+    w.write_all(line.as_bytes()).unwrap();
+}
+
+#[test]
+fn a_subscription_made_after_the_drop_gets_the_bytes_before_it_then_ends() {
+    use std::io::Read;
+    let dir = temp_dir();
+    let (d1, _link, mut s) = start(&dir);
+    let (mut r, mut w, sent) = raw_send(&s);
+    assert_eq!(sent["drops"], 0, "{sent}");
+    read_until(d1.master.as_fd(), b"x", T);
+    write_all(d1.master.as_fd(), b"hello");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(d1);
+    read_until(s.host.master.as_fd(), b"waiting", T);
+    subscribe_until_drop(&mut w, &sent);
+    assert_eq!(reply(&mut r)["ok"], true);
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.starts_with("hello"), "{got:?}");
+    assert!(got.contains("the device went away at offset"), "{got:?}");
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
+}
+
+#[test]
+fn a_subscriber_behind_at_the_drop_gets_the_rest_then_ends() {
+    use std::io::Read;
+    let dir = temp_dir();
+    let (d1, _link, s) = start(&dir);
+    let (mut r, mut w, sent) = raw_send(&s);
+    read_until(d1.master.as_fd(), b"x", T);
+    subscribe_until_drop(&mut w, &sent);
+    assert_eq!(reply(&mut r)["ok"], true);
+    // The terminal is read, the subscriber not yet: it falls behind.
+    let host = rustix::io::dup(&s.host.master).unwrap();
+    std::thread::spawn(move || {
+        let mut b = [0u8; 65536];
+        while matches!(rustix::io::read(&host, &mut b), Ok(n) if n > 0) {}
+    });
+    let chunk = [b'y'; 4096];
+    for _ in 0..150 {
+        write_all(d1.master.as_fd(), &chunk);
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    drop(d1);
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    let tail =
+        String::from_utf8_lossy(&got[got.len().saturating_sub(120)..]).into_owned();
+    assert!(tail.contains("the device went away at offset"), "{tail:?}");
+    let (before, _, _) = xcomm::ctl::proto::last_words(&got).expect("last words");
+    assert_eq!(before, 150 * 4096);
+    assert!(got[..before].iter().all(|&b| b == b'y'));
+}

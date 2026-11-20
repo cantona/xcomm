@@ -40,6 +40,10 @@ pub enum Outcome {
     Timeout {
         end: u64,
     },
+    /// The device went away at `end` with no match before it (a `run`).
+    Gone {
+        end: u64,
+    },
 }
 
 pub struct Matcher {

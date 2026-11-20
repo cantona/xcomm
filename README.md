@@ -275,7 +275,7 @@ makes them Unicode-aware in a build with `--features unicode`.
 | 1 | `wait`/`run` timed out, or another error |
 | 2 | usage error (or `run` output over `--max-bytes`) |
 | 3 | no session for the device |
-| 4 | port disconnected |
+| 4 | port disconnected, also while `run` waits for its match |
 | 5 | busy (a file transfer) |
 | 6 | offset evicted from the ring |
 | 7 | a `--fail-on` pattern matched |

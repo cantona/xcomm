@@ -4,6 +4,13 @@ What changed in each release of xcomm.
 
 ## [Unreleased]
 
+### Changed
+- `xcomm ctl run` exits 4 when the port goes away while it waits for its
+  match, printing the output that came before it, as on a timeout. It waited
+  on across the reconnect, where the prompt of a board that came back could
+  pass for the answer to a command it never ran. `xcomm ctl wait` still
+  waits across a reconnect.
+
 ## [0.1.3] - 2026-11-18
 
 ### Added

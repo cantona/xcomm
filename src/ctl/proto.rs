@@ -41,6 +41,10 @@ pub enum Request {
         since: Option<u64>,
         #[serde(default)]
         from_oldest: bool,
+        /// The `drops` a send's reply gave: the subscription ends where the
+        /// device next goes away, with [`gone_line`] as its last bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drops: Option<u64>,
     },
     /// The requests below act on the line. Each waits for the bytes queued
     /// before it to be written to the device, so it comes after them.
@@ -88,43 +92,60 @@ pub struct Envelope {
 /// A subscriber that falls behind gets this line, with the offset it had
 /// reached, as its last bytes; then the session closes it.
 pub fn dropped_line(at: u64) -> String {
-    format!("{DROPPED_HEAD}{at}{DROPPED_TAIL}")
+    format!("{DROPPED_HEAD}{at}{LAST_TAIL}")
+}
+
+/// A subscriber that asked to end where the device goes away gets this
+/// line, with the offset where it went, after every byte before it.
+pub fn gone_line(at: u64) -> String {
+    format!("{GONE_HEAD}{at}{LAST_TAIL}")
 }
 
 const DROPPED_HEAD: &str =
     "\n{\"ok\":false,\"code\":9,\"error\":\"subscriber too slow at offset ";
-const DROPPED_TAIL: &str = "\"}\n";
+const GONE_HEAD: &str =
+    "\n{\"ok\":false,\"code\":4,\"error\":\"the device went away at offset ";
+const LAST_TAIL: &str = "\"}\n";
 
-/// Where `bytes` ends with a `dropped_line`, and its offset.
-pub fn dropped_at(bytes: &[u8]) -> Option<(usize, u64)> {
-    let body = bytes.strip_suffix(DROPPED_TAIL.as_bytes())?;
+/// The heads of the session's last words, and the code each carries.
+const LAST_HEADS: [(&str, u8); 2] = [
+    (DROPPED_HEAD, super::code::DROPPED),
+    (GONE_HEAD, super::code::DISCONNECTED),
+];
+
+/// Where `bytes` ends with the session's last words (a [`dropped_line`] or
+/// a [`gone_line`]), their code, and their offset.
+pub fn last_words(bytes: &[u8]) -> Option<(usize, u8, u64)> {
+    let body = bytes.strip_suffix(LAST_TAIL.as_bytes())?;
     let digits = body.iter().rev().take_while(|b| b.is_ascii_digit()).count();
     let (head, at) = body.split_at(body.len() - digits);
-    let line = head.strip_suffix(DROPPED_HEAD.as_bytes())?;
     let at = std::str::from_utf8(at).ok()?.parse().ok()?;
-    Some((line.len(), at))
+    LAST_HEADS.iter().find_map(|(h, code)| {
+        head.strip_suffix(h.as_bytes())
+            .map(|line| (line.len(), *code, at))
+    })
 }
 
-/// How many bytes at the end of `bytes` could be a `dropped_line` cut
-/// short: 2 at least, as a lone newline is too common to hold back.
-pub fn dropped_start(bytes: &[u8]) -> usize {
-    let longest = DROPPED_HEAD.len() + 20 + DROPPED_TAIL.len();
+/// How many bytes at the end of `bytes` could be last words cut short: 2
+/// at least, as a lone newline is too common to hold back.
+pub fn last_words_start(bytes: &[u8]) -> usize {
+    let longest = GONE_HEAD.len().max(DROPPED_HEAD.len()) + 20 + LAST_TAIL.len();
     let look = bytes.len().saturating_sub(longest);
     memchr::memchr_iter(b'\n', &bytes[look..])
         .map(|p| &bytes[look + p..])
-        .find(|t| t.len() >= 2 && starts_dropped(t))
+        .find(|t| t.len() >= 2 && LAST_HEADS.iter().any(|(h, _)| starts_last(t, h)))
         .map_or(0, <[u8]>::len)
 }
 
-/// Whether `t` is the start of a `dropped_line`, but not all of it.
-fn starts_dropped(t: &[u8]) -> bool {
-    let head = DROPPED_HEAD.as_bytes();
+/// Whether `t` is the start of last words with `head`, but not all of it.
+fn starts_last(t: &[u8], head: &str) -> bool {
+    let head = head.as_bytes();
     let Some(rest) = t.strip_prefix(head) else {
         return head.starts_with(t);
     };
     let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
     let after = &rest[digits..];
-    after.len() < DROPPED_TAIL.len() && DROPPED_TAIL.as_bytes().starts_with(after)
+    after.len() < LAST_TAIL.len() && LAST_TAIL.as_bytes().starts_with(after)
 }
 
 /// Now as Unix time in ms, as `deadline_ms` counts.
