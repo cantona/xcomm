@@ -7,7 +7,8 @@ One panel per metric, one bar per tool, from `xcomm-bench run` reports, or
 from one file that holds them all under "tools" (as the README's figures
 were kept: each tool's 256 MiB report, its latency the median of the
 latency rounds). Each panel says whether more or less is better; xcomm's
-bar is coloured. The README's chart:
+bars are coloured, one per version when the tool is named "xcomm <version>".
+The README's chart:
 
     scripts/bench-chart.py assets/bench.svg bench.json
 """
@@ -25,7 +26,7 @@ METRICS = [
     ("syscalls_per_mib", "System calls", "per MiB", False),
 ]
 
-PANEL_W, BAR_H, GAP, LABEL_W, VALUE_W = 420, 28, 8, 92, 110
+PANEL_W, BAR_H, GAP, LABEL_W, VALUE_W = 420, 28, 8, 112, 110
 # The dark theme of the README's terminal pictures (scripts/ansi2svg.py).
 BG, BORDER, TEXT, HINT = "#1e1f29", "#44475a", "#e6e6e6", "#8a8fa8"
 OURS, OTHERS = "#50fa7b", "#6272a4"
@@ -36,6 +37,10 @@ def fmt(v):
     return f"{v:,.0f}" if v >= 100 else f"{v:,.1f}" if v >= 10 else f"{v:,.2f}"
 
 
+def ours(report):
+    return report["tool"].split()[0] == "xcomm"
+
+
 def main():
     out_path, paths = sys.argv[1], sys.argv[2:]
     reports = []
@@ -43,7 +48,7 @@ def main():
         doc = json.load(open(p))
         reports.extend(doc["tools"].values() if "tools" in doc else [doc])
     # xcomm first, then the others as given.
-    reports.sort(key=lambda r: r["tool"] != "xcomm")
+    reports.sort(key=lambda r: not ours(r))
     n = len(reports)
     panel_h = 48 + n * (BAR_H + GAP)
     cols = 2
@@ -75,9 +80,8 @@ def main():
         for j, (r, v) in enumerate(zip(reports, values)):
             y = y0 + 34 + j * (BAR_H + GAP)
             w = 0 if v is None else max(2, bar_w * v / top)
-            ours = r["tool"] == "xcomm"
-            fill = OURS if ours else OTHERS
-            weight = ' font-weight="600"' if ours else ""
+            fill = OURS if ours(r) else OTHERS
+            weight = ' font-weight="600"' if ours(r) else ""
             svg.append(
                 f'<text x="{x0}" y="{y + 20}" fill="{TEXT}"{weight}>{html.escape(r["tool"])}</text>'
                 f'<rect x="{x0 + LABEL_W}" y="{y}" width="{w:.1f}" height="{BAR_H}" rx="3" '

@@ -443,17 +443,17 @@ removes it), then run that command.
 
 ## Benchmarks
 
-<p align="center"><img src="assets/bench.svg" alt="Benchmark chart: throughput, CPU, latency, memory and system calls for xcomm, minicom, picocom and tio" width="900"></p>
+<p align="center"><img src="assets/bench.svg" alt="Benchmark chart: throughput, CPU, latency, memory and system calls for xcomm 0.1.0 and 0.1.4, minicom, picocom and tio" width="900"></p>
 
-| | xcomm 0.1.0 | minicom 2.10 | picocom 3.1 | tio 3.9 |
-|---|---|---|---|---|
-| Throughput, text | **434 MiB/s** | 10.5 MiB/s | 45.3 MiB/s | 1.09 MiB/s |
-| Throughput, binary | **442 MiB/s** | not measured¹ | 39.7 MiB/s | 1.08 MiB/s |
-| CPU time per MiB | **1.84 ms** | 95.1 ms | 23.6 ms | 922 ms |
-| System calls per MiB | **769** | 41,284 | 24,576 | 1,049,089 |
-| Keystroke latency p50² | **8.60 µs** (8.51–9.34) | 8.79 µs (8.61–9.39) | 9.09 µs (8.98–10.35) | 11.57 µs (10.69–11.90) |
-| Keystroke latency p99² | **12.16 µs** (11.79–13.62) | 13.13 µs (11.66–13.58) | 13.30 µs (12.45–14.15) | 15.93 µs (15.08–17.56) |
-| Peak memory (RSS) | 4.24 MiB | 5.05 MiB | **1.83 MiB** | 3.65 MiB |
+| | xcomm 0.1.0 | xcomm 0.1.4³ | minicom 2.10 | picocom 3.1 | tio 3.9 |
+|---|---|---|---|---|---|
+| Throughput, text | 434 MiB/s | **449 MiB/s** | 10.5 MiB/s | 45.3 MiB/s | 1.09 MiB/s |
+| Throughput, binary | 442 MiB/s | **484 MiB/s** | not measured¹ | 39.7 MiB/s | 1.08 MiB/s |
+| CPU time per MiB | **1.84 ms** | 1.86 ms | 95.1 ms | 23.6 ms | 922 ms |
+| System calls per MiB | **769** | **769** | 41,284 | 24,576 | 1,049,089 |
+| Keystroke latency p50² | 8.60 µs (8.51–9.34) | **8.50 µs** (8.39–9.81) | 8.79 µs (8.61–9.39) | 9.09 µs (8.98–10.35) | 11.57 µs (10.69–11.90) |
+| Keystroke latency p99² | 12.16 µs (11.79–13.62) | **11.53 µs** (10.75–14.50) | 13.13 µs (11.66–13.58) | 13.30 µs (12.45–14.15) | 15.93 µs (15.08–17.56) |
+| Peak memory (RSS) | 4.24 MiB | 4.36 MiB | 5.05 MiB | **1.83 MiB** | 3.65 MiB |
 
 Every tool runs on the same pseudo-terminal pair with the same input, at
 115200 8N1, with no configuration file, through the harness in `bench/`:
@@ -478,6 +478,18 @@ Every tool runs on the same pseudo-terminal pair with the same input, at
   the rounds overlap: minicom was ahead of xcomm in 2 rounds at p50 and 3 at
   p99, and picocom in 1 at p50, each by less than 1 µs. Read it as xcomm and
   minicom level, ahead of picocom and tio.
+- ³ **xcomm 0.1.4** was measured later on the same machine, the same way
+  but without the other tools, as the glibc `cargo build --release` binary
+  (the static musl release binaries peak about 2 MB lower); the other
+  columns are the 0.1.0 measurement. xcomm 0.1.0, run again in the same
+  session, gave 432–434 MiB/s text, 437–439 MiB/s binary, 1.83 ms per MiB
+  and a 4.30–4.32 MiB peak, so of 0.1.4's extra memory only about 0.05 MiB
+  is the version. Its throughput gain comes from writing to the terminal
+  through a non-blocking open of it. Its latency is the median of 50 rounds
+  alternated with 0.1.0, the brackets the lowest and highest of the 50;
+  0.1.0 gave 8.52 µs p50 and 11.59 µs p99 in the same rounds, so the two
+  versions' latency is level and most of the gap to the 0.1.0 column is
+  the day it was measured.
 - **Memory:** xcomm keeps the last 1 MiB of output for the control socket
   (`--ring-size`), and its own code is larger; picocom keeps no output. About
   40% of xcomm's RSS (and most of picocom's) is the shared C library.
