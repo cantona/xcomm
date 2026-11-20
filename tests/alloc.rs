@@ -45,8 +45,15 @@ fn allocs() -> u64 {
 
 struct Count {
     iterations: u64,
+    /// The allocations so far once warm, and the pass and ring offset then.
     warm: Option<u64>,
+    warm_at: u64,
+    warm_end: u64,
     end: u64,
+    /// Bytes the device has been sent, and the subscriber has received.
+    typed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    subscribed: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    deadline: std::time::Instant,
     echo: bool,
     capture: Option<Capture>,
     ring: xcomm::ring::Ring,
@@ -94,14 +101,37 @@ impl Control for Count {
     fn stop(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+    /// Warm once every path has run (the threads feeding them may start
+    /// late on a busy machine); counted for 2000 passes and a whole turn of
+    /// the ring after that.
     fn tick(&mut self) -> ControlFlow<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         self.iterations += 1;
-        if self.iterations == 50 {
-            self.warm = Some(allocs());
-        }
-        if self.iterations == 2000 {
-            self.end = allocs();
-            return ControlFlow::Break(());
+        assert!(
+            std::time::Instant::now() < self.deadline,
+            "not through the passes in time: pass {}, warm {:?}",
+            self.iterations,
+            self.warm
+        );
+        let size = self.ring.capacity() as u64;
+        match self.warm {
+            None if self.iterations >= 50
+                && self.ring.end() > size
+                && self.typed.load(Relaxed) > 0
+                && self.subscribed.as_ref().is_none_or(|s| s.load(Relaxed) > 0) =>
+            {
+                self.warm = Some(allocs());
+                self.warm_at = self.iterations;
+                self.warm_end = self.ring.end();
+            }
+            Some(_)
+                if self.iterations >= self.warm_at + 2000
+                    && self.ring.end() > self.warm_end + size =>
+            {
+                self.end = allocs();
+                return ControlFlow::Break(());
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
     }
@@ -185,6 +215,8 @@ fn run_with_subscriber() {
     let server = CtlServer::bind(&dir, "alloc", CtlMode::ReadWrite).unwrap();
     let mut sub = std::os::unix::net::UnixStream::connect(server.path()).unwrap();
     std::io::Write::write_all(&mut sub, b"{\"cmd\":\"subscribe\"}\n").unwrap();
+    let subscribed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let got = subscribed.clone();
     let reader = std::thread::spawn(move || {
         let mut sub = std::io::BufReader::new(sub);
         let mut reply = String::new();
@@ -200,6 +232,7 @@ fn run_with_subscriber() {
                 break;
             }
             total += n as u64;
+            got.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             tail.extend_from_slice(&buf[..n]);
             let keep = tail.len().saturating_sub(200);
             tail.drain(..keep);
@@ -208,7 +241,14 @@ fn run_with_subscriber() {
     });
     // A subscriber is dropped (which allocates its message) only once it
     // is a ring behind, and the socket buffers more than that first.
-    run_full(None, false, b"typed", None, Some(server), 65521);
+    run_full(
+        None,
+        false,
+        b"typed",
+        None,
+        Some((server, subscribed)),
+        65521,
+    );
     let (reached, tail) = reader.join().unwrap();
     // Fed after the ring had wrapped: late in the counted passes.
     assert!(reached > 65521, "the subscriber reached offset {reached}");
@@ -224,10 +264,24 @@ fn run_full(
     echo: bool,
     typed: &'static [u8],
     colored: Option<&'static [u8]>,
-    server: Option<CtlServer>,
+    server: Option<(CtlServer, std::sync::Arc<std::sync::atomic::AtomicU64>)>,
     ring_size: usize,
 ) {
     let dev = support::pty();
+    // Raw before anything is written: a cooked pty echoes the feeder's bytes
+    // back, and the drainer would count them as typed.
+    let port_fd = rustix::fs::open(
+        &dev.slave_path,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::NOCTTY
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    let mut t = rustix::termios::tcgetattr(&port_fd).unwrap();
+    t.make_raw();
+    rustix::termios::tcsetattr(&port_fd, rustix::termios::OptionalActions::Now, &t)
+        .unwrap();
     let signals = SignalPipe::install(&[libc::SIGUSR1]).unwrap();
     let (out_r, out_w) = std::io::pipe().unwrap();
     let (in_r, in_w) = std::io::pipe().unwrap();
@@ -243,14 +297,18 @@ fn run_full(
     let typist = keep_writing(in_w.into(), typed, stop.clone());
     // What the loop sends to the device must be taken, or the queue fills
     // and the loop stops reading input.
+    let typed_got = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let drainer = {
         let master = dev.master.try_clone().unwrap();
         let stop = stop.clone();
+        let got = typed_got.clone();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match rustix::io::read(master.as_fd(), &mut buf[..]) {
-                    Ok(_) => {}
+                    Ok(n) => {
+                        got.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     Err(rustix::io::Errno::AGAIN) => {
                         std::thread::sleep(std::time::Duration::from_millis(1))
                     }
@@ -267,22 +325,16 @@ fn run_full(
             }
         }
     });
-    let port_fd = rustix::fs::open(
-        &dev.slave_path,
-        rustix::fs::OFlags::RDWR
-            | rustix::fs::OFlags::NOCTTY
-            | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )
-    .unwrap();
-    let mut t = rustix::termios::tcgetattr(&port_fd).unwrap();
-    t.make_raw();
-    rustix::termios::tcsetattr(&port_fd, rustix::termios::OptionalActions::Now, &t)
-        .unwrap();
+    let (server, subscribed) = server.unzip();
     let mut count = Count {
         iterations: 0,
         warm: None,
+        warm_at: 0,
+        warm_end: 0,
         end: 0,
+        typed: typed_got,
+        subscribed,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
         echo,
         capture: colored
             .map(|_| Capture::start(std::path::Path::new("/dev/null")).unwrap()),
@@ -304,7 +356,6 @@ fn run_full(
     assert_eq!(reason, ExitReason::Requested);
     let warm = count.warm.unwrap();
     assert_eq!(count.end - warm, 0, "allocations in steady state");
-    assert!(count.ring.end() > ring_size as u64, "the ring did not wrap");
     drop(count);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(out_w);
