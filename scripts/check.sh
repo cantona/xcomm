@@ -61,10 +61,23 @@ for tc in "$active" "$toolchain"; do
 		exit 1
 	fi
 done
+# On Linux the tests also run linked with musl, as the released static
+# binaries are.
+musl_target=
+if [ "$(uname -s)" = Linux ]; then
+	musl_target=$(uname -m)-unknown-linux-musl
+	if ! rustup target list --installed --toolchain "$active" | grep -qx "$musl_target"; then
+		echo "check.sh: target $musl_target is not installed for $active; run: rustup target add $musl_target --toolchain $active" >&2
+		exit 1
+	fi
+fi
 
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+if [ -n "$musl_target" ]; then
+	cargo test --locked --target "$musl_target"
+fi
 cargo clippy --locked --all-targets --features unicode -- -D warnings
 cargo test --locked --features unicode --lib --test cli --test ctl_wait
 cargo "+$toolchain" check --locked --workspace --all-targets
