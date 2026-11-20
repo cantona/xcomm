@@ -4,6 +4,13 @@ What changed in each release of xcomm.
 
 ## [Unreleased]
 
+### Added
+- Static Linux binaries, linked with musl, for x86_64 and aarch64, attached
+  to each GitHub release: no shared libraries needed, and less memory than
+  a build linked with glibc. Measured on x86_64, a session's peak resident
+  memory through a 32 MiB pty flood was 2.4 MB rather than 4.4 MB, at the
+  same throughput and latency.
+
 ### Changed
 - Device output reaches the terminal 3-5 % (text) and 10-12 % (binary)
   faster in a flood, measured through a pty: xcomm writes it through a

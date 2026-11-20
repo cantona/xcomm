@@ -58,3 +58,33 @@ jobs:
         with:
           key: ${{ env.RUST }}
       - run: sh scripts/check.sh
+
+  # Releases ship static musl binaries for Linux: the tests run on musl too,
+  # on each architecture released, before anything is published.
+  musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      RUST: 1.98.1
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools the transfer tests drive (lrzsz)
+        run: sudo apt-get update && sudo apt-get install -y lrzsz
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustup target add "$TARGET"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ env.RUST }}-${{ matrix.target }}
+      - run: cargo test --locked --target "$TARGET"

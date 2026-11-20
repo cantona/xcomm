@@ -74,6 +74,26 @@ brew install cantona/tap/xcomm
 xcomm skill install        # the agent skill, if you use one
 ```
 
+**Static Linux binaries** (x86_64 and aarch64, linked with musl: no shared
+libraries needed, and the least memory; file transfers still use lrzsz),
+attached to each [release](https://github.com/cantona/xcomm/releases) from
+0.1.4:
+
+```sh
+v=0.1.4 t=x86_64-unknown-linux-musl    # or aarch64-unknown-linux-musl
+u=https://github.com/cantona/xcomm/releases/download/v$v/xcomm-$v-$t.tar.gz
+curl -fLO "$u" && curl -fLO "$u.sha256" &&
+  sha256sum -c "xcomm-$v-$t.tar.gz.sha256" &&
+  tar -xzf "xcomm-$v-$t.tar.gz" && mkdir -p ~/.local/bin &&
+  install -m 755 "xcomm-$v-$t/xcomm" "xcomm-$v-$t/xcomm-wait" ~/.local/bin/
+```
+
+`xcomm-wait` goes beside `xcomm`: `xcomm ctl wait` and `run` run it from
+there. `xcomm man` shows the manual page. Remove the two files yourself to
+uninstall: `xcomm uninstall` takes away only what cargo installed (it
+names an `xcomm` that cargo did not install), so it removes these only
+where an earlier cargo install under `~/.local` left its record.
+
 **With cargo** (from [crates.io](https://crates.io/crates/xcomm)):
 
 ```sh

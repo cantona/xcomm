@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-only
+name: Release binaries
+
+# Static Linux binaries (musl) for a release: built and tested on each
+# architecture's own runner, then attached to the GitHub release once every
+# target has built and passed. Run by hand with a tag to attach them to a
+# release that lacks them (0.1.4 and later: older trees do not build their
+# tests on musl). Assets already attached are never replaced: their
+# published checksums stay what people may have recorded. After an upload
+# cut short, delete what it attached (the run says how), then run it again.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build, e.g. v0.1.4'
+        required: true
+
+permissions:
+  contents: read
+
+# One run per tag at a time: two would each make their own tarballs and
+# could attach one run's tarball beside the other's checksum.
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      RUST: 1.98.1
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          # The tests and build scripts below run without a token.
+          persist-credentials: false
+      - name: Tools (lrzsz for the transfer tests, file for the static check)
+        run: sudo apt-get update && sudo apt-get install -y lrzsz file
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustup target add "$TARGET"
+      - name: Test on musl
+        run: cargo test --locked --target "$TARGET"
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET" -p xcomm
+      - name: Package
+        run: |
+          set -eu
+          version=${TAG#v}
+          dir=xcomm-$version-$TARGET
+          bin=target/$TARGET/release
+          # Static: nothing for the dynamic loader to resolve.
+          for b in xcomm xcomm-wait; do
+            file "$bin/$b"
+            if file "$bin/$b" | grep -q 'dynamically linked'; then
+              echo "$b is dynamically linked" >&2
+              exit 1
+            fi
+          done
+          "$bin/xcomm" --version | grep -qx "xcomm $version"
+          mkdir -p out "$dir"
+          cp "$bin/xcomm" "$bin/xcomm-wait" xcomm.1 README.md CHANGELOG.md COPYING "$dir/"
+          tar -czf "out/$dir.tar.gz" "$dir"
+          (cd out && sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: out/
+          if-no-files-found: error
+
+  # Only once every target has built and passed its tests.
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ls -l out
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')
+          for f in out/*; do
+            if printf '%s\n' "$have" | grep -qxF "${f#out/}"; then
+              echo "${f#out/} is already attached to $TAG: left as it is." >&2
+              echo "To attach this run's files instead, delete the old ones first:" >&2
+              echo "  gh release delete-asset $TAG <name> --repo $GITHUB_REPOSITORY" >&2
+              exit 1
+            fi
+          done
+          gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY"
