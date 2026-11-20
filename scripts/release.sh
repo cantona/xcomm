@@ -10,6 +10,7 @@
 #   release.sh wait-ci                     wait for CI on the pushed master head
 #   release.sh publish  <ver>              cargo publish from the tagged tree (asks)
 #   release.sh gh-release <ver> <notes-file>   GitHub release                 (asks)
+#   release.sh binaries <ver>              wait for the static binaries, check them
 #   release.sh brew-bump  <ver>            tap branch, formula bump, PR        (asks)
 #   release.sh brew-publish <pr>           wait for bottles, run brew pr-pull (asks)
 #
@@ -214,6 +215,59 @@ cmd_gh_release() {
 	gh release create "v$ver" -R "$GH_REPO" --title "xcomm $ver" --notes-file "$notes" --verify-tag
 }
 
+# The static Linux binaries the release workflow attaches (.github/workflows/
+# release.yml, started by gh-release): waits for its run, then checks every
+# tarball against its checksum, that the binaries in it are static, and that
+# the one this machine can run gives the version.
+cmd_binaries() {
+	local ver=$1 tag id='' dir t name b kind sum arch
+	version_ok "$ver"
+	tag=v$ver
+	say "waiting for the static binaries of $tag"
+	# The newest run for the tag, started by the release or by hand (its
+	# run-name carries the tag either way). gh failing stops the step.
+	for _ in $(seq 30); do
+		id=$(gh run list -R "$GH_REPO" --workflow release.yml --limit 20 --json databaseId,displayTitle \
+			--jq "[.[] | select(.displayTitle == \"Release binaries $tag\")] | .[0].databaseId // empty") ||
+			die "gh run list failed (above)"
+		[ -n "$id" ] && break
+		sleep 10
+	done
+	[ -n "$id" ] || die "no release.yml run for $tag: is the release published?"
+	gh run watch -R "$GH_REPO" "$id" --exit-status --interval 30 > /dev/null ||
+		die "the release binaries failed: gh run view -R $GH_REPO $id --log-failed (a run just started by hand may not be listed yet: when gh run list -R $GH_REPO --workflow release.yml shows it, run binaries again)"
+	dir=$(mktemp -d)
+	# Expanded now: the local is gone by the time the script exits.
+	trap "rm -rf -- $(printf '%q' "$dir")" EXIT
+	for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+		name=xcomm-$ver-$t
+		gh release download "$tag" -R "$GH_REPO" -D "$dir" -p "$name.tar.gz" -p "$name.tar.gz.sha256" ||
+			die "$name is not attached to $tag"
+		# Compared whole: sha256sum -c would check whichever file the line names.
+		sum=$(cd "$dir" && sha256sum "$name.tar.gz") || die "sha256sum $name.tar.gz failed"
+		[ "$sum" = "$(cat "$dir/$name.tar.gz.sha256")" ] || die "$name.tar.gz does not match its checksum"
+		case $t in
+		x86_64-*) arch=x86-64 ;;
+		aarch64-*) arch='ARM aarch64' ;;
+		esac
+		tar -xzf "$dir/$name.tar.gz" -C "$dir"
+		for b in xcomm xcomm-wait; do
+			[ -x "$dir/$name/$b" ] || die "$name has no $b"
+			# Said positively: a file that cannot run, or cannot tell, fails.
+			kind=$(file -b "$dir/$name/$b") || die "file $name/$b failed"
+			[[ $kind == *"statically linked"* || $kind == *"static-pie linked"* ]] ||
+				die "$name/$b is not static: $kind"
+			[[ $kind == *", $arch,"* ]] || die "$name/$b is not built for $arch: $kind"
+		done
+		if [ "$(uname -s)" = Linux ] && [ "$t" = "$(uname -m)-unknown-linux-musl" ]; then
+			[ "$("$dir/$name/xcomm" --version)" = "xcomm $ver" ] || die "$name/xcomm is not $ver"
+		else
+			say "$name: not run here ($(uname -sm)): its version is not checked"
+		fi
+		say "$name: checksum, static, $arch, ok"
+	done
+}
+
 # The formula at stdin with the new tarball, and without the old bottles.
 formula_bump() {
 	python3 -c '
@@ -288,7 +342,7 @@ cmd_brew_publish() {
 	say "xcomm $ver bottles are on main: brew update && brew upgrade xcomm"
 }
 
-[ $# -ge 1 ] || { sed -n '4,15p' "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n '4,16p' "$0"; exit 2; }
 step=$1; shift
 case $step in
 prepare) [ $# = 2 ] || die "prepare <ver> <date>"; cmd_prepare "$@" ;;
@@ -298,6 +352,7 @@ push) [ $# = 1 ] || die "push <ver>"; cmd_push "$@" ;;
 wait-ci) cmd_wait_ci ;;
 publish) [ $# = 1 ] || die "publish <ver>"; cmd_publish "$@" ;;
 gh-release) [ $# = 2 ] || die "gh-release <ver> <notes-file>"; cmd_gh_release "$@" ;;
+binaries) [ $# = 1 ] || die "binaries <ver>"; cmd_binaries "$@" ;;
 brew-bump) [ $# = 1 ] || die "brew-bump <ver>"; cmd_brew_bump "$@" ;;
 brew-publish) [ $# = 1 ] || die "brew-publish <pr>"; cmd_brew_publish "$@" ;;
 *) die "unknown step '$step'" ;;

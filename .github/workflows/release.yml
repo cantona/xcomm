@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
 # SPDX-License-Identifier: GPL-2.0-only
 name: Release binaries
+# With the tag, however the run started: release.sh binaries finds it so.
+run-name: Release binaries ${{ github.event.release.tag_name || inputs.tag }}
 
 # Static Linux binaries (musl) for a release: built and tested on each
 # architecture's own runner, then attached to the GitHub release once every
