@@ -407,13 +407,32 @@ pub fn wait_stopped(pid: i32, timeout: Duration) {
     }
 }
 
-/// Waits until process `pid` is inside a write(2) to its stdout. Reading
-/// /proc/<pid>/syscall needs ptrace access; where that is denied
-/// (kernel.yama.ptrace_scope 2 or 3) it waits a fixed time instead, which
-/// is usually enough.
+/// Waits until process `pid` waits on a terminal that takes nothing: in a
+/// write(2) to its stdout when `blocking` (stdout is written as it is), else
+/// in the poll of two descriptors with no timeout that waits for room on
+/// xcomm's own non-blocking open of the terminal, or a signal (the session
+/// loop always polls more). Reading /proc/<pid>/syscall needs ptrace
+/// access; where that is denied (kernel.yama.ptrace_scope 2 or 3) it waits
+/// a fixed time instead, which is usually enough.
 #[cfg(target_os = "linux")]
-pub fn wait_blocked_writing_stdout(pid: i32, timeout: Duration) {
-    let want = format!("{} 0x1 ", libc::SYS_write);
+pub fn wait_stalled_on_terminal(pid: i32, blocking: bool, timeout: Duration) {
+    let write = format!("{} 0x1 ", libc::SYS_write);
+    // ppoll(fds, 2, NULL, ...); poll(fds, 2, -1) where there is a poll(2).
+    let ppoll = format!("{} ", libc::SYS_ppoll);
+    #[cfg(target_arch = "x86_64")]
+    let poll = Some(format!("{} ", libc::SYS_poll));
+    #[cfg(not(target_arch = "x86_64"))]
+    let poll: Option<String> = None;
+    let waits_for_room = |call: &str| {
+        let args: Vec<&str> = call.split(' ').collect();
+        let two = args.get(2) == Some(&"0x2");
+        (call.starts_with(&ppoll) && two && args.get(3) == Some(&"0x0"))
+            || poll.as_ref().is_some_and(|p| {
+                call.starts_with(p.as_str())
+                    && two
+                    && args.get(3) == Some(&"0xffffffffffffffff")
+            })
+    };
     let deadline = Instant::now() + timeout;
     loop {
         let call = match std::fs::read_to_string(format!("/proc/{pid}/syscall")) {
@@ -425,12 +444,13 @@ pub fn wait_blocked_writing_stdout(pid: i32, timeout: Duration) {
             }
             Err(e) => panic!("/proc/{pid}/syscall: {e}"),
         };
-        if call.starts_with(&want) {
+        if (blocking && call.starts_with(&write)) || (!blocking && waits_for_room(&call))
+        {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "process {pid} not blocked writing stdout: {call}"
+            "process {pid} not stalled on the terminal (blocking {blocking}): {call}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }

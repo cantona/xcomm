@@ -483,17 +483,38 @@ fn an_inherited_ignored_sighup_stays_ignored() {
     assert!(status.success());
 }
 
-/// Stopped inside a write to a terminal that takes nothing (output stopped,
+/// Stopped while waiting on a terminal that takes nothing (output stopped,
 /// as by Ctrl-S), then `kill -TERM` and `kill -CONT`: the SIGTERM caught as
-/// the process continues ends the session.
+/// the process continues ends the session. Waiting in a write to a blocking
+/// stdout, and in the poll for room on xcomm's own open of the terminal.
 #[cfg(target_os = "linux")]
 #[test]
 fn sigterm_sent_while_stopped_in_a_blocked_write_ends_the_session() {
-    let (dev, mut s) = start(&[]);
+    for blocking in [true, false] {
+        sigterm_while_stopped_on_a_stalled_terminal(blocking);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sigterm_while_stopped_on_a_stalled_terminal(blocking: bool) {
+    let dev = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let env: &[(&str, &str)] = if blocking {
+        &[("XCOMM_TEST_BLOCKING_TERMINAL", "1")]
+    } else {
+        &[]
+    };
+    let mut s = support::spawn_with_env(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path],
+        &lock_dir("session"),
+        env,
+    );
+    read_until(s.host.master.as_fd(), b"\r\n", T);
     rustix::termios::tcflow(&s.host.slave, rustix::termios::Action::OOff).unwrap();
     write_all(dev.master.as_fd(), b"more");
     let pid = s.child.id() as i32;
-    support::wait_blocked_writing_stdout(pid, T);
+    support::wait_stalled_on_terminal(pid, blocking, T);
     unsafe { libc::kill(pid, libc::SIGTSTP) };
     support::wait_stopped(pid, T);
     unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -575,4 +596,103 @@ fn color_auto_with_stdout_not_a_terminal_strips_sgr() {
     read_until(s.host.master.as_fd(), b"\r\n", T);
     write_all(dev.master.as_fd(), COLORED);
     assert_eq!(read_until(out_r.as_fd(), b"end", T), UNCOLORED);
+}
+
+/// xcomm writes to the terminal through an open of its own: the stdout it
+/// shares with the shell is never set non-blocking.
+#[test]
+fn the_shared_terminal_is_left_blocking() {
+    let (dev, mut s) = start(&[]);
+    let nonblocking = |s: &support::Spawned| {
+        rustix::fs::fcntl_getfl(&s.host.slave)
+            .unwrap()
+            .contains(rustix::fs::OFlags::NONBLOCK)
+    };
+    write_all(dev.master.as_fd(), b"flood");
+    read_until(s.host.master.as_fd(), b"flood", T);
+    assert!(
+        !nonblocking(&s),
+        "stdout set non-blocking during the session"
+    );
+    // It does write through an open of its own: write-only, non-blocking.
+    assert!(
+        own_open_writes_without_blocking(s.child.id(), &s.host.slave_path),
+        "no non-blocking write-only open of its own on the terminal"
+    );
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
+}
+
+/// Whether process `pid` has a descriptor above 2 on `path` that is open
+/// write-only and non-blocking, from /proc.
+#[cfg(target_os = "linux")]
+fn own_open_writes_without_blocking(pid: u32, path: &std::path::Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap();
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) > Some(2))
+        .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == path))
+        .filter_map(|e| {
+            let fd = e.file_name().into_string().ok()?;
+            let info =
+                std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+            let flags = info.lines().find_map(|l| l.strip_prefix("flags:"))?;
+            i32::from_str_radix(flags.trim(), 8).ok()
+        })
+        .any(|f| f & libc::O_ACCMODE == libc::O_WRONLY && f & libc::O_NONBLOCK != 0)
+}
+
+/// The same from lsof on macOS: access `w`, and the file flags (`G`, the
+/// kernel's FWRITE 0x2 and FNONBLOCK 0x4) non-blocking.
+#[cfg(target_os = "macos")]
+fn own_open_writes_without_blocking(pid: u32, path: &std::path::Path) -> bool {
+    let out = std::process::Command::new("lsof")
+        .args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "3-255",
+            "+fg",
+            "-F",
+            "faGn",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let want = path.to_str().unwrap();
+    // One f line per descriptor, then its fields.
+    text.split("\nf").skip(1).any(|fd| {
+        let field = |c: char| fd.lines().find_map(|l| l.strip_prefix(c));
+        let flags = field('G')
+            .and_then(|g| g.split(';').next())
+            .and_then(|g| u32::from_str_radix(g.trim_start_matches("0x"), 16).ok());
+        field('a') == Some("w")
+            && field('n') == Some(want)
+            && flags.is_some_and(|g| g & 0x4 != 0)
+    })
+}
+
+/// A pty master as stdout is named /dev/ptmx, and opening that name makes
+/// a new pty: xcomm keeps writing to the stdout it was given.
+#[test]
+fn a_pty_master_as_stdout_still_gets_the_output() {
+    let dev = support::pty();
+    let out = support::pty();
+    let path = dev.slave_path.to_str().unwrap().to_string();
+    let master = std::process::Stdio::from(out.master.try_clone().unwrap());
+    let mut s = support::spawn_with(
+        env!("CARGO_BIN_EXE_xcomm"),
+        &[&path],
+        &lock_dir("ptmx"),
+        &[],
+        Some(master),
+    );
+    // The banner goes to stderr: the session is up.
+    read_until(s.host.master.as_fd(), b"\r\n", T);
+    write_all(dev.master.as_fd(), b"HELLO-DEVICE\n");
+    read_until(out.slave.as_fd(), b"HELLO-DEVICE", T);
+    write_all(s.host.master.as_fd(), b"\x01x");
+    assert!(s.wait_exit(T).success());
 }

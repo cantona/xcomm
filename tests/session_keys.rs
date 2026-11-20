@@ -459,15 +459,18 @@ fn stall_the_terminal(s: &support::Spawned) {
 
 #[test]
 fn sigterm_ends_a_session_with_wrap_off_and_the_terminal_stalled() {
-    let (dev, mut s, _) = start(&[], &[]);
-    write_all(s.host.master.as_fd(), b"\x01w");
-    read_until(s.host.master.as_fd(), b"line wrap off\r\n", T);
-    stall_the_terminal(&s);
-    // Device output now blocks xcomm in its write to the terminal.
-    write_all(dev.master.as_fd(), b"more");
-    std::thread::sleep(Duration::from_millis(100));
-    unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
-    assert!(s.wait_exit(T).success());
+    // A blocking stdout, and xcomm's own non-blocking open of the terminal.
+    for env in [&[("XCOMM_TEST_BLOCKING_TERMINAL", "1")][..], &[]] {
+        let (dev, mut s, _) = start(&[], env);
+        write_all(s.host.master.as_fd(), b"\x01w");
+        read_until(s.host.master.as_fd(), b"line wrap off\r\n", T);
+        stall_the_terminal(&s);
+        // Device output now holds xcomm waiting on the terminal.
+        write_all(dev.master.as_fd(), b"more");
+        std::thread::sleep(Duration::from_millis(100));
+        unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
+        assert!(s.wait_exit(T).success(), "{env:?}");
+    }
 }
 
 /// Stopped and continued with wrap off and the terminal taking nothing:
@@ -476,16 +479,23 @@ fn sigterm_ends_a_session_with_wrap_off_and_the_terminal_stalled() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sigterm_sent_while_stopped_with_wrap_off_and_the_terminal_stalled_ends_the_session() {
-    let (dev, mut s, _) = start(&[], &[]);
-    write_all(s.host.master.as_fd(), b"\x01w");
-    read_until(s.host.master.as_fd(), b"line wrap off\r\n", T);
-    stall_the_terminal(&s);
-    write_all(dev.master.as_fd(), b"more");
-    let pid = s.child.id() as i32;
-    support::wait_blocked_writing_stdout(pid, T);
-    unsafe { libc::kill(pid, libc::SIGTSTP) };
-    support::wait_stopped(pid, T);
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    unsafe { libc::kill(pid, libc::SIGCONT) };
-    assert!(s.wait_exit(T).success());
+    for blocking in [true, false] {
+        let env: &[(&str, &str)] = if blocking {
+            &[("XCOMM_TEST_BLOCKING_TERMINAL", "1")]
+        } else {
+            &[]
+        };
+        let (dev, mut s, _) = start(&[], env);
+        write_all(s.host.master.as_fd(), b"\x01w");
+        read_until(s.host.master.as_fd(), b"line wrap off\r\n", T);
+        stall_the_terminal(&s);
+        write_all(dev.master.as_fd(), b"more");
+        let pid = s.child.id() as i32;
+        support::wait_stalled_on_terminal(pid, blocking, T);
+        unsafe { libc::kill(pid, libc::SIGTSTP) };
+        support::wait_stopped(pid, T);
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        assert!(s.wait_exit(T).success(), "blocking {blocking}");
+    }
 }

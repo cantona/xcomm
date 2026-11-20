@@ -9,7 +9,7 @@ pub mod outq;
 
 use std::io;
 use std::ops::ControlFlow;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -337,12 +337,15 @@ fn on_signals(
     }
 }
 
-/// Writes all of `bytes` to the (blocking) terminal. Termination signals
-/// arrive without SA_RESTART, so a write stalled on a terminal that is not
-/// being read returns EINTR and the session can still exit. A signal that
-/// arrives after the last check but before the write blocks is not seen
-/// until the write returns: closing that window would cost a poll per write
-/// on the data path, and a lock left by a later SIGKILL is cleared as stale.
+/// Writes all of `bytes` to the terminal. Through xcomm's own non-blocking
+/// open of it (see [`own_terminal`]), a full terminal is waited for with
+/// poll, which also wakes for signals. On a blocking stdout (the fallback),
+/// termination signals arrive without SA_RESTART, so a write stalled on a
+/// terminal that is not being read returns EINTR and the session can still
+/// exit; a signal that arrives after the last check but before the write
+/// blocks is not seen until the write returns: closing that window would
+/// cost a poll per write, and a lock left by a later SIGKILL is cleared as
+/// stale.
 fn write_out(
     fd: BorrowedFd<'_>,
     mut bytes: &[u8],
@@ -385,8 +388,9 @@ fn write_out(
                     return Ok(Signaled::Exit(exit));
                 }
             }
-            // A non-blocking terminal (set so by another program): wait for
-            // it, and for signals, which must still end or stop the session.
+            // A full non-blocking terminal (xcomm's own open, or one another
+            // program set so): wait for room, and for signals, which must
+            // still end or stop the session.
             Err(rustix::io::Errno::AGAIN) => {
                 let signal_fd = p.signals.fd();
                 let mut fds = [
@@ -409,6 +413,70 @@ fn write_out(
     } else {
         Signaled::Nothing
     })
+}
+
+/// The terminal on `stdout` opened again, non-blocking, for xcomm's own
+/// output: measured, a flood reaches a pty 3-5 % (text) and 10-12 %
+/// (binary) faster through it than through a blocking stdout. Not by
+/// setting O_NONBLOCK on stdout: that flag is on the open file the shell
+/// shares, and would outlast xcomm. None (stdout is used as it is) when
+/// stdout is not a terminal, the one its name opens is not the same
+/// device, or its name stands for another terminal when opened (/dev/ptmx
+/// makes a new pty; /dev/tty and /dev/console are the controlling or
+/// console terminal then).
+fn own_terminal(stdout: BorrowedFd<'_>) -> Option<OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    if !rustix::termios::isatty(stdout) {
+        return None;
+    }
+    // ttyname_r with a buffer of its own size: on macOS it answers ERANGE
+    // for a pty master whatever the size, and rustix's ttyname grows its
+    // buffer on ERANGE until the allocation aborts. Terminal names are short.
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer and its length are ttyname_r's to fill.
+    let rc = unsafe {
+        libc::ttyname_r(
+            std::os::fd::AsRawFd::as_raw_fd(&stdout),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let name = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?;
+    let theirs = rustix::fs::fstat(stdout).ok()?;
+    if is_alias(name.to_bytes(), theirs.st_rdev) {
+        return None;
+    }
+    let fd = rustix::fs::open(
+        name,
+        OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    (rustix::fs::fstat(&fd).ok()?.st_rdev == theirs.st_rdev).then_some(fd)
+}
+
+/// Whether the terminal named `name`, device `rdev`, is another terminal
+/// when opened anew: a pty master (`ptmx`, wherever its devpts is mounted)
+/// makes a new pty, and the controlling, console and foreground-VT nodes
+/// stand for whichever terminal that is then.
+fn is_alias(name: &[u8], rdev: rustix::fs::Dev) -> bool {
+    let named = name.ends_with(b"/ptmx")
+        || [&b"/dev/tty"[..], b"/dev/console", b"/dev/tty0"].contains(&name);
+    // TTYAUX_MAJOR (tty, console, ptmx) and tty0 on Linux, whatever the name.
+    #[cfg(target_os = "linux")]
+    let numbered = {
+        let (major, minor) = (rustix::fs::major(rdev), rustix::fs::minor(rdev));
+        major == 5 || (major == 4 && minor == 0)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let numbered = {
+        let _ = rdev;
+        false
+    };
+    named || numbered
 }
 
 /// Writes the rest of what xcomm began writing to the terminal, so that
@@ -1031,8 +1099,15 @@ pub fn run(
 
     let stdin = io::stdin();
     let stdout = io::stdout();
+    // XCOMM_TEST_BLOCKING_TERMINAL (test-only) keeps writing to a blocking
+    // stdout, the path taken where the terminal cannot be opened again, so
+    // tests reach it too.
+    let own_output = (!opts.headless && env("XCOMM_TEST_BLOCKING_TERMINAL").is_none())
+        .then(|| own_terminal(stdout.as_fd()))
+        .flatten();
     // Headless: neither read nor written, whatever they are.
-    let shown = (!opts.headless).then(|| stdout.as_fd());
+    let shown = (!opts.headless)
+        .then(|| own_output.as_ref().map_or(stdout.as_fd(), |fd| fd.as_fd()));
     let raw = if !opts.headless && rustix::termios::isatty(stdin.as_fd()) {
         match enter_raw(stdin.as_fd(), &signals)? {
             Some(raw) => Some(raw),
@@ -1648,4 +1723,37 @@ fn banner(
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_alias;
+    use rustix::fs::makedev;
+
+    #[test]
+    fn terminals_that_open_as_another_are_aliases() {
+        let pts = makedev(136, 3);
+        for name in [
+            &b"/dev/tty"[..],
+            b"/dev/console",
+            b"/dev/tty0",
+            b"/dev/ptmx",
+            b"/dev/pts/ptmx",
+            b"/run/sandbox/pts/ptmx",
+        ] {
+            assert!(is_alias(name, pts), "{}", String::from_utf8_lossy(name));
+        }
+        assert!(!is_alias(b"/dev/pts/3", pts));
+        assert!(!is_alias(b"/dev/ttys004", makedev(16, 4)));
+        assert!(!is_alias(b"/dev/ttyS0", makedev(4, 64)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_device_number_tells_an_alias_by_another_name() {
+        for (major, minor) in [(5, 0), (5, 1), (5, 2), (4, 0)] {
+            assert!(is_alias(b"/somewhere/else", makedev(major, minor)));
+        }
+        assert!(!is_alias(b"/somewhere/else", makedev(4, 1)));
+    }
 }

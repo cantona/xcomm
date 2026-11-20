@@ -489,7 +489,8 @@ fn write_all_to(fd: BorrowedFd<'_>, signals: &SignalPipe, mut bytes: &[u8]) -> u
                     return all - bytes.len();
                 }
             }
-            // Non-blocking (set so by another program): wait for room.
+            // Non-blocking (xcomm's own open of the terminal, or one another
+            // program set so): wait for room.
             Err(rustix::io::Errno::AGAIN) => {
                 let signal_fd = signals.fd();
                 let mut fds = [

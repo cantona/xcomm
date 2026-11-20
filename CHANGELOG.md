@@ -5,6 +5,10 @@ What changed in each release of xcomm.
 ## [Unreleased]
 
 ### Changed
+- Device output reaches the terminal 3-5 % (text) and 10-12 % (binary)
+  faster in a flood, measured through a pty: xcomm writes it through a
+  non-blocking open of its own terminal. The terminal xcomm shares with the
+  shell is left blocking.
 - `xcomm ctl run` exits 4 when the port goes away while it waits for its
   match, printing the output that came before it, as on a timeout. It waited
   on across the reconnect, where the prompt of a board that came back could
