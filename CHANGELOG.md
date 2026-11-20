@@ -4,6 +4,8 @@ What changed in each release of xcomm.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-21
+
 ### Added
 - Static Linux binaries, linked with musl, for x86_64 and aarch64, attached
   to each GitHub release: no shared libraries needed, and less memory than
@@ -149,7 +151,8 @@ can drive while you watch, and a herdr plugin.
   control actions, hotplug notifications.
 - minicom's options and its `Ctrl-A` keys (`Alt-A` inside a multiplexer).
 
-[Unreleased]: https://github.com/cantona/xcomm/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/cantona/xcomm/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/cantona/xcomm/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/cantona/xcomm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cantona/xcomm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cantona/xcomm/compare/v0.1.0...v0.1.1
